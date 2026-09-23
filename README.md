@@ -11,6 +11,16 @@ uv sync
 git config core.hooksPath .githooks
 ```
 
+## Market data
+
+```sh
+uv run tbot download                    # BTCUSDT, ETHUSDT 1h/4h since 2017-08 into data/
+uv run tbot check                       # quality report; exit code 1 on errors
+uv run tbot download --symbols SOLUSDT --timeframes 4h --start 2021-01-01
+```
+
+Downloads only extend forward from the last stored bar. Delete the symbol's directory under `data/` to re-download from scratch.
+
 ## Git hooks
 
 | Hook | Checks |

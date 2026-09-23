@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "Multi-strategy crypto trading bot for Binance"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "httpx>=0.28.1",
+    "polars>=1.44.2",
+    "tzdata>=2026.4",
+]
 
 [project.scripts]
 tbot = "tbot.cli:main"
@@ -44,7 +48,7 @@ select = [
 python_version = "3.12"
 strict = true
 files = ["src", "tests", "scripts"]
-mypy_path = "scripts"
+mypy_path = ["scripts", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -98,9 +98,12 @@ The core stays timeframe-agnostic so faster strategies (e.g. 15m) can be added l
 
 ### 5.2 Data
 
-- **Historical**: bulk download klines from `data.binance.vision`; fill recent gaps with the REST API. Store as Parquet, partitioned by `market/symbol/timeframe/year`. Query with DuckDB.
+- **Historical**: complete months come from `data.binance.vision` monthly archives, verified against their SHA-256 checksums. Everything after the last archive (including a month not yet published) comes from the public REST API (`data-api.binance.vision`). Only closed bars are stored.
+- **Storage**: Parquet via polars, one file per `exchange/market/symbol/timeframe/year`. Writes merge by open time and replace files atomically. Sync only extends forward.
+- **Timestamps**: spot archives use microseconds from 2025 and milliseconds before; both are normalized to UTC milliseconds.
+- **Off-grid bars**: Binance has stretches of bars not aligned to the timeframe grid (1h bars at :28 after the February 2018 outage). They are dropped, not snapped: snapping would leak future prices into a bar.
 - **Live**: subscribe to kline streams over WebSocket. On reconnect, backfill missing bars via REST before emitting new ones.
-- **Quality checks**: missing bars, duplicates, zero volume, outliers. Keep delisted symbols to avoid survivorship bias.
+- **Quality checks**: errors are duplicates, off-grid bars, unclosed bars, and invalid prices. Gaps, zero-volume bars, and large moves are warnings, since they are usually real exchange events. Keep delisted symbols to avoid survivorship bias.
 - **Perpetuals**: also store funding rate history.
 
 ### 5.3 Strategy Plugins
@@ -203,7 +206,7 @@ Two tiers:
 
 ### 5.9 Persistence
 
-- **Market data**: Parquet + DuckDB.
+- **Market data**: Parquet, read and written with polars.
 - **Ledger**: SQLite, moving to PostgreSQL if needed. Tables: `runs`, `signals`, `order_intents`, `orders`, `fills`, `positions`, `equity_snapshots`, `risk_events`.
 - Every signal, order, and fill is recorded, so live results can be compared with a backtest over the same period.
 
@@ -257,7 +260,8 @@ A strategy is promoted to live only after passing every step:
 | Runtime | Python 3.12, uv |
 | Exchange access | ccxt (REST + WebSocket) |
 | Data | polars, pandas, numpy |
-| Storage | Parquet + DuckDB, SQLite |
+| Storage | Parquet (polars), SQLite |
+| HTTP | httpx |
 | Config and models | pydantic, pydantic-settings, YAML |
 | Concurrency | asyncio |
 | Quality | ruff, mypy, pytest, hypothesis, git hooks (`.githooks/`) |

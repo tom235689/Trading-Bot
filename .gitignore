@@ -20,9 +20,9 @@ htmlcov/
 .env.*
 !.env.example
 
-# Runtime data
-data/
-logs/
+# Runtime data (root only; src/tbot/data is code)
+/data/
+/logs/
 *.db
 *.sqlite
 *.sqlite3
