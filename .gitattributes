@@ -1,0 +1,2 @@
+# Normalize line endings; hooks must stay LF to run.
+* text=auto eol=lf

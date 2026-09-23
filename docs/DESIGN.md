@@ -217,7 +217,7 @@ Two tiers:
 ### 5.11 Security and Configuration
 
 - API keys: trading permission only, withdrawals disabled, IP whitelist enabled.
-- Secrets live in `.env`, never committed. Pre-commit runs a secret scan.
+- Secrets live in `.env`, never committed. Git hooks scan for secrets.
 - Config: YAML for settings, environment variables for secrets, validated with pydantic.
 - Default mode is `paper`. `live` requires both `mode: live` in config and an explicit `--live` CLI flag.
 
@@ -260,7 +260,7 @@ A strategy is promoted to live only after passing every step:
 | Storage | Parquet + DuckDB, SQLite |
 | Config and models | pydantic, pydantic-settings, YAML |
 | Concurrency | asyncio |
-| Quality | ruff, mypy, pytest, hypothesis, pre-commit |
+| Quality | ruff, mypy, pytest, hypothesis, git hooks (`.githooks/`) |
 | Alerts | Telegram Bot API |
 | Deployment | Docker on a VPS in an allowed region (e.g. Tokyo) |
 
@@ -290,7 +290,7 @@ Trading-Bot/
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| 0. Foundation | Project layout, tooling, pre-commit (Hangul check, secret scan) | Lint, type check, and tests pass |
+| 0. Foundation | Project layout, tooling, git hooks (Hangul check, secret scan) | Lint, type check, and tests pass |
 | 1. Data | Historical download, storage, quality checks | Several years of BTC and ETH 4h/1h data stored and verified |
 | 2. Core and backtester | Models, plugin interface, event-driven backtester, cost models, report, one sample strategy | Backtest matches hand-calculated results in tests |
 | 3. Validation tools | Walk-forward, parameter sweep, Monte Carlo, trial log | Validation report for the sample strategy |

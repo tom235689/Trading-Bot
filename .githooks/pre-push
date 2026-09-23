@@ -1,0 +1,5 @@
+#!/bin/sh
+# Block pushes carrying Hangul or secrets anywhere in outgoing history, then run tests.
+set -e
+uv run --quiet python scripts/git_guard.py pre-push "$@"
+uv run --quiet pytest -q
