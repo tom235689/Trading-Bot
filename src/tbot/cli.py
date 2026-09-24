@@ -7,6 +7,10 @@ from pathlib import Path
 import httpx
 
 from tbot import __version__
+from tbot.backtest.config import load_config
+from tbot.backtest.metrics import compute_metrics
+from tbot.backtest.report import format_metrics
+from tbot.backtest.runner import run_backtest
 from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.quality import QualityReport, check_bars
@@ -42,6 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--symbols", nargs="+", type=parse_symbol, default=DEFAULT_SYMBOLS)
         command.add_argument("--timeframes", nargs="+", type=Timeframe, default=DEFAULT_TIMEFRAMES)
         command.add_argument("--data-dir", type=Path, default=Path("data"))
+
+    backtest = commands.add_parser("backtest", help="run a backtest from a YAML config")
+    backtest.add_argument("config", type=Path)
+    backtest.add_argument("--data-dir", type=Path, default=Path("data"))
     return parser
 
 
@@ -104,6 +112,14 @@ def run_check(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def run_backtest_command(args: argparse.Namespace) -> int:
+    result = run_backtest(load_config(args.config), BarStore(args.data_dir))
+    print(format_metrics(compute_metrics(result)))
+    for symbol, quantity in sorted(result.positions.items()):
+        print(f"Open position {symbol} {quantity:.6f}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -111,5 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_download(args)
     if args.command == "check":
         return run_check(args)
+    if args.command == "backtest":
+        return run_backtest_command(args)
     parser.print_help()
     return 0

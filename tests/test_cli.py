@@ -45,3 +45,18 @@ def test_check_without_data_fails(tmp_path: Path, capsys: pytest.CaptureFixture[
     argv = ["check", "--symbols", "ETHUSDT", "--timeframes", "1h", "--data-dir", str(tmp_path)]
     assert main(argv) == 1
     assert "ETHUSDT 1h: FAIL, no data" in capsys.readouterr().out
+
+
+def test_backtest_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    BarStore(tmp_path).write(
+        "BTCUSDT", Timeframe.H4, make_bars(datetime(2024, 1, 1, tzinfo=UTC), 60, Timeframe.H4)
+    )
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "start: 2024-01-05\n"
+        "strategies:\n"
+        "  - {name: donchian_trend, symbols: [BTCUSDT], timeframe: 4h, allocation: 1.0}\n",
+        encoding="utf-8",
+    )
+    assert main(["backtest", str(config), "--data-dir", str(tmp_path)]) == 0
+    assert "CAGR" in capsys.readouterr().out

@@ -111,23 +111,25 @@ The core stays timeframe-agnostic so faster strategies (e.g. 15m) can be added l
 ```python
 class Strategy(ABC):
     name: ClassVar[str]
-    Params: ClassVar[type[BaseModel]]
 
+    def __init__(self, symbols: Sequence[str], params: Mapping[str, Any] | None = None) -> None: ...
+
+    @property
     @abstractmethod
     def warmup(self) -> int:
         """Bars needed before the first signal."""
 
     @abstractmethod
-    def on_bar(self, ctx: StrategyContext) -> dict[str, float]:
-        """Return target exposure per symbol in [-1, 1]."""
+    def on_bar(self, ctx: StrategyContext) -> Mapping[str, float]:
+        """Target exposure per symbol in [-1, 1], as a fraction of this strategy's capital."""
 ```
 
 **Contract**
 
-- Pure logic: no exchange calls, no file or network I/O, no wall clock. `StrategyContext` provides bar history and current positions.
-- Deterministic: same input gives the same output.
-- Output is target exposure as a fraction of the strategy's allocated capital, not order size. Negative values are ignored in spot mode.
-- Registered with `@register_strategy`; parameters validated by the `Params` pydantic model.
+- Pure logic: no exchange calls, no file or network I/O, no wall clock. `StrategyContext` provides read-only arrays of closed bars and current portfolio exposures.
+- Deterministic: same input gives the same output. Internal state is allowed only if it derives from bars seen through `on_bar`, so replaying history rebuilds it.
+- Output is target exposure as a fraction of the strategy's allocated capital, not order size. Weights across symbols should sum to at most 1. Negative values are clipped to zero in spot mode.
+- Registered with `@register_strategy`; each strategy validates its params with its own pydantic model (unknown keys are rejected).
 
 **Configuration**
 
@@ -154,7 +156,7 @@ strategies:
 
 ### 5.5 Risk Manager
 
-Independent layer with veto power. Values below are initial defaults and live in config.
+Independent layer with veto power. Values below are the intended live defaults and live in config. Backtest defaults are permissive (weight and gross caps of 100%) so strategies can be studied unconstrained; implemented so far: per-symbol cap, gross cap, long-only.
 
 | Rule | Default |
 |---|---|
@@ -196,13 +198,19 @@ Two tiers:
 1. **Research (vectorized)**: pandas or polars over full arrays. Screens many ideas quickly. Never used for final decisions.
 2. **Validation (event-driven)**: reuses the live engine with a simulated broker.
 
+**Event loop** (validation tier): events are bar close times across all loaded streams. At each event the engine reveals bars closing now, fills pending orders, marks positions at the latest close and records equity, runs strategies whose bars closed, then combines targets, applies risk limits, and queues orders. Before `start`, strategies run to build state but nothing trades.
+
 **Fill model**
 
-- Signals use closed bars only. Market orders fill at the next bar open plus slippage.
-- Limit orders fill only if the next bar trades through the price, not just touches it.
+- Signals use closed bars only. Market orders fill at the open of the next bar of the symbol's finest loaded timeframe, plus slippage. After a data gap, the order waits for the next available bar.
+- Spot broker rules: buys are capped by cash (including the fee), sells by the position.
+- Rebalance rules: a zero target closes the exact position; other changes below `rebalance_threshold` of equity or below `min_notional` are skipped.
+- Limit orders fill only if the next bar trades through the price, not just touches it (not implemented yet).
 - Fees, slippage (bps, configurable), and funding (perpetuals, at each funding time) are always applied.
 
-**Report**: CAGR, Sharpe, Sortino, Calmar, max drawdown, win rate, profit factor, turnover, exposure, average trade return vs cost, per-strategy attribution.
+**Config** (YAML): `start`, optional `end` (exclusive), `initial_cash`, `costs`, `risk`, `rebalance`, and `strategies` as in 5.3. Allocations must sum to at most 1. See `config/donchian_trend.yaml`.
+
+**Report**: CAGR, Sharpe and Sortino (daily returns, 365-day year, zero risk-free rate), Calmar, max drawdown, win rate, profit factor, turnover, exposure, fees, average trade return. Per-strategy attribution comes with multi-strategy support.
 
 ### 5.9 Persistence
 
@@ -259,7 +267,7 @@ A strategy is promoted to live only after passing every step:
 |---|---|
 | Runtime | Python 3.12, uv |
 | Exchange access | ccxt (REST + WebSocket) |
-| Data | polars, pandas, numpy |
+| Data | polars, numpy |
 | Storage | Parquet (polars), SQLite |
 | HTTP | httpx |
 | Config and models | pydantic, pydantic-settings, YAML |

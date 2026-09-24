@@ -11,6 +11,10 @@ def to_millis(moment: datetime) -> int:
     return (moment - EPOCH) // timedelta(milliseconds=1)
 
 
+def from_millis(millis: int) -> datetime:
+    return EPOCH + timedelta(milliseconds=millis)
+
+
 class Timeframe(StrEnum):
     M1 = "1m"
     M3 = "3m"

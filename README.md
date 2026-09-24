@@ -21,6 +21,14 @@ uv run tbot download --symbols SOLUSDT --timeframes 4h --start 2021-01-01
 
 Downloads only extend forward from the last stored bar. Delete the symbol's directory under `data/` to re-download from scratch.
 
+## Backtest
+
+```sh
+uv run tbot backtest config/donchian_trend.yaml
+```
+
+A config lists strategies with symbols, timeframe, allocation, and params, plus costs, risk limits, and rebalance rules. Strategies are plugins registered by name in `src/tbot/strategies/`.
+
 ## Git hooks
 
 | Hook | Checks |
