@@ -1,6 +1,7 @@
 """Command line entry point."""
 
 import argparse
+import os
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.quality import QualityReport, check_bars
 from tbot.data.store import BarStore
+from tbot.research.report import format_report
+from tbot.research.trials import TrialLog, make_record
+from tbot.research.validate import load_validation_config, run_validation
 
 DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 DEFAULT_TIMEFRAMES = [Timeframe.H1, Timeframe.H4]
@@ -50,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
     backtest = commands.add_parser("backtest", help="run a backtest from a YAML config")
     backtest.add_argument("config", type=Path)
     backtest.add_argument("--data-dir", type=Path, default=Path("data"))
+
+    validate = commands.add_parser("validate", help="run the validation pipeline")
+    validate.add_argument("config", type=Path)
+    validate.add_argument("--data-dir", type=Path, default=Path("data"))
+    validate.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     return parser
 
 
@@ -112,12 +121,33 @@ def run_check(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def trial_log(data_dir: Path) -> TrialLog:
+    return TrialLog(data_dir / "trials.jsonl")
+
+
 def run_backtest_command(args: argparse.Namespace) -> int:
-    result = run_backtest(load_config(args.config), BarStore(args.data_dir))
-    print(format_metrics(compute_metrics(result)))
+    config = load_config(args.config)
+    result = run_backtest(config, BarStore(args.data_dir))
+    metrics = compute_metrics(result)
+    trial_log(args.data_dir).append([make_record(config, metrics, "backtest")])
+    print(format_metrics(metrics))
     for symbol, quantity in sorted(result.positions.items()):
         print(f"Open position {symbol} {quantity:.6f}")
     return 0
+
+
+def run_validate_command(args: argparse.Namespace) -> int:
+    config, base = load_validation_config(args.config)
+    report = run_validation(
+        config,
+        base,
+        args.data_dir,
+        trial_log(args.data_dir),
+        workers=args.workers,
+        progress=lambda stage: print(f"... {stage}", flush=True),
+    )
+    print(format_report(report))
+    return 0 if report.passed else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -129,5 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_check(args)
     if args.command == "backtest":
         return run_backtest_command(args)
+    if args.command == "validate":
+        return run_validate_command(args)
     parser.print_help()
     return 0

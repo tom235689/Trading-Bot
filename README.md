@@ -29,6 +29,14 @@ uv run tbot backtest config/donchian_trend.yaml
 
 A config lists strategies with symbols, timeframe, allocation, and params, plus costs, risk limits, and rebalance rules. Strategies are plugins registered by name in `src/tbot/strategies/`.
 
+## Validation
+
+```sh
+uv run tbot validate config/donchian_validation.yaml
+```
+
+Runs the in-sample baseline, cost stress, parameter sweep, walk-forward, Monte Carlo, deflated Sharpe, and a single holdout evaluation, then checks the promotion gate. Exit code 1 means the gate failed. Every backtest is appended to `data/trials.jsonl`; keep that file, it is the record of how many things were tried. See [docs/reports/](docs/reports/) for past reports.
+
 ## Git hooks
 
 | Hook | Checks |

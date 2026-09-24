@@ -261,6 +261,16 @@ A strategy is promoted to live only after passing every step:
 
 **Initial promotion gate (tunable)**: out-of-sample Sharpe above 0.8 after costs, max drawdown under 25%, at least 100 trades, profitable under 2x costs.
 
+**Implementation** (`tbot validate <validation.yaml>`, code in `src/tbot/research/`):
+
+- A validation config points at a base backtest config and sets `holdout_start`, the parameter `grid`, the `objective` (Sharpe by default), walk-forward window lengths, Monte Carlo settings, the cost multiplier, and gate thresholds. Steps 1-3 and 5-7 run in one command; breadth (step 4) is covered by running the same config on other symbols.
+- Steps run on the in-sample period (base start to `holdout_start`): baseline, cost stress, the full sweep, walk-forward (grid search on each train window, best objective applied to the next test window), and Monte Carlo on the baseline's trades. The holdout runs last, once, with the base params. The report says how many times the holdout has been evaluated, because every look at it weakens it.
+- Parameter stability is read from the sweep: the objective over the whole grid, the baseline's rank, and the mean objective of a point and its grid neighbors (a plateau scores close to its peak).
+- Out-of-sample metrics come from the walk-forward test segments stitched into one equity curve; each segment starts flat.
+- Monte Carlo shuffles trade order (returns on equity at entry) to get the drawdown distribution. Shuffling leaves the compounded return unchanged, so return percentiles are only reported for bootstrap resampling.
+- Every run appends to `data/trials.jsonl`. The deflated Sharpe counts distinct parameter sets tried on the same sample (strategy, symbols, timeframe, period); re-running identical params is not a new trial.
+- The gate applies to the stitched out-of-sample result (Sharpe, drawdown, trades), the cost stress (still profitable), and the holdout (profitable). Sweeps run in parallel processes.
+
 ## 8. Tech Stack
 
 | Area | Choice |

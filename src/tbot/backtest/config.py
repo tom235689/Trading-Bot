@@ -1,5 +1,6 @@
 """Backtest configuration loaded from YAML."""
 
+from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
 from typing import Any, Self
@@ -46,6 +47,23 @@ class BacktestConfig(BaseModel):
         if sum(s.allocation for s in self.strategies) > 1 + 1e-9:
             raise ValueError("strategy allocations must sum to at most 1")
         return self
+
+    def with_params(self, params: Mapping[str, Any]) -> Self:
+        """Copy with the first strategy's params replaced."""
+        first = self.strategies[0].model_copy(update={"params": dict(params)})
+        return self.model_copy(update={"strategies": [first, *self.strategies[1:]]})
+
+    def with_period(self, start: date, end: date | None) -> Self:
+        if end is not None and end <= start:
+            raise ValueError("end must be after start")
+        return self.model_copy(update={"start": start, "end": end})
+
+    def with_cost_multiplier(self, multiplier: float) -> Self:
+        costs = CostModel(
+            fee_rate=self.costs.fee_rate * multiplier,
+            slippage_bps=self.costs.slippage_bps * multiplier,
+        )
+        return self.model_copy(update={"costs": costs})
 
 
 def load_config(path: Path) -> BacktestConfig:

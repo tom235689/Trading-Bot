@@ -1,0 +1,12 @@
+# Validation plan for the Donchian trend strategy.
+backtest: donchian_trend.yaml
+holdout_start: 2025-01-01      # in-sample 2018-2024, holdout 2025 onward
+grid:
+  entry: [20, 30, 40, 55, 70, 90]
+  exit: [10, 15, 20, 30, 40]
+objective: sharpe
+min_trades: 30
+walk_forward: {train_months: 36, test_months: 12}
+monte_carlo: {runs: 2000, seed: 1}
+cost_multiplier: 2.0
+gate: {min_oos_sharpe: 0.8, max_drawdown: 0.25, min_trades: 100}

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
+import numpy.typing as npt
 import polars as pl
 
 from tbot.backtest.engine import BacktestResult
@@ -45,6 +46,13 @@ def _profit_factor(gains: float, losses: float) -> float:
     return math.inf if gains > 0 else math.nan
 
 
+def daily_returns(result: BacktestResult) -> npt.NDArray[np.float64]:
+    """Returns between daily closing equities, starting from the initial cash."""
+    daily = result.equity.group_by_dynamic("time", every="1d").agg(pl.col("equity").last())
+    closes = np.concatenate([[result.initial_cash], daily["equity"].to_numpy()])
+    return np.asarray(np.diff(closes) / closes[:-1], dtype=np.float64)
+
+
 def compute_metrics(result: BacktestResult) -> Metrics:
     equity = result.equity
     if equity.is_empty():
@@ -55,9 +63,7 @@ def compute_metrics(result: BacktestResult) -> Metrics:
     years = (end - start).total_seconds() / SECONDS_PER_YEAR
     final = float(values[-1])
 
-    daily = equity.group_by_dynamic("time", every="1d").agg(pl.col("equity").last())
-    closes = np.concatenate([[initial], daily["equity"].to_numpy()])
-    returns = np.diff(closes) / closes[:-1]
+    returns = daily_returns(result)
     annual = math.sqrt(DAYS_PER_YEAR)
     sharpe = sortino = math.nan
     if len(returns) >= 2:
