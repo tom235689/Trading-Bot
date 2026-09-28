@@ -4,10 +4,11 @@ import polars as pl
 import pytest
 
 from factories import Scripted, price_bars
-from tbot.backtest.engine import BacktestEngine, BacktestResult, StrategySlot
+from tbot.backtest.engine import BacktestEngine, BacktestResult
 from tbot.core.timeframe import Timeframe
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel
+from tbot.portfolio.allocation import StrategySlot
 from tbot.risk.limits import RiskLimits
 from tbot.strategies.base import Strategy
 

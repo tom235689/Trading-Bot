@@ -1,0 +1,228 @@
+import asyncio
+import json
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import httpx
+import polars as pl
+import pytest
+
+from binance_fake import Row, make_rows
+from tbot.core.timeframe import Timeframe, to_millis
+from tbot.data.schema import from_rows
+from tbot.data.store import BarStore
+from tbot.live.feed import LiveFeed, StreamKey
+
+H1, H4 = Timeframe.H1, Timeframe.H4
+T0 = datetime(2024, 1, 1, tzinfo=UTC)
+BTC1 = ("BTCUSDT", H1)
+
+
+def at(hours: float) -> datetime:
+    return T0 + timedelta(hours=hours)
+
+
+def rest_client(rows_by_key: dict[StreamKey, list[Row]]) -> tuple[httpx.Client, list[str]]:
+    """Serve /api/v3/klines from in-memory rows and record the requests."""
+    requests: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        params = request.url.params
+        key = (params["symbol"], Timeframe(params["interval"]))
+        start, end = int(params["startTime"]), int(params["endTime"])
+        rows = [r for r in rows_by_key.get(key, []) if start <= r[0] <= end]
+        return httpx.Response(200, json=rows[: int(params["limit"])])
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), requests
+
+
+def kline_message(key: StreamKey, open_time: datetime, closed: bool, price: float = 100.0) -> str:
+    symbol, timeframe = key
+    open_ms = to_millis(open_time)
+    p = f"{price:.2f}"
+    k = {
+        "t": open_ms,
+        "T": open_ms + timeframe.millis - 1,
+        "s": symbol,
+        "i": str(timeframe),
+        "o": p,
+        "h": p,
+        "l": p,
+        "c": p,
+        "v": "1.0",
+        "n": 3,
+        "x": closed,
+        "q": "100.0",
+        "V": "0.5",
+        "Q": "50.0",
+    }
+    return json.dumps(
+        {
+            "stream": f"{symbol.lower()}@kline_{timeframe}",
+            "data": {"e": "kline", "s": symbol, "k": k},
+        }
+    )
+
+
+Messages = list[str | Exception]
+
+
+def fake_connector(connections: list[Messages]) -> tuple[Callable[..., object], list[str]]:
+    """Each connection replays its messages; an Exception item is raised; the last hangs."""
+    urls: list[str] = []
+
+    @asynccontextmanager
+    async def connect(url: str) -> AsyncIterator[AsyncIterator[str | bytes]]:
+        urls.append(url)
+        messages = connections[min(len(urls) - 1, len(connections) - 1)]
+
+        async def stream() -> AsyncIterator[str | bytes]:
+            for item in messages:
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+            await asyncio.Event().wait()  # stay connected
+
+        yield stream()
+
+    return connect, urls
+
+
+def make_feed(
+    tmp_path: Path,
+    keys: list[StreamKey],
+    now: datetime,
+    rows: dict[StreamKey, list[Row]] | None = None,
+    **options: object,
+) -> tuple[LiveFeed, BarStore, list[str]]:
+    store = BarStore(tmp_path / "data")
+    client, requests = rest_client(rows or {})
+    feed = LiveFeed(keys, store, client, clock=lambda: now, **options)  # type: ignore[arg-type]
+    return feed, store, requests
+
+
+def test_emit_stores_new_closed_bars_once(tmp_path: Path) -> None:
+    feed, store, _ = make_feed(tmp_path, [BTC1], now=at(4.5))
+    bars = from_rows(make_rows(T0, 6, H1))
+    assert feed._emit(BTC1, bars) == 4  # opens 0h..3h are closed at 4:30; 4h and 5h are not
+    assert feed.queue.qsize() == 4
+    assert store.last_open_time(*BTC1) == at(3)
+    assert feed.last[BTC1] == at(3)
+    assert feed._emit(BTC1, bars) == 0
+    assert feed._emit(BTC1, bars, exchange_closed=True) == 2  # exchange says closed: trusted
+
+
+def test_catch_up_fetches_missing_bars_via_rest(tmp_path: Path) -> None:
+    rows = {BTC1: make_rows(T0, 10, H1)}
+    feed, store, requests = make_feed(tmp_path, [BTC1], now=at(8.2), rows=rows)
+    store.write(*BTC1, from_rows(rows[BTC1][:3]))
+    feed.last[BTC1] = store.last_open_time(*BTC1)
+
+    assert asyncio.run(feed.catch_up()) == 5  # opens 3h..7h
+    assert len(requests) == 1
+    assert feed.last[BTC1] == at(7)
+    assert asyncio.run(feed.catch_up()) == 0
+
+
+def test_websocket_emits_closed_bars_dedups_and_reconnects(tmp_path: Path) -> None:
+    rows = {BTC1: make_rows(T0, 4, H1)}  # REST knows bars up to open 3h
+    # Local clock 5 s behind the exchange: the socket's closed flag must win over the clock.
+    feed, store, _ = make_feed(tmp_path, [BTC1], now=at(5) - timedelta(seconds=5), rows=rows)
+    store.write(*BTC1, from_rows(rows[BTC1][:3]))
+    feed.last[BTC1] = at(2)
+    connect, urls = fake_connector(
+        [
+            [
+                kline_message(BTC1, at(4), closed=False),  # ignored
+                kline_message(BTC1, at(3), closed=True),  # already emitted by catch-up
+                RuntimeError("connection dropped"),
+            ],
+            [kline_message(BTC1, at(4), closed=True, price=123.0)],
+        ]
+    )
+    feed.connector = connect  # type: ignore[assignment]
+
+    async def run() -> list[tuple[StreamKey, pl.DataFrame]]:
+        task = asyncio.create_task(feed.run_websocket())
+        items = [await asyncio.wait_for(feed.queue.get(), 5) for _ in range(2)]
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return items
+
+    items = asyncio.run(run())
+    assert [bar["open_time"][0] for _, bar in items] == [at(3), at(4)]
+    assert items[1][1]["close"][0] == 123.0
+    assert feed.reconnects == 1
+    assert len(urls) == 2
+    assert "btcusdt@kline_1h" in urls[0]
+    assert store.last_open_time(*BTC1) == at(4)
+
+
+def test_batches_group_streams_closing_together(tmp_path: Path) -> None:
+    eth1, btc4 = ("ETHUSDT", H1), ("BTCUSDT", H4)
+    feed, _, _ = make_feed(tmp_path, [BTC1, eth1, btc4], now=at(6), batch_wait=0.05)
+    one = from_rows(make_rows(at(3), 1, H1))
+    feed.queue.put_nowait((BTC1, one))
+    feed.queue.put_nowait((eth1, one))
+    feed.queue.put_nowait((btc4, from_rows(make_rows(T0, 1, H4))))
+    feed.queue.put_nowait((BTC1, from_rows(make_rows(at(4), 1, H1))))
+
+    async def take(n: int) -> list[set[StreamKey]]:
+        batches = feed.batches()
+        return [set(await anext(batches)) for _ in range(n)]
+
+    assert asyncio.run(take(2)) == [{BTC1, eth1, btc4}, {BTC1}]
+
+
+def test_overdue_seconds(tmp_path: Path) -> None:
+    feed, _, _ = make_feed(tmp_path, [BTC1], now=at(5.25))
+    assert feed._overdue_seconds(BTC1, at(5.25)) == pytest.approx(15 * 60)  # nothing seen yet
+    feed.last[BTC1] = at(4)
+    assert feed._overdue_seconds(BTC1, at(5.25)) == 0.0
+    feed.last[BTC1] = at(2)
+    assert feed._overdue_seconds(BTC1, at(5.25)) == pytest.approx(15 * 60)
+
+
+def test_watchdog_polls_rest_and_reports_stale_once(tmp_path: Path) -> None:
+    stale: list[StreamKey] = []
+    rows = {BTC1: make_rows(T0, 3, H1)}  # REST has nothing newer than open 2h
+    feed, store, requests = make_feed(
+        tmp_path,
+        [BTC1],
+        now=at(5.5),
+        rows=rows,
+        poll_seconds=0.01,
+        stale_after=60,
+        on_stale=lambda key, last: stale.append(key),
+    )
+    store.write(*BTC1, from_rows(rows[BTC1]))
+    feed.last[BTC1] = at(2)
+
+    async def run() -> None:
+        task = asyncio.create_task(feed.run_watchdog())
+        await asyncio.sleep(0.2)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert len(requests) >= 2
+    assert stale == [BTC1]
+
+
+def test_server_clock_measures_offset() -> None:
+    import time
+
+    from tbot.live.clock import ServerClock
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"serverTime": int((time.time() + 5) * 1000)})
+
+    clock = ServerClock(httpx.Client(transport=httpx.MockTransport(handle)))
+    assert clock.now() == pytest.approx(datetime.now(UTC), abs=timedelta(seconds=1))
+    assert clock.sync() == pytest.approx(5.0, abs=0.5)
+    assert clock.now() - datetime.now(UTC) == pytest.approx(
+        timedelta(seconds=5), abs=timedelta(seconds=0.5)
+    )

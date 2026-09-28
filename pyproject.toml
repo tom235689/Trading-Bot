@@ -9,8 +9,11 @@ dependencies = [
     "numpy>=2.5.3",
     "polars>=1.44.2",
     "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
     "pyyaml>=6.0.3",
+    "structlog>=26.1.0",
     "tzdata>=2026.4",
+    "websockets>=17.1",
 ]
 
 [project.scripts]

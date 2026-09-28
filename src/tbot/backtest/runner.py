@@ -4,11 +4,10 @@ from datetime import UTC, date, datetime, time
 
 import polars as pl
 
-import tbot.strategies  # noqa: F401  # registers built-in strategies
 from tbot.backtest.config import BacktestConfig
-from tbot.backtest.engine import BacktestEngine, BacktestResult, StrategySlot, StreamKey
+from tbot.backtest.engine import BacktestEngine, BacktestResult, StreamKey
 from tbot.data.store import BarStore
-from tbot.strategies.registry import create_strategy
+from tbot.portfolio.allocation import build_slots
 
 # Extra history loaded before start, as a multiple of warmup, to cover data gaps.
 WARMUP_MARGIN = 2
@@ -21,10 +20,7 @@ def _utc(day: date) -> datetime:
 def run_backtest(config: BacktestConfig, store: BarStore) -> BacktestResult:
     start = _utc(config.start)
     end = _utc(config.end) if config.end else None
-    slots = [
-        StrategySlot(create_strategy(sc.name, sc.symbols, sc.params), sc.timeframe, sc.allocation)
-        for sc in config.strategies
-    ]
+    slots = build_slots(config.strategies)
 
     # Each stream loads enough history before start for its longest warmup.
     lookback: dict[StreamKey, int] = {}

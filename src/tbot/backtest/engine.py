@@ -11,32 +11,23 @@ Each event is a bar close time. At every event, in order:
 A symbol's fills and marks use its finest loaded timeframe.
 """
 
-import math
-from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
-import numpy.typing as npt
 import polars as pl
 
+from tbot.core.arrays import readonly
 from tbot.core.timeframe import Timeframe, from_millis, to_millis
-from tbot.execution.rebalance import RebalanceRules, plan_orders
+from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
+from tbot.portfolio.allocation import StrategySlot, decide_orders, validate_targets
 from tbot.portfolio.portfolio import Portfolio
 from tbot.risk.limits import RiskLimits
-from tbot.strategies.base import BarWindow, Strategy, StrategyContext
+from tbot.strategies.base import BarWindow, StrategyContext
 
 StreamKey = tuple[str, Timeframe]
-
-
-@dataclass
-class StrategySlot:
-    strategy: Strategy
-    timeframe: Timeframe
-    allocation: float  # fraction of portfolio equity
-    targets: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -55,24 +46,18 @@ class BacktestResult:
     positions: dict[str, float]  # open at the end
 
 
-def _readonly[T: np.generic](array: npt.NDArray[T]) -> npt.NDArray[T]:
-    array = np.ascontiguousarray(array)
-    array.flags.writeable = False
-    return array
-
-
 class _Stream:
     """Bars of one symbol and timeframe, revealed one by one as time advances."""
 
     def __init__(self, bars: pl.DataFrame, timeframe: Timeframe) -> None:
-        self.open_ms = _readonly(bars["open_time"].dt.epoch("ms").to_numpy())
+        self.open_ms = readonly(bars["open_time"].dt.epoch("ms").to_numpy())
         self.close_ms = self.open_ms + timeframe.millis
-        self.open_time = _readonly(self.open_ms.astype("datetime64[ms]"))
-        self.open = _readonly(bars["open"].to_numpy())
-        self.high = _readonly(bars["high"].to_numpy())
-        self.low = _readonly(bars["low"].to_numpy())
-        self.close = _readonly(bars["close"].to_numpy())
-        self.volume = _readonly(bars["volume"].to_numpy())
+        self.open_time = readonly(self.open_ms.astype("datetime64[ms]"))
+        self.open = readonly(bars["open"].to_numpy())
+        self.high = readonly(bars["high"].to_numpy())
+        self.low = readonly(bars["low"].to_numpy())
+        self.close = readonly(bars["close"].to_numpy())
+        self.volume = readonly(bars["volume"].to_numpy())
         self.visible = 0
 
     def advance(self, now_ms: int) -> bool:
@@ -186,32 +171,12 @@ class BacktestEngine:
                 windows={s: self.streams[(s, slot.timeframe)].window() for s in symbols},
                 exposures=self.portfolio.exposures(self.marks),
             )
-            slot.targets = self._validate(slot, slot.strategy.on_bar(ctx))
+            slot.targets = validate_targets(slot.strategy, slot.strategy.on_bar(ctx))
             updated = True
         return updated
 
-    @staticmethod
-    def _validate(slot: StrategySlot, targets: Mapping[str, float]) -> dict[str, float]:
-        name = slot.strategy.name
-        for symbol, weight in targets.items():
-            if symbol not in slot.strategy.symbols:
-                raise ValueError(f"{name}: target for unsubscribed symbol {symbol}")
-            if not (math.isfinite(weight) and -1 <= weight <= 1):
-                raise ValueError(f"{name}: target {weight} for {symbol} is outside [-1, 1]")
-        return dict(targets)
-
     def _rebalance(self, now_ms: int) -> None:
-        equity = self.portfolio.equity(self.marks)
-        if equity <= 0:
-            self.pending = []
-            return
-        weights: dict[str, float] = defaultdict(float)
-        for slot in self.slots:
-            for symbol, weight in slot.targets.items():
-                weights[symbol] += slot.allocation * weight
-        orders = plan_orders(
-            self.risk.apply(weights), self.portfolio.positions, self.marks, equity, self.rules
-        )
+        orders = decide_orders(self.slots, self.portfolio, self.marks, self.risk, self.rules)
         self.pending = [PendingOrder(now_ms, s, q) for s, q in orders.items()]
 
     def _result(self) -> BacktestResult:

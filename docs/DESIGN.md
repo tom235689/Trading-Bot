@@ -102,7 +102,7 @@ The core stays timeframe-agnostic so faster strategies (e.g. 15m) can be added l
 - **Storage**: Parquet via polars, one file per `exchange/market/symbol/timeframe/year`. Writes merge by open time and replace files atomically. Sync only extends forward.
 - **Timestamps**: spot archives use microseconds from 2025 and milliseconds before; both are normalized to UTC milliseconds.
 - **Off-grid bars**: Binance has stretches of bars not aligned to the timeframe grid (1h bars at :28 after the February 2018 outage). They are dropped, not snapped: snapping would leak future prices into a bar.
-- **Live**: subscribe to kline streams over WebSocket. On reconnect, backfill missing bars via REST before emitting new ones.
+- **Live** (`tbot/live/feed.py`): kline WebSocket for closed bars, REST catch-up on connect, after every reconnect, and from a watchdog that polls whenever a bar is overdue. Every emitted bar is first written to the same Parquet store, and the store's last bar is the memory of what was seen, so nothing is emitted twice or out of order. Bars from streams that close at the same instant are grouped into one event (short wait for stragglers), as in the backtest. A stream overdue by more than `stale_after_seconds` raises a stale alert once.
 - **Quality checks**: errors are duplicates, off-grid bars, unclosed bars, and invalid prices. Gaps, zero-volume bars, and large moves are warnings, since they are usually real exchange events. Keep delisted symbols to avoid survivorship bias.
 - **Perpetuals**: also store funding rate history.
 
@@ -220,17 +220,21 @@ Two tiers:
 
 ### 5.10 Monitoring and Alerts
 
-- Structured JSON logs (structlog).
-- Telegram alerts: fills, errors, risk limit hits, kill switch, reconciliation mismatches.
-- External heartbeat: the bot pings an outside monitor. If pings stop, the monitor alerts. A dead bot cannot alert on its own.
+- Structured logs (structlog): readable console output plus rotating JSON lines in `logs/`.
+- Telegram alerts (`TBOT_TELEGRAM_TOKEN`, `TBOT_TELEGRAM_CHAT_ID`): start and stop, every fill, failed price lookups, stale streams, task crashes, and a daily summary at `summary_hour_utc`. Without a token, alerts go to the log. A failed send is logged and never stops trading. Risk limit hits, kill switch, and reconciliation mismatches are added with the live phase.
+- External heartbeat (`TBOT_HEARTBEAT_URL`): the bot pings an outside monitor every `heartbeat_seconds`. If pings stop, the monitor alerts. A dead bot cannot alert on its own.
+- `tbot status <config>` prints the ledger: equity, positions, recent fills and events, and the last stored bar per stream.
 - Dashboard (later): equity curve, positions, per-strategy performance.
+
+**Paper session** (`tbot paper <config>`, `tbot/live/paper.py`): the session (`tbot/live/session.py`) runs the backtest's decision path one event at a time: append the bars that closed, mark, run the strategies whose bars closed, combine targets, apply risk limits, plan orders. Paper fills happen at once at the live book price (ask for buys, bid for sells) through the same simulated broker with fees and slippage. Every signal, order, fill, and equity snapshot goes to a SQLite ledger. On start the bot syncs the store, rebuilds the portfolio by replaying the ledger's fills, rebuilds strategy state by replaying stored history through the strategies, and warns if the trading config changed since the ledger was created. Fills are timestamped with the wall clock; equity snapshots with the bar close. A test proves the session reproduces the backtest engine bar for bar when fills use the next bar's open.
 
 ### 5.11 Security and Configuration
 
 - API keys: trading permission only, withdrawals disabled, IP whitelist enabled.
 - Secrets live in `.env`, never committed. Git hooks scan for secrets.
 - Config: YAML for settings, environment variables for secrets, validated with pydantic.
-- Default mode is `paper`. `live` requires both `mode: live` in config and an explicit `--live` CLI flag.
+- Secrets come from the environment or a `.env` file (`TBOT_` prefix, see `.env.example`), validated by pydantic-settings.
+- Paper and live are separate commands with separate configs. `live` will require both `mode: live` in config and an explicit `--live` CLI flag.
 
 ## 6. Initial Strategy Candidates
 
@@ -316,7 +320,7 @@ Trading-Bot/
 | 1. Data | Historical download, storage, quality checks | Several years of BTC and ETH 4h/1h data stored and verified |
 | 2. Core and backtester | Models, plugin interface, event-driven backtester, cost models, report, one sample strategy | Backtest matches hand-calculated results in tests |
 | 3. Validation tools | Walk-forward, parameter sweep, Monte Carlo, trial log | Validation report for the sample strategy |
-| 4. Paper trading | Live data, simulated broker, Telegram alerts, heartbeat | Two weeks of uninterrupted operation |
+| 4. Paper trading | Live data, simulated broker, ledger, Telegram alerts, heartbeat | Two weeks of uninterrupted operation |
 | 5. Live | Binance adapter, reconciliation, kill switch, exchange-side stops | Testnet run, then small live capital |
 | 6. Expansion | Multi-strategy allocation, dashboard, perpetuals | Two or more strategies running together |
 

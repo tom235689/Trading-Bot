@@ -1,6 +1,7 @@
 """Command line entry point."""
 
 import argparse
+import asyncio
 import os
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -16,6 +17,9 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.quality import QualityReport, check_bars
 from tbot.data.store import BarStore
+from tbot.live.config import Settings, load_paper_config
+from tbot.live.paper import run_paper, status_text
+from tbot.monitoring.logging import configure_logging
 from tbot.research.report import format_report
 from tbot.research.trials import TrialLog, make_record
 from tbot.research.validate import load_validation_config, run_validation
@@ -59,6 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("config", type=Path)
     validate.add_argument("--data-dir", type=Path, default=Path("data"))
     validate.add_argument("--workers", type=int, default=os.cpu_count() or 1)
+
+    paper = commands.add_parser("paper", help="paper trade on live Binance data until stopped")
+    paper.add_argument("config", type=Path)
+    paper.add_argument("--data-dir", type=Path, default=Path("data"))
+    paper.add_argument("--log-file", type=Path, default=Path("logs/paper.jsonl"))
+
+    status = commands.add_parser("status", help="show the paper ledger")
+    status.add_argument("config", type=Path)
+    status.add_argument("--data-dir", type=Path, default=Path("data"))
     return parser
 
 
@@ -150,6 +163,17 @@ def run_validate_command(args: argparse.Namespace) -> int:
     return 0 if report.passed else 1
 
 
+def run_paper_command(args: argparse.Namespace) -> int:
+    configure_logging(args.log_file)
+    config = load_paper_config(args.config)
+    return asyncio.run(run_paper(config, Settings(), args.data_dir))
+
+
+def run_status_command(args: argparse.Namespace) -> int:
+    print(status_text(load_paper_config(args.config), BarStore(args.data_dir)))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -161,5 +185,9 @@ def main(argv: list[str] | None = None) -> int:
         return run_backtest_command(args)
     if args.command == "validate":
         return run_validate_command(args)
+    if args.command == "paper":
+        return run_paper_command(args)
+    if args.command == "status":
+        return run_status_command(args)
     parser.print_help()
     return 0

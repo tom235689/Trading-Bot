@@ -37,6 +37,16 @@ uv run tbot validate config/donchian_validation.yaml
 
 Runs the in-sample baseline, cost stress, parameter sweep, walk-forward, Monte Carlo, deflated Sharpe, and a single holdout evaluation, then checks the promotion gate. Exit code 1 means the gate failed. Every backtest is appended to `data/trials.jsonl`; keep that file, it is the record of how many things were tried. See [docs/reports/](docs/reports/) for past reports.
 
+## Paper trading
+
+```sh
+cp .env.example .env                    # optional: Telegram token and chat id, heartbeat URL
+uv run tbot paper config/paper.yaml     # runs until Ctrl+C; logs to logs/paper.jsonl
+uv run tbot status config/paper.yaml    # equity, positions, recent fills and events
+```
+
+The bot syncs the bar store, rebuilds state from the ledger (`data/paper.sqlite`) and stored history, then trades on closed bars from the Binance WebSocket with simulated fills at the live book price. Restarting resumes from the ledger. Keep the machine awake and the network up; a supervisor (Task Scheduler, NSSM, systemd) that restarts the process on exit is recommended for long runs.
+
 ## Git hooks
 
 | Hook | Checks |
