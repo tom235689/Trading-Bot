@@ -10,6 +10,7 @@ import httpx
 import yaml
 
 from tbot import __version__
+from tbot.backtest.attribution import format_attribution, run_attribution
 from tbot.backtest.config import load_config
 from tbot.backtest.metrics import compute_metrics
 from tbot.backtest.report import format_metrics
@@ -20,6 +21,7 @@ from tbot.data.quality import QualityReport, check_bars
 from tbot.data.store import BarStore
 from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings, load_live_config
 from tbot.live.runner import account_text, resume, run_live, run_paper, status_text
+from tbot.monitoring.dashboard import DashboardData, from_backtest, from_ledger, render
 from tbot.monitoring.logging import configure_logging
 from tbot.research.report import format_report
 from tbot.research.trials import TrialLog, make_record
@@ -67,6 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
     backtest = commands.add_parser("backtest", help="run a backtest from a YAML config")
     backtest.add_argument("config", type=Path)
     backtest.add_argument("--data-dir", type=Path, default=Path("data"))
+    backtest.add_argument(
+        "--attribution", action="store_true", help="also run each strategy alone and compare"
+    )
+    backtest.add_argument("--html", type=Path, default=None, help="write an HTML dashboard")
 
     validate = commands.add_parser("validate", help="run the validation pipeline")
     validate.add_argument("config", type=Path)
@@ -93,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     account = commands.add_parser("account", help="show exchange balances and open orders")
     account.add_argument("config", type=Path)
+
+    dashboard = commands.add_parser("dashboard", help="write an HTML dashboard of a session")
+    dashboard.add_argument("config", type=Path)
+    dashboard.add_argument("--data-dir", type=Path, default=Path("data"))
+    dashboard.add_argument("--out", type=Path, default=None, help="default reports/<name>.html")
     return parser
 
 
@@ -167,6 +178,26 @@ def run_backtest_command(args: argparse.Namespace) -> int:
     print(format_metrics(metrics))
     for symbol, quantity in sorted(result.positions.items()):
         print(f"Open position {symbol} {quantity:.6f}")
+    if args.attribution:
+        print()
+        print(format_attribution(run_attribution(config, BarStore(args.data_dir))))
+    if args.html:
+        subtitle = f"{args.config}, {config.start} to {config.end or 'latest'}"
+        write_dashboard(from_backtest(result, f"Backtest {args.config.stem}", subtitle), args.html)
+    return 0
+
+
+def write_dashboard(data: DashboardData, out: Path) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render(data), encoding="utf-8")
+    print(f"wrote {out}")
+
+
+def run_dashboard_command(args: argparse.Namespace) -> int:
+    config = load_session_config(args.config)
+    out = args.out or Path("reports") / f"{args.config.stem}.html"
+    title = f"{'Live' if isinstance(config, LiveConfig) else 'Paper'} session {args.config.stem}"
+    write_dashboard(from_ledger(config, BarStore(args.data_dir), title), out)
     return 0
 
 
@@ -223,6 +254,7 @@ COMMANDS = {
     "status": run_status_command,
     "resume": run_resume_command,
     "account": run_account_command,
+    "dashboard": run_dashboard_command,
 }
 
 

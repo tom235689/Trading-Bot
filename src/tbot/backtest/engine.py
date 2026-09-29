@@ -25,6 +25,7 @@ from tbot.execution.sim_broker import CostModel, SimulatedBroker
 from tbot.portfolio.allocation import StrategySlot, decide_orders, validate_targets
 from tbot.portfolio.portfolio import Portfolio
 from tbot.risk.limits import RiskLimits
+from tbot.risk.volatility import volatility_scale
 from tbot.strategies.base import BarWindow, StrategyContext
 
 StreamKey = tuple[str, Timeframe]
@@ -176,7 +177,20 @@ class BacktestEngine:
         return updated
 
     def _rebalance(self, now_ms: int) -> None:
-        orders = decide_orders(self.slots, self.portfolio, self.marks, self.risk, self.rules)
+        scales = None
+        if self.risk.target_volatility:
+            scales = {
+                symbol: volatility_scale(
+                    self.streams[key].close[: self.streams[key].visible],
+                    key[1],
+                    self.risk.target_volatility,
+                    self.risk.volatility_lookback_days,
+                )
+                for symbol, key in self.exec_keys.items()
+            }
+        orders = decide_orders(
+            self.slots, self.portfolio, self.marks, self.risk, self.rules, scales
+        )
         self.pending = [PendingOrder(now_ms, s, q) for s, q in orders.items()]
 
     def _result(self) -> BacktestResult:

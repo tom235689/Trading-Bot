@@ -150,7 +150,7 @@ strategies:
 ### 5.4 Portfolio
 
 - Combines strategy targets by allocation. Opposite targets on the same symbol net out, saving fees.
-- Volatility targeting: scale exposure down for more volatile symbols.
+- Volatility targeting (`risk.target_volatility`, `risk.volatility_lookback_days`; `tbot/risk/volatility.py`): each symbol's combined weight is multiplied by `min(1, target / realized)` where realized is the annualized standard deviation of log returns over the lookback on the symbol's finest stream. Spot never scales up. Applied before the per-symbol and gross caps, identically in backtest and session. On the Donchian strategy a 0.4 target cut the 2018-2024 drawdown from -40% to -25% while raising the Sharpe from 1.03 to 1.29 (`docs/reports/donchian_voltarget_2026-09-29.md`).
 - No-trade band: skip rebalances smaller than a threshold or below the minimum notional, to limit churn.
 - Tracks positions, cash, realized and unrealized PnL, and per-strategy attribution.
 
@@ -214,7 +214,9 @@ Two tiers:
 
 **Config** (YAML): `start`, optional `end` (exclusive), `initial_cash`, `costs`, `risk`, `rebalance`, and `strategies` as in 5.3. Allocations must sum to at most 1. See `config/donchian_trend.yaml`.
 
-**Report**: CAGR, Sharpe and Sortino (daily returns, 365-day year, zero risk-free rate), Calmar, max drawdown, win rate, profit factor, turnover, exposure, fees, average trade return. Per-strategy attribution comes with multi-strategy support.
+**Report**: CAGR, Sharpe and Sortino (daily returns, 365-day year, zero risk-free rate), Calmar, max drawdown, win rate, profit factor, turnover, exposure, fees, average trade return. `--html` writes the dashboard for the run.
+
+**Attribution** (`tbot backtest <config> --attribution`, `tbot/backtest/attribution.py`): runs every strategy alone with full capital and then the configured combination, and prints the metrics side by side with the correlation of the solo daily returns. This is how a candidate second strategy is judged: an uncorrelated strategy only helps if it has positive expectancy on its own. First result (`config/multi.yaml`): the RSI mean-reversion leg loses money alone (Sharpe -0.37) and lowers the mix below Donchian alone despite zero correlation, so it stays an example, not a recommendation.
 
 ### 5.9 Persistence
 
@@ -228,7 +230,7 @@ Two tiers:
 - Telegram alerts (`TBOT_TELEGRAM_TOKEN`, `TBOT_TELEGRAM_CHAT_ID`): start and stop, every fill, failed price lookups, stale streams, task crashes, and a daily summary at `summary_hour_utc`. Without a token, alerts go to the log. A failed send is logged and never stops trading. Risk limit hits, kill switch, and reconciliation mismatches are added with the live phase.
 - External heartbeat (`TBOT_HEARTBEAT_URL`): the bot pings an outside monitor every `heartbeat_seconds`. If pings stop, the monitor alerts. A dead bot cannot alert on its own.
 - `tbot status <config>` prints the ledger: equity, positions, recent fills and events, and the last stored bar per stream.
-- Dashboard (later): equity curve, positions, per-strategy performance.
+- Dashboard (`tbot dashboard <config>`, `tbot backtest --html`; `tbot/monitoring/dashboard.py`): one self-contained HTML file with stat tiles, equity and drawdown charts (inline SVG, crosshair tooltip, light and dark mode, table view), open positions, recent fills and events. Static on purpose: nothing listens on the trading machine; generate it on demand or on a schedule. Per-strategy performance is the attribution report.
 
 **Paper session** (`tbot paper <config>`, `tbot/live/paper.py`): the session (`tbot/live/session.py`) runs the backtest's decision path one event at a time: append the bars that closed, mark, run the strategies whose bars closed, combine targets, apply risk limits, plan orders. Paper fills happen at once at the live book price (ask for buys, bid for sells) through the same simulated broker with fees and slippage. Every signal, order, fill, and equity snapshot goes to a SQLite ledger. On start the bot syncs the store, rebuilds the portfolio by replaying the ledger's fills, rebuilds strategy state by replaying stored history through the strategies, and warns if the trading config changed since the ledger was created. Fills are timestamped with the wall clock; equity snapshots with the bar close. A test proves the session reproduces the backtest engine bar for bar when fills use the next bar's open.
 
@@ -326,7 +328,9 @@ Trading-Bot/
 | 3. Validation tools | Walk-forward, parameter sweep, Monte Carlo, trial log | Validation report for the sample strategy |
 | 4. Paper trading | Live data, simulated broker, ledger, Telegram alerts, heartbeat | Two weeks of uninterrupted operation |
 | 5. Live | Binance adapter, live executor, reconciliation, risk guard with kill switch, exchange-side stops, `tbot live` | Testnet run, then small live capital |
-| 6. Expansion | Multi-strategy allocation, dashboard, perpetuals | Two or more strategies running together |
+| 6. Expansion | Volatility targeting, second strategy plugin and attribution, dashboard; perpetuals deferred | Two or more strategies running together |
+
+Perpetuals are deferred: they add a second API surface (USD-M futures), margin and liquidation handling, funding accrual, and shorting to every layer, which deserves its own design pass. The validation results say exposure control on spot was the more valuable step.
 
 No live trading before a strategy passes phase 3 validation.
 

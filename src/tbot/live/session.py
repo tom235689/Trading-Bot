@@ -11,6 +11,7 @@ from tbot.live.history import BarHistory
 from tbot.live.ledger import EquityPoint
 from tbot.portfolio.allocation import StrategySlot, decide_orders, validate_targets
 from tbot.portfolio.portfolio import Portfolio
+from tbot.risk.volatility import volatility_scale
 from tbot.strategies.base import StrategyContext
 
 StreamKey = tuple[str, Timeframe]
@@ -59,7 +60,20 @@ class TradingSession:
         if not self._run_strategies(closed.keys(), now):
             return {}
         cfg = self.config
-        return decide_orders(self.slots, self.portfolio, self.marks, cfg.risk, cfg.rebalance)
+        scales = None
+        if cfg.risk.target_volatility:
+            scales = {
+                symbol: volatility_scale(
+                    self.histories[key].values["close"],
+                    key[1],
+                    cfg.risk.target_volatility,
+                    cfg.risk.volatility_lookback_days,
+                )
+                for symbol, key in self.exec_keys.items()
+            }
+        return decide_orders(
+            self.slots, self.portfolio, self.marks, cfg.risk, cfg.rebalance, scales
+        )
 
     def replay(self, closed: Mapping[StreamKey, pl.DataFrame], now: datetime) -> None:
         """Warm up: same as ingest but nothing is traded."""

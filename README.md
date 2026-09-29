@@ -27,7 +27,13 @@ Downloads only extend forward from the last stored bar. Delete the symbol's dire
 uv run tbot backtest config/donchian_trend.yaml
 ```
 
-A config lists strategies with symbols, timeframe, allocation, and params, plus costs, risk limits, and rebalance rules. Strategies are plugins registered by name in `src/tbot/strategies/`.
+A config lists strategies with symbols, timeframe, allocation, and params, plus costs, risk limits (including volatility targeting), and rebalance rules. Strategies are plugins registered by name in `src/tbot/strategies/` (`donchian_trend`, `rsi_reversion`).
+
+```sh
+uv run tbot backtest config/multi.yaml --attribution      # each strategy alone, the mix, correlation
+uv run tbot backtest config/donchian_voltarget.yaml --html reports/voltarget.html
+uv run tbot dashboard config/paper.yaml                   # reports/paper.html from the ledger
+```
 
 ## Validation
 

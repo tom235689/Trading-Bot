@@ -1,0 +1,21 @@
+# Donchian trend on BTC and ETH 4h bars with volatility targeting: each symbol's weight is
+# scaled down when its 30-day realized volatility exceeds the target (never scaled up).
+start: 2018-01-01
+initial_cash: 10000
+costs:
+  fee_rate: 0.001
+  slippage_bps: 5
+risk:
+  max_symbol_weight: 1.0
+  max_gross_exposure: 1.0
+  target_volatility: 0.4
+  volatility_lookback_days: 30
+rebalance:
+  min_notional: 10
+  rebalance_threshold: 0.02
+strategies:
+  - name: donchian_trend
+    symbols: [BTC/USDT, ETH/USDT]
+    timeframe: 4h
+    allocation: 1.0
+    params: {entry: 55, exit: 20}

@@ -23,6 +23,7 @@ htmlcov/
 # Runtime data (root only; src/tbot/data is code)
 /data/
 /logs/
+/reports/
 *.db
 *.sqlite
 *.sqlite3

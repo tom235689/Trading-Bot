@@ -54,10 +54,14 @@ def decide_orders(
     marks: Mapping[str, float],
     risk: RiskLimits,
     rules: RebalanceRules,
+    scales: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
-    """Signed order quantities that move the portfolio to the risk-limited combined targets."""
+    """Signed order quantities that move the portfolio to the risk-limited combined targets.
+
+    `scales` are per-symbol volatility scales in [0, 1] from `risk.volatility`.
+    """
     equity = portfolio.equity(marks)
     if equity <= 0:
         return {}
-    weights = risk.apply(combine_targets(slots))
+    weights = risk.apply(combine_targets(slots), scales)
     return plan_orders(weights, portfolio.positions, marks, equity, rules)
