@@ -171,24 +171,28 @@ Independent layer with veto power. Values below are the intended live defaults a
 
 The kill switch state is persisted. A restart does not resume trading; a human must reset it.
 
+**Implementation** (`tbot/live/guard.py`, applied by `SessionTrader` in paper, testnet, and live): the `guard` config section holds `daily_loss_limit`, `max_drawdown`, and `stale_seconds` (zero disables a rule). Each event: equity below the day's opening equity by the daily limit puts the session in reduce-only mode (orders may only shrink positions); equity below the running peak by the drawdown limit flattens every position and halts; a bar older than `stale_seconds` when it arrives blocks that event. Guard state (peak, day open, halted) is saved in the ledger after every check, so a restart stays halted; `tbot resume <config>` clears it and resets the peak. Per-symbol and gross exposure caps are applied earlier by `RiskLimits`; order sanity (tick, step, minimum notional) by the executor; unknown state (reconciliation failure) by alerting and adopting the exchange.
+
 ### 5.6 Execution
 
-- **Order lifecycle**: `PENDING -> NEW -> PARTIALLY_FILLED -> FILLED | CANCELED | REJECTED | EXPIRED`.
-- **Write-ahead**: persist the order intent before sending, so a crash can be recovered.
-- **Idempotency**: every order carries a deterministic client order ID. On timeout, query by that ID before retrying.
-- **Retries**: exponential backoff on network errors and rate limits; no retry on business rejects.
-- **Order type**: post-only limit (`LIMIT_MAKER`) first for lower fees; fall back to market after a timeout.
-- **Protective stops**: place exchange-side stop orders so losses stay bounded if the bot dies.
-- **Reconciliation**: on startup and every few minutes, compare balances, positions, and open orders with the exchange. On mismatch, alert and adopt exchange state.
+- **Executor** (`tbot/live/executor.py`): the session hands signed order quantities to an executor. `PaperExecutor` fills through the simulated broker; `LiveExecutor` trades on Binance spot. The same `SessionTrader` drives both.
+- **Write-ahead**: the order is written to the ledger as `pending` before it is sent, then updated to `filled`, `skipped`, `unfilled`, or `failed`.
+- **Idempotency**: the client order id is derived from the bar close time, symbol, and side (`tb<close ms><symbol><B|S>`). Before sending, the executor asks the exchange for that id; an order that already exists (crash after send, lost response) is adopted, never re-sent. A transport failure while sending is followed by the same lookup.
+- **Sizing at the exchange**: buys are capped by free quote balance (with fee and a small margin), sells by free base balance; quantities are rounded down to the lot step and orders below the exchange minimum are skipped.
+- **Fees**: commission paid in the base asset reduces the filled quantity; every commission is converted into quote and booked as the fill's fee (BNB and others via the ticker), so the book stays equal to the exchange balances.
+- **Order type**: market orders for now. Post-only limit with a market fallback is a later improvement.
+- **Protective stops**: after every event a `STOP_LOSS_LIMIT` sell sits on the exchange for each held position at `protective_stop_pct` below the last close (limit 0.5% under the stop). Stops are cancelled before a sell (they lock the balance) and re-placed afterwards. A stop that fires while the bot is down shows up as a reconciliation adjustment.
+- **Reconciliation** (`tbot/live/reconcile.py`): on startup and every `reconcile_seconds`, base balances (free plus locked) are compared with booked positions and free quote with booked cash. Differences beyond the lot step or `reconcile_tolerance` (cash: at least one quote unit) are adopted from the exchange, written to the ledger's `adjustments` table, and alerted. Restoring a book replays fills and adjustments in time order.
 
 ### 5.7 Binance Adapter
 
-- Built on ccxt with `enableRateLimit`. Respect request weight and order count limits.
-- Sync server time (`adjustForTimeDifference`) to avoid timestamp and `recvWindow` errors.
-- Round prices and quantities to each symbol's `PRICE_FILTER`, `LOT_SIZE`, and `NOTIONAL` filters from exchange info.
-- Order and fill updates from the user data stream over WebSocket, with REST polling as a fallback.
-- Client order IDs: at most 36 characters, only characters Binance allows.
+- `tbot/exchange/binance.py` talks to the spot REST API directly (no ccxt): the bot needs about ten endpoints, and a small adapter is easier to test against a fake exchange. Signed requests use HMAC-SHA256 with a timestamp from the server-synced clock and `recv_window`.
+- GET and DELETE retry on rate limits (418, 429) and server errors with backoff; POST never retries, the executor's client-id lookup handles uncertainty.
+- Symbol rules from `exchangeInfo` (`PRICE_FILTER`, `LOT_SIZE`, `NOTIONAL`) round prices and quantities with `Decimal`; symbols that are not `TRADING` refuse to start.
+- Order and fill updates come from the order response (`newOrderRespType=FULL`) and periodic reconciliation; the user data stream is a later improvement.
+- Client order ids: at most 36 characters, only characters Binance allows.
 - Fees come from config and are checked against the account's actual fee rates (BNB discount, VIP tier).
+- Testnet (`https://testnet.binance.vision`) has the same API with fake balances; signals still use production market data, so testnet fills happen at testnet prices and only prove the mechanics.
 - Binance blocks some regions, including the US. The host must run from an allowed region.
 
 ### 5.8 Backtest
@@ -321,7 +325,7 @@ Trading-Bot/
 | 2. Core and backtester | Models, plugin interface, event-driven backtester, cost models, report, one sample strategy | Backtest matches hand-calculated results in tests |
 | 3. Validation tools | Walk-forward, parameter sweep, Monte Carlo, trial log | Validation report for the sample strategy |
 | 4. Paper trading | Live data, simulated broker, ledger, Telegram alerts, heartbeat | Two weeks of uninterrupted operation |
-| 5. Live | Binance adapter, reconciliation, kill switch, exchange-side stops | Testnet run, then small live capital |
+| 5. Live | Binance adapter, live executor, reconciliation, risk guard with kill switch, exchange-side stops, `tbot live` | Testnet run, then small live capital |
 | 6. Expansion | Multi-strategy allocation, dashboard, perpetuals | Two or more strategies running together |
 
 No live trading before a strategy passes phase 3 validation.

@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS equity (
     exposure REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, time TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS adjustments (
+    id INTEGER PRIMARY KEY, time TEXT NOT NULL, symbol TEXT NOT NULL, quantity REAL NOT NULL,
+    cash REAL NOT NULL, note TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS equity_time ON equity (time);
 """
 
@@ -42,6 +45,17 @@ class Event:
     time: datetime
     level: str
     message: str
+
+
+@dataclass(frozen=True)
+class Adjustment:
+    """Position and cash delta from reconciling against the exchange. Symbol "" means cash only."""
+
+    time: datetime
+    symbol: str
+    quantity: float
+    cash: float
+    note: str = ""
 
 
 def _iso(moment: datetime) -> str:
@@ -106,6 +120,28 @@ class Ledger:
                 "INSERT INTO orders (time, symbol, quantity, status, note) VALUES (?, ?, ?, ?, ?)",
                 (_iso(time), symbol, quantity, status, note),
             )
+
+    # adjustments: reconciliation deltas applied on top of fills
+
+    def add_adjustment(self, adjustment: Adjustment) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO adjustments (time, symbol, quantity, cash, note) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    _iso(adjustment.time),
+                    adjustment.symbol,
+                    adjustment.quantity,
+                    adjustment.cash,
+                    adjustment.note,
+                ),
+            )
+
+    def adjustments(self) -> list[Adjustment]:
+        rows = self.conn.execute(
+            "SELECT time, symbol, quantity, cash, note FROM adjustments ORDER BY id"
+        ).fetchall()
+        return [Adjustment(_parse(t), s, q, c, n) for t, s, q, c, n in rows]
 
     # signals and equity
 

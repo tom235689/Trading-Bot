@@ -1,0 +1,32 @@
+# Real money. `tbot live config/live.yaml --live` is required to start it.
+# initial_cash is the book's starting cash; on the first run the exchange balance replaces it.
+mode: live
+initial_cash: 1000
+costs:
+  fee_rate: 0.001
+  slippage_bps: 5
+risk:
+  max_symbol_weight: 0.3
+  max_gross_exposure: 1.0
+rebalance:
+  min_notional: 10
+  rebalance_threshold: 0.02
+guard:
+  daily_loss_limit: 0.03
+  max_drawdown: 0.15
+  stale_seconds: 900
+strategies:
+  - name: donchian_trend
+    symbols: [BTC/USDT, ETH/USDT]
+    timeframe: 4h
+    allocation: 1.0
+    params: {entry: 55, exit: 20}
+ledger: data/live.sqlite
+protective_stop_pct: 0.2
+reconcile_seconds: 300
+reconcile_tolerance: 0.002
+recv_window: 5000
+heartbeat_seconds: 300
+stale_after_seconds: 600
+batch_wait_seconds: 5
+summary_hour_utc: 0

@@ -6,18 +6,19 @@ import httpx
 import pytest
 
 from factories import Scripted, price_bars
-from tbot.cli import main
+from tbot.cli import load_session_config, main
 from tbot.core.config import StrategyConfig
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
-from tbot.live.config import PaperConfig, Settings, load_paper_config
+from tbot.live.config import LiveConfig, PaperConfig, Settings, load_paper_config
+from tbot.live.executor import PaperExecutor
+from tbot.live.guard import GuardConfig, RiskGuard
 from tbot.live.history import BarHistory
 from tbot.live.ledger import Ledger
-from tbot.live.paper import (
-    PaperTrader,
-    PriceSource,
+from tbot.live.runner import (
+    SessionTrader,
     build_session,
     lookback_bars,
     make_notifier,
@@ -34,6 +35,7 @@ from tbot.portfolio.portfolio import Portfolio
 H1, H4 = Timeframe.H1, Timeframe.H4
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
 BTC = ("BTC", H1)
+NO_GUARD = GuardConfig(daily_loss_limit=0, max_drawdown=0, stale_seconds=0)
 
 
 def at(hours: int) -> datetime:
@@ -69,12 +71,13 @@ def paper_config(tmp_path: Path) -> PaperConfig:
         rebalance=RebalanceRules(min_notional=0, rebalance_threshold=0),
         strategies=[StrategyConfig(name="scripted", symbols=["BTC"], timeframe=H1, allocation=1)],
         ledger=tmp_path / "paper.sqlite",
+        guard=NO_GUARD,
     )
 
 
 def make_trader(
-    tmp_path: Path, script: dict[datetime, dict[str, float]], prices: PriceSource
-) -> tuple[PaperTrader, Ledger, Collect]:
+    tmp_path: Path, script: dict[datetime, dict[str, float]], prices: FakePrices | FailingPrices
+) -> tuple[SessionTrader, Ledger, Collect]:
     config = paper_config(tmp_path)
     session = TradingSession(
         config,
@@ -84,8 +87,9 @@ def make_trader(
     )
     ledger = Ledger(config.ledger)
     notifier = Collect()
-    trader = PaperTrader(
-        session, ledger, SimulatedBroker(config.costs), prices, notifier, clock=lambda: at(9)
+    executor = PaperExecutor(SimulatedBroker(config.costs), prices, ledger, notifier, lambda: at(9))
+    trader = SessionTrader(
+        session, ledger, executor, notifier, RiskGuard(NO_GUARD), clock=lambda: at(9)
     )
     return trader, ledger, notifier
 
@@ -106,13 +110,15 @@ def test_handle_fills_records_and_alerts(tmp_path: Path) -> None:
     assert nothing == []
     assert buys[0].time == at(9)  # fill time is the wall clock, not the bar close
     assert ledger.fills() == buys + sells
-    assert ledger.counts() == {"fills": 2, "orders": 2, "signals": 3, "equity": 3, "events": 0}
+    counts = ledger.counts()
+    assert (counts["fills"], counts["orders"], counts["signals"], counts["equity"]) == (2, 2, 3, 3)
     latest = ledger.latest_equity()
     assert latest is not None
     assert latest.equity == pytest.approx(1000 - 0.5 - 0.5)  # two fees, flat price
     assert latest.time == at(3)
     assert notifier.messages[0].startswith("[paper] BUY 5.000000 BTC @ 100.00")
     assert notifier.messages[1].startswith("[paper] SELL 5.000000 BTC @ 100.00")
+    assert ledger.get_meta("guard") is not None  # guard state persisted every event
     ledger.close()
 
 
@@ -140,7 +146,7 @@ def test_restore_portfolio_replays_ledger_fills(tmp_path: Path) -> None:
 def test_summary_and_status_text(tmp_path: Path) -> None:
     trader, ledger, _ = make_trader(tmp_path, {at(1): {"BTC": 0.5}}, FakePrices({"BTC": 100.0}))
     asyncio.run(trader.handle({BTC: BARS.slice(0, 1)}))
-    summary = summary_text(trader.session, ledger, at(1))
+    summary = summary_text(trader.session, ledger, at(1), "paper")
     assert "equity 999.50" in summary
     assert "BTC 5.000000" in summary
     ledger.close()
@@ -148,9 +154,10 @@ def test_summary_and_status_text(tmp_path: Path) -> None:
     store = BarStore(tmp_path / "data")
     store.write("BTC", H1, BARS)
     status = status_text(paper_config(tmp_path), store)
-    assert "fills 1, round trips 0" in status
+    assert "fills 1, round trips 0, adjustments 0" in status
     assert "position BTC 5.000000" in status
     assert "last stored bar BTC: 2024-01-01 02:00" in status
+    assert "HALTED" not in status
 
 
 def test_stream_keys_and_lookback() -> None:
@@ -204,16 +211,24 @@ def test_build_session_needs_stored_history(tmp_path: Path) -> None:
     assert session.slots[0].targets == {"BTCUSDT": 1.0}  # rising series: long after warmup
 
 
-def test_paper_config_and_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = load_paper_config(Path("config/paper.yaml"))
-    assert config.ledger == Path("data/paper.sqlite")
-    assert config.risk.max_symbol_weight == 0.5
+def test_configs_and_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paper = load_paper_config(Path("config/paper.yaml"))
+    assert paper.ledger == Path("data/paper.sqlite")
+    assert paper.risk.max_symbol_weight == 0.5
+    testnet = load_session_config(Path("config/testnet.yaml"))
+    assert isinstance(testnet, LiveConfig)
+    assert testnet.mode == "testnet"
+    live = load_session_config(Path("config/live.yaml"))
+    assert isinstance(live, LiveConfig)
+    assert (live.mode, live.protective_stop_pct, live.guard.max_drawdown) == ("live", 0.2, 0.15)
+    assert isinstance(load_session_config(Path("config/paper.yaml")), PaperConfig)
 
     monkeypatch.chdir(tmp_path)  # no .env here: only the environment counts
-    for name in ("TBOT_TELEGRAM_TOKEN", "TBOT_TELEGRAM_CHAT_ID", "TBOT_HEARTBEAT_URL"):
-        monkeypatch.delenv(name, raising=False)
+    for name in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "HEARTBEAT_URL", "BINANCE_API_KEY"):
+        monkeypatch.delenv(f"TBOT_{name}", raising=False)
     empty = Settings()
     assert empty.telegram_token is None
+    assert empty.binance_api_key is None
     monkeypatch.setenv("TBOT_TELEGRAM_TOKEN", "token")
     monkeypatch.setenv("TBOT_TELEGRAM_CHAT_ID", "42")
     configured = Settings()
@@ -240,3 +255,5 @@ def test_status_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     out = capsys.readouterr().out
     assert "no equity snapshots yet" in out
     assert "no bars BTCUSDT" in out
+    assert main(["resume", str(config_path)]) == 0
+    assert "not halted" in capsys.readouterr().out

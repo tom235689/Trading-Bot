@@ -47,6 +47,19 @@ uv run tbot status config/paper.yaml    # equity, positions, recent fills and ev
 
 The bot syncs the bar store, rebuilds state from the ledger (`data/paper.sqlite`) and stored history, then trades on closed bars from the Binance WebSocket with simulated fills at the live book price. Restarting resumes from the ledger. Keep the machine awake and the network up; a supervisor (Task Scheduler, NSSM, systemd) that restarts the process on exit is recommended for long runs.
 
+## Testnet and live trading
+
+```sh
+# .env: TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET (testnet keys from testnet.binance.vision)
+uv run tbot account config/testnet.yaml          # balances and open orders: checks the keys
+uv run tbot live config/testnet.yaml             # real order path, fake money
+uv run tbot live config/live.yaml --live         # real money; the flag is mandatory
+uv run tbot status config/live.yaml
+uv run tbot resume config/live.yaml              # clear the kill switch after a halt
+```
+
+Before live: API key with spot trading only, withdrawals off, IP restricted; Windows time sync enabled (the bot warns when the clock is off by more than a second); a supervisor that restarts the process. Every position carries an exchange-side stop `protective_stop_pct` below the last close, so a dead bot still has bounded loss.
+
 ## Git hooks
 
 | Hook | Checks |

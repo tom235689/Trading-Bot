@@ -1,31 +1,53 @@
-"""Paper trading configuration (YAML) and secrets (environment)."""
+"""Paper and live session configuration (YAML) and secrets (environment)."""
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tbot.core.config import TradingConfig
+from tbot.live.guard import GuardConfig
 
 
-class PaperConfig(TradingConfig):
-    ledger: Path = Path("data/paper.sqlite")
+class SessionConfig(TradingConfig):
+    ledger: Path
+    guard: GuardConfig = GuardConfig()
     heartbeat_seconds: int = Field(default=300, ge=30)
     stale_after_seconds: int = Field(default=600, ge=60)  # bar overdue by this much: alert
     batch_wait_seconds: float = Field(default=5.0, ge=0)  # wait for streams closing together
     summary_hour_utc: int = Field(default=0, ge=0, le=23)
 
 
+class PaperConfig(SessionConfig):
+    ledger: Path = Path("data/paper.sqlite")
+
+
+class LiveConfig(SessionConfig):
+    mode: Literal["testnet", "live"]
+    ledger: Path = Path("data/live.sqlite")
+    protective_stop_pct: float = Field(default=0.2, ge=0, lt=1)  # 0 disables exchange stops
+    reconcile_seconds: int = Field(default=300, ge=30)
+    reconcile_tolerance: float = Field(default=0.002, ge=0)  # relative mismatch that is noise
+    recv_window: int = Field(default=5000, ge=1000, le=60000)
+
+
 def load_paper_config(path: Path) -> PaperConfig:
     return PaperConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
 
 
+def load_live_config(path: Path) -> LiveConfig:
+    return LiveConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+
+
 class Settings(BaseSettings):
-    """Secrets and endpoints from the environment or a .env file. All optional."""
+    """Secrets and endpoints from the environment or a .env file."""
 
     model_config = SettingsConfigDict(env_prefix="TBOT_", env_file=".env", extra="ignore")
 
     telegram_token: str | None = None
     telegram_chat_id: str | None = None
     heartbeat_url: str | None = None
+    binance_api_key: str | None = None
+    binance_api_secret: str | None = None

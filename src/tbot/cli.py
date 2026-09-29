@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, time
 from pathlib import Path
 
 import httpx
+import yaml
 
 from tbot import __version__
 from tbot.backtest.config import load_config
@@ -17,8 +18,8 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.quality import QualityReport, check_bars
 from tbot.data.store import BarStore
-from tbot.live.config import Settings, load_paper_config
-from tbot.live.paper import run_paper, status_text
+from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings, load_live_config
+from tbot.live.runner import account_text, resume, run_live, run_paper, status_text
 from tbot.monitoring.logging import configure_logging
 from tbot.research.report import format_report
 from tbot.research.trials import TrialLog, make_record
@@ -40,6 +41,14 @@ def parse_date(value: str) -> datetime:
 
 def fmt(moment: datetime | None) -> str:
     return f"{moment:%Y-%m-%d %H:%M}" if moment else "-"
+
+
+def load_session_config(path: Path) -> SessionConfig:
+    """A config with `mode` is a live config; anything else is paper."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if "mode" in raw:
+        return LiveConfig.model_validate(raw)
+    return PaperConfig.model_validate(raw)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,9 +78,21 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--data-dir", type=Path, default=Path("data"))
     paper.add_argument("--log-file", type=Path, default=Path("logs/paper.jsonl"))
 
-    status = commands.add_parser("status", help="show the paper ledger")
+    live = commands.add_parser("live", help="trade on Binance testnet or live until stopped")
+    live.add_argument("config", type=Path)
+    live.add_argument("--live", action="store_true", help="required when the config mode is live")
+    live.add_argument("--data-dir", type=Path, default=Path("data"))
+    live.add_argument("--log-file", type=Path, default=Path("logs/live.jsonl"))
+
+    status = commands.add_parser("status", help="show a session ledger")
     status.add_argument("config", type=Path)
     status.add_argument("--data-dir", type=Path, default=Path("data"))
+
+    resume_cmd = commands.add_parser("resume", help="clear the kill switch of a session")
+    resume_cmd.add_argument("config", type=Path)
+
+    account = commands.add_parser("account", help="show exchange balances and open orders")
+    account.add_argument("config", type=Path)
     return parser
 
 
@@ -165,29 +186,50 @@ def run_validate_command(args: argparse.Namespace) -> int:
 
 def run_paper_command(args: argparse.Namespace) -> int:
     configure_logging(args.log_file)
-    config = load_paper_config(args.config)
+    config = load_session_config(args.config)
+    if not isinstance(config, PaperConfig):
+        raise SystemExit("this is a live config; use `tbot live`")
     return asyncio.run(run_paper(config, Settings(), args.data_dir))
 
 
+def run_live_command(args: argparse.Namespace) -> int:
+    configure_logging(args.log_file)
+    config = load_live_config(args.config)
+    return asyncio.run(run_live(config, Settings(), args.data_dir, confirmed=args.live))
+
+
 def run_status_command(args: argparse.Namespace) -> int:
-    print(status_text(load_paper_config(args.config), BarStore(args.data_dir)))
+    print(status_text(load_session_config(args.config), BarStore(args.data_dir)))
     return 0
+
+
+def run_resume_command(args: argparse.Namespace) -> int:
+    print(resume(load_session_config(args.config)))
+    return 0
+
+
+def run_account_command(args: argparse.Namespace) -> int:
+    print(asyncio.run(account_text(load_live_config(args.config), Settings())))
+    return 0
+
+
+COMMANDS = {
+    "download": run_download,
+    "check": run_check,
+    "backtest": run_backtest_command,
+    "validate": run_validate_command,
+    "paper": run_paper_command,
+    "live": run_live_command,
+    "status": run_status_command,
+    "resume": run_resume_command,
+    "account": run_account_command,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == "download":
-        return run_download(args)
-    if args.command == "check":
-        return run_check(args)
-    if args.command == "backtest":
-        return run_backtest_command(args)
-    if args.command == "validate":
-        return run_validate_command(args)
-    if args.command == "paper":
-        return run_paper_command(args)
-    if args.command == "status":
-        return run_status_command(args)
+    if args.command in COMMANDS:
+        return COMMANDS[args.command](args)
     parser.print_help()
     return 0
