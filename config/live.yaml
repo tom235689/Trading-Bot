@@ -1,13 +1,18 @@
 # Real money. `tbot live config/live.yaml --live` is required to start it.
-# initial_cash is the book's starting cash; on the first run the exchange balance replaces it.
+# The bot manages initial_cash (in USDT) and what it buys with it. Other balances in the
+# account, including BTC or ETH bought by hand, are left alone (ownership: budget).
+# Start small: initial_cash is the most the bot can lose. Keep at least that much free USDT.
 mode: live
+ownership: budget
 initial_cash: 1000
 costs:
   fee_rate: 0.001
   slippage_bps: 5
 risk:
-  max_symbol_weight: 0.3
+  max_symbol_weight: 0.5
   max_gross_exposure: 1.0
+  target_volatility: 0.4
+  volatility_lookback_days: 30
 rebalance:
   min_notional: 10
   rebalance_threshold: 0.02

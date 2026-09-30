@@ -11,13 +11,14 @@ from tbot.core.timeframe import Timeframe, from_millis
 from tbot.strategies.base import BarWindow
 
 COLUMNS = ("open", "high", "low", "close", "volume")
+MAX_BARS = 5000  # default history kept per stream
 
 
 class BarHistory:
     """Closed bars oldest first. Only the most recent max_bars are kept."""
 
     def __init__(
-        self, timeframe: Timeframe, bars: pl.DataFrame | None = None, max_bars: int = 5000
+        self, timeframe: Timeframe, bars: pl.DataFrame | None = None, max_bars: int = MAX_BARS
     ) -> None:
         self.timeframe = timeframe
         self.max_bars = max_bars

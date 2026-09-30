@@ -1,14 +1,22 @@
-# Paper trading: Donchian trend on BTC and ETH 4h bars, simulated fills at live prices.
+# Paper trading: simulated fills at live Binance prices. Trading settings are the validated
+# candidate (config/donchian_voltarget.yaml), and testnet.yaml and live.yaml use the same ones,
+# so two weeks of paper rehearse exactly what would go live.
 initial_cash: 10000
 costs:
   fee_rate: 0.001     # Binance spot taker, VIP 0
   slippage_bps: 5
 risk:
-  max_symbol_weight: 0.5
+  max_symbol_weight: 0.5   # not binding: two symbols at 0.5 each, as in the backtest
   max_gross_exposure: 1.0
+  target_volatility: 0.4   # scale a symbol down when its 30-day volatility is higher
+  volatility_lookback_days: 30
 rebalance:
   min_notional: 10
   rebalance_threshold: 0.02
+guard:
+  daily_loss_limit: 0.03
+  max_drawdown: 0.15
+  stale_seconds: 900
 strategies:
   - name: donchian_trend
     symbols: [BTC/USDT, ETH/USDT]

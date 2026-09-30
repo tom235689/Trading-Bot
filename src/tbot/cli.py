@@ -3,11 +3,15 @@
 import argparse
 import asyncio
 import os
+import sys
+from collections.abc import Callable
 from datetime import UTC, date, datetime, time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import yaml
+from pydantic import ValidationError
 
 from tbot import __version__
 from tbot.backtest.attribution import format_attribution, run_attribution
@@ -19,10 +23,12 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.quality import QualityReport, check_bars
 from tbot.data.store import BarStore
-from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings, load_live_config
-from tbot.live.runner import account_text, resume, run_live, run_paper, status_text
+from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings
+from tbot.live.ledger import LedgerUnavailable
+from tbot.live.runner import AlreadyRunning, account_text, resume, run_live, run_paper, status_text
 from tbot.monitoring.dashboard import DashboardData, from_backtest, from_ledger, render
 from tbot.monitoring.logging import configure_logging
+from tbot.monitoring.telegram import Telegram
 from tbot.research.report import format_report
 from tbot.research.trials import TrialLog, make_record
 from tbot.research.validate import load_validation_config, run_validation
@@ -45,14 +51,56 @@ def fmt(moment: datetime | None) -> str:
     return f"{moment:%Y-%m-%d %H:%M}" if moment else "-"
 
 
-def load_session_config(path: Path) -> SessionConfig:
-    """A config with `mode` is a live config; anything else is paper."""
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+def config_kind(raw: dict[str, Any]) -> str:
+    """What a config file looks like, to point at the command that takes it."""
+    if "backtest" in raw and "grid" in raw:
+        return "a validation config (tbot validate)"
+    if "mode" in raw:
+        return "a testnet or live config (tbot live, account, status, resume, dashboard)"
+    if "ledger" in raw:
+        return "a paper config (tbot paper, status, resume, dashboard)"
+    if "start" in raw:
+        return "a backtest config (tbot backtest)"
+    return "not a tbot config"
+
+
+def read_yaml(path: Path) -> dict[str, Any]:
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except OSError as exc:
+        raise SystemExit(f"{path}: cannot read ({exc.strerror})") from None
+    except yaml.YAMLError as exc:
+        raise SystemExit(f"{path}: not valid YAML: {exc}") from None
     if not isinstance(raw, dict):
         raise SystemExit(f"{path}: expected a mapping of settings")
-    if "mode" in raw:
-        return LiveConfig.model_validate(raw)
-    return PaperConfig.model_validate(raw)
+    return raw
+
+
+def load[T](path: Path, loader: Callable[[Path], T]) -> T:
+    """Run a config loader; a bad file ends the command with a readable message."""
+    raw = read_yaml(path)
+    try:
+        return loader(path)
+    except (ValidationError, ValueError) as exc:
+        raise SystemExit(f"{path}: invalid for this command ({config_kind(raw)}):\n{exc}") from None
+    except OSError as exc:  # a file the config points at, such as a validation's backtest
+        raise SystemExit(f"{path}: {exc}") from None
+
+
+def load_session_config(path: Path) -> SessionConfig:
+    """A config with `mode` is a live config; anything else is paper."""
+
+    def parse(path: Path) -> SessionConfig:
+        raw = read_yaml(path)
+        if "mode" in raw:
+            return LiveConfig.model_validate(raw)
+        return PaperConfig.model_validate(raw)
+
+    return load(path, parse)
+
+
+def load_live_config(path: Path) -> LiveConfig:
+    return load(path, lambda path: LiveConfig.model_validate(read_yaml(path)))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,12 +109,31 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
 
     download = commands.add_parser("download", help="download closed bars from Binance")
-    download.add_argument("--start", type=parse_date, default=parse_date(DEFAULT_START))
+    download.add_argument(
+        "--start",
+        type=parse_date,
+        default=parse_date(DEFAULT_START),
+        help=f"first day, YYYY-MM-DD (default {DEFAULT_START}); ignored once bars are stored",
+    )
     check = commands.add_parser("check", help="check stored bars")
     for command in (download, check):
-        command.add_argument("--symbols", nargs="+", type=parse_symbol, default=DEFAULT_SYMBOLS)
-        command.add_argument("--timeframes", nargs="+", type=Timeframe, default=DEFAULT_TIMEFRAMES)
-        command.add_argument("--data-dir", type=Path, default=Path("data"))
+        command.add_argument(
+            "--symbols",
+            nargs="+",
+            type=parse_symbol,
+            default=DEFAULT_SYMBOLS,
+            help="e.g. BTCUSDT ETH/USDT (default: %(default)s)",
+        )
+        command.add_argument(
+            "--timeframes",
+            nargs="+",
+            type=Timeframe,
+            default=DEFAULT_TIMEFRAMES,
+            help="e.g. 1h 4h 1d (default: 1h 4h)",
+        )
+        command.add_argument(
+            "--data-dir", type=Path, default=Path("data"), help="bar store (default: data)"
+        )
 
     backtest = commands.add_parser("backtest", help="run a backtest from a YAML config")
     backtest.add_argument("config", type=Path)
@@ -106,6 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("config", type=Path)
     dashboard.add_argument("--data-dir", type=Path, default=Path("data"))
     dashboard.add_argument("--out", type=Path, default=None, help="default reports/<name>.html")
+
+    commands.add_parser("notify", help="send a test Telegram alert with the .env settings")
     return parser
 
 
@@ -173,7 +242,7 @@ def trial_log(data_dir: Path) -> TrialLog:
 
 
 def run_backtest_command(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
+    config = load(args.config, load_config)
     result = run_backtest(config, BarStore(args.data_dir))
     metrics = compute_metrics(result)
     trial_log(args.data_dir).append([make_record(config, metrics, "backtest")])
@@ -204,7 +273,7 @@ def run_dashboard_command(args: argparse.Namespace) -> int:
 
 
 def run_validate_command(args: argparse.Namespace) -> int:
-    config, base = load_validation_config(args.config)
+    config, base = load(args.config, load_validation_config)
     report = run_validation(
         config,
         base,
@@ -218,10 +287,10 @@ def run_validate_command(args: argparse.Namespace) -> int:
 
 
 def run_paper_command(args: argparse.Namespace) -> int:
-    configure_logging(args.log_file)
     config = load_session_config(args.config)
     if not isinstance(config, PaperConfig):
         raise SystemExit("this is a live config; use `tbot live`")
+    configure_logging(args.log_file)
     return asyncio.run(run_paper(config, Settings(), args.data_dir))
 
 
@@ -229,6 +298,8 @@ def run_live_command(args: argparse.Namespace) -> int:
     config = load_live_config(args.config)
     if config.mode == "live" and not args.live:
         raise SystemExit("config mode is live: pass --live to trade real money")
+    if config.mode != "live" and args.live:
+        raise SystemExit("--live is only for mode: live; this config trades on the testnet")
     configure_logging(args.log_file or Path("logs") / f"{config.mode}.jsonl")
     return asyncio.run(run_live(config, Settings(), args.data_dir, confirmed=args.live))
 
@@ -255,6 +326,24 @@ def run_account_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_notify_command(args: argparse.Namespace) -> int:
+    settings = Settings()
+    if not settings.telegram_token or not settings.telegram_chat_id:
+        print("set TBOT_TELEGRAM_TOKEN and TBOT_TELEGRAM_CHAT_ID in .env first")
+        return 1
+    token, chat_id = settings.telegram_token, settings.telegram_chat_id
+
+    async def send() -> bool:
+        async with httpx.AsyncClient() as client:
+            return await Telegram(token, chat_id, client).send("tbot: test alert")
+
+    if asyncio.run(send()):
+        print("sent: check the Telegram chat")
+        return 0
+    print("failed: see the log line above; check the token and the chat id")
+    return 1
+
+
 COMMANDS = {
     "download": run_download,
     "check": run_check,
@@ -266,6 +355,7 @@ COMMANDS = {
     "resume": run_resume_command,
     "account": run_account_command,
     "dashboard": run_dashboard_command,
+    "notify": run_notify_command,
 }
 
 
@@ -273,6 +363,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command in COMMANDS:
-        return COMMANDS[args.command](args)
+        try:
+            return COMMANDS[args.command](args)
+        except (LedgerUnavailable, AlreadyRunning) as exc:
+            print(exc, file=sys.stderr)
+            return 2
     parser.print_help()
     return 0

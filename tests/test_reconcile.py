@@ -11,7 +11,7 @@ from tbot.core.timeframe import Timeframe
 from tbot.exchange.binance import TESTNET_URL, BinanceSpot
 from tbot.live.config import PaperConfig
 from tbot.live.ledger import Adjustment, Ledger
-from tbot.live.reconcile import reconcile
+from tbot.live.reconcile import Ownership, reconcile
 from tbot.live.runner import restore_portfolio
 from tbot.portfolio.portfolio import Portfolio
 
@@ -29,7 +29,11 @@ class Collect:
 
 
 def run_reconcile(
-    fake: FakeSpot, portfolio: Portfolio, tmp_path: Path, times: int = 1
+    fake: FakeSpot,
+    portfolio: Portfolio,
+    tmp_path: Path,
+    times: int = 1,
+    ownership: Ownership = "account",
 ) -> tuple[list[list[Adjustment]], Ledger, Collect]:
     async def go() -> list[list[Adjustment]]:
         async with fake.client() as client:
@@ -37,7 +41,14 @@ def run_reconcile(
             await spot.load_rules([BTC, "ETHUSDT"])
             return [
                 await reconcile(
-                    spot, portfolio, [BTC, "ETHUSDT"], ledger, notifier, T0, tolerance=0.002
+                    spot,
+                    portfolio,
+                    [BTC, "ETHUSDT"],
+                    ledger,
+                    notifier,
+                    T0,
+                    tolerance=0.002,
+                    ownership=ownership,
                 )
                 for _ in range(times)
             ]
@@ -93,6 +104,26 @@ def test_restore_replays_fills_and_adjustments_in_order(tmp_path: Path) -> None:
     ledger.add_adjustment(Adjustment(T0 + timedelta(hours=2), "", 0.0, 5.0, "fee rebate"))
     ledger.close()
 
-    portfolio = restore_portfolio(config, Ledger(config.ledger))
+    with Ledger(config.ledger) as reopened:
+        portfolio = restore_portfolio(config, reopened)
     assert portfolio.position(BTC) == pytest.approx(0.03)
     assert portfolio.cash == pytest.approx(1000 - 500 - 0.5 - 50 + 5)
+
+
+def test_budget_ownership_leaves_the_owners_balances_alone(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 5000.0, "BTC": 0.3}, prices={BTC: 50000.0})
+    portfolio = Portfolio(1000.0)
+    portfolio.positions[BTC] = 0.01  # the bot's; the rest of the BTC and USDT is the owner's
+    [adjustments], ledger, _ = run_reconcile(fake, portfolio, tmp_path, ownership="budget")
+    assert adjustments == []
+    ledger.close()
+
+    fake.balances.update(USDT=600.0, BTC=0.004)  # the owner withdrew and sold below the book
+    [adjustments], ledger, _ = run_reconcile(fake, portfolio, tmp_path, ownership="budget")
+    assert [(a.symbol, a.quantity, a.cash) for a in adjustments] == [
+        (BTC, pytest.approx(-0.006), 0.0),
+        ("", 0.0, pytest.approx(-400.0)),
+    ]
+    assert portfolio.position(BTC) == pytest.approx(0.004)
+    assert portfolio.cash == pytest.approx(600.0)
+    ledger.close()

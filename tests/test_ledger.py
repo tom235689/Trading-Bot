@@ -49,3 +49,24 @@ def test_config_hash_is_stable() -> None:
     assert config_hash('{"a": 1}') == config_hash('{"a": 1}')
     assert config_hash('{"a": 1}') != config_hash('{"a": 2}')
     assert len(config_hash("x")) == 16
+
+
+def test_old_ledgers_gain_client_ids_and_orders_in_doubt_are_listed(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, time TEXT NOT NULL, symbol TEXT NOT NULL, "
+        "quantity REAL NOT NULL, status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '')"
+    )
+    conn.commit()
+    conn.close()
+    with Ledger(path) as ledger:
+        ledger.add_order(T0, "BTCUSDT", 1.0, "pending", "", "a")
+        ledger.add_order(T0, "BTCUSDT", 1.0, "filled", "", "a")
+        ledger.add_order(T0, "ETHUSDT", 2.0, "pending", "", "b")
+        ledger.add_order(T0, "ETHUSDT", 2.0, "unknown", "503", "b")
+        assert [r.client_id for r in ledger.unresolved_orders()] == ["b"]
+        assert ledger.client_id_used("a")
+        assert not ledger.client_id_used("c")

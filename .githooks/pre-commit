@@ -1,7 +1,8 @@
 #!/bin/sh
 # Block Hangul and secrets in staged changes, then lint and type check.
+# Tools run through python -m: generated launcher .exe files can be blocked on Windows.
 set -e
 uv run --quiet --frozen python scripts/git_guard.py pre-commit
-uv run --quiet --frozen ruff check .
-uv run --quiet --frozen ruff format --check .
-uv run --quiet --frozen mypy
+uv run --quiet --frozen python -m ruff check .
+uv run --quiet --frozen python -m ruff format --check .
+uv run --quiet --frozen python -m mypy

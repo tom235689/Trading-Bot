@@ -1,12 +1,13 @@
 """Bar-by-bar trading session: the backtest's decision path, one event at a time."""
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 
 import polars as pl
 
 from tbot.core.config import TradingConfig
-from tbot.core.timeframe import Timeframe, from_millis
+from tbot.core.timeframe import Timeframe, from_millis, to_millis
 from tbot.live.history import BarHistory
 from tbot.live.ledger import EquityPoint
 from tbot.portfolio.allocation import StrategySlot, decide_orders, validate_targets
@@ -15,6 +16,14 @@ from tbot.risk.volatility import volatility_scale
 from tbot.strategies.base import StrategyContext
 
 StreamKey = tuple[str, Timeframe]
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """Each slot's targets as of the last event a previous run handled."""
+
+    time: datetime
+    targets: list[dict[str, float]]
 
 
 class TradingSession:
@@ -55,7 +64,10 @@ class TradingSession:
         return list(self.histories)
 
     def ingest(self, closed: Mapping[StreamKey, pl.DataFrame], now: datetime) -> dict[str, float]:
-        """Process bars that closed at `now`; return signed order quantities per symbol."""
+        """Process bars that closed at `now`; return signed order quantities per symbol.
+
+        Only symbols whose execution stream closed now get orders, as in the backtest.
+        """
         self._append(closed)
         if not self._run_strategies(closed.keys(), now):
             return {}
@@ -71,14 +83,38 @@ class TradingSession:
                 )
                 for symbol, key in self.exec_keys.items()
             }
-        return decide_orders(
+        orders = decide_orders(
             self.slots, self.portfolio, self.marks, cfg.risk, cfg.rebalance, scales
         )
+        fresh = {symbol for symbol, key in self.exec_keys.items() if key in closed}
+        return {symbol: q for symbol, q in orders.items() if symbol in fresh}
 
     def replay(self, closed: Mapping[StreamKey, pl.DataFrame], now: datetime) -> None:
         """Warm up: same as ingest but nothing is traded."""
         self._append(closed)
         self._run_strategies(closed.keys(), now)
+
+    def restore(self, checkpoint: Checkpoint) -> None:
+        for slot, targets in zip(self.slots, checkpoint.targets, strict=True):
+            slot.targets = validate_targets(slot.strategy, targets)
+            slot.strategy.restore(slot.targets)
+
+    def checkpoint(self, now: datetime) -> Checkpoint:
+        return Checkpoint(now, [dict(slot.targets) for slot in self.slots])
+
+    def seed_marks(self, frames: Mapping[StreamKey, pl.DataFrame]) -> None:
+        """Mark every held symbol before a replay, so the first replayed event can value it."""
+        for symbol, key in self.exec_keys.items():
+            frame = frames.get(key)
+            if frame is not None and not frame.is_empty():
+                self.marks.setdefault(symbol, float(frame["close"][-1]))
+        unmarked = sorted(set(self.portfolio.positions) - set(self.marks))
+        if unmarked:
+            raise ValueError(
+                f"the book holds {', '.join(unmarked)}, which this config does not trade or "
+                "has no stored bars for: add the symbol back to the config (and run `tbot "
+                "download`) so the bot can value, manage, and sell it"
+            )
 
     def snapshot(self, now: datetime) -> EquityPoint:
         equity = self.portfolio.equity(self.marks)
@@ -110,12 +146,27 @@ class TradingSession:
         return ran
 
 
-def replay_history(session: TradingSession, frames: Mapping[StreamKey, pl.DataFrame]) -> None:
-    """Feed stored bars through the session in close-time order, as the backtest would."""
+def replay_history(
+    session: TradingSession,
+    frames: Mapping[StreamKey, pl.DataFrame],
+    checkpoint: Checkpoint | None = None,
+) -> None:
+    """Feed stored bars through the session in close-time order, as the backtest would.
+
+    With a checkpoint, strategies take its targets once the replay reaches its time,
+    then keep replaying the bars that closed after it.
+    """
+    session.seed_marks(frames)
     events: dict[int, dict[StreamKey, pl.DataFrame]] = {}
     for key, frame in frames.items():
         for row in frame.sort("open_time").iter_slices(1):
             close_ms = int(row["open_time"].dt.epoch("ms")[0]) + key[1].millis
             events.setdefault(close_ms, {})[key] = row
+    pending = checkpoint
     for close_ms in sorted(events):
+        if pending is not None and close_ms > to_millis(pending.time):
+            session.restore(pending)
+            pending = None
         session.replay(events[close_ms], from_millis(close_ms))
+    if pending is not None:
+        session.restore(pending)

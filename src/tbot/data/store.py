@@ -1,5 +1,7 @@
 """Parquet bar storage: one file per symbol, timeframe, and year."""
 
+import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -7,6 +9,8 @@ import polars as pl
 
 from tbot.core.timeframe import Timeframe
 from tbot.data.schema import BAR_SCHEMA, empty_bars
+
+REPLACE_ATTEMPTS = 6  # Windows refuses to replace a file another process is reading
 
 
 class BarStore:
@@ -58,7 +62,20 @@ class BarStore:
             if file.exists():
                 part = pl.concat([pl.read_parquet(file), part])
             merged = part.unique("open_time", keep="last", maintain_order=True).sort("open_time")
-            # Write then rename so a crash never leaves a partial file.
-            tmp = file.with_suffix(".tmp")
+            # Write then rename so a crash never leaves a partial file. The temporary name
+            # is per process, so two sessions sharing a store never write the same one.
+            tmp = file.with_suffix(f".{os.getpid()}.tmp")
             merged.write_parquet(tmp)
-            tmp.replace(file)
+            _replace(tmp, file)
+
+
+def _replace(source: Path, target: Path) -> None:
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            source.replace(target)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                source.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05 * 2**attempt)

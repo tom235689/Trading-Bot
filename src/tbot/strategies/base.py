@@ -63,3 +63,11 @@ class Strategy(ABC):
     @abstractmethod
     def on_bar(self, ctx: StrategyContext) -> Mapping[str, float]:
         """Target exposure per symbol in [-1, 1], as a fraction of this strategy's capital."""
+
+    def restore(self, targets: Mapping[str, float]) -> None:  # noqa: B027
+        """Continue from the targets this strategy returned before a restart.
+
+        A restart replays only recent bars, which may not reach back to the event that
+        set path-dependent state (an entry long ago). Strategies with such state
+        override this; stateless ones need nothing.
+        """

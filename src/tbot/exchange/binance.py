@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import json
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
@@ -25,6 +25,8 @@ TESTNET_URL = "https://testnet.binance.vision"
 RETRY_STATUS = frozenset({418, 429, 500, 502, 503, 504})
 ORDER_NOT_FOUND = -2013
 NOTHING_TO_CANCEL = -2011
+TIMESTAMP_OUTSIDE_WINDOW = -1021
+SEND_STATUS_UNKNOWN = -1007
 Params = Mapping[str, str | int | float]
 
 
@@ -36,6 +38,11 @@ class BinanceError(Exception):
         self.code = code
         self.message = message
         self.status = status
+
+    @property
+    def uncertain(self) -> bool:
+        """The request may have been executed: Binance says so for 5xx and -1007."""
+        return self.status >= 500 or self.code == SEND_STATUS_UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -136,9 +143,12 @@ def parse_rules(info: Mapping[str, Any]) -> SymbolRules:
     )
 
 
-def aggregate_fill(order: Order, when: datetime) -> tuple[Fill | None, dict[str, float]]:
+def aggregate_fill(
+    order: Order, when: datetime, trades: Sequence[TradeFill] | None = None
+) -> tuple[Fill | None, dict[str, float]]:
     """One Fill for a filled order plus commissions by asset.
 
+    Commissions come from `trades`, or from the order's own fills when not given.
     The Fill's fee is zero; the caller converts the commissions into the quote asset.
     """
     if order.executed_qty == 0:
@@ -146,7 +156,7 @@ def aggregate_fill(order: Order, when: datetime) -> tuple[Fill | None, dict[str,
     quantity = order.executed_qty if order.side == "BUY" else -order.executed_qty
     price = order.quote_qty / order.executed_qty
     commissions: dict[str, float] = {}
-    for fill in order.fills:
+    for fill in order.fills if trades is None else trades:
         commissions[fill.commission_asset] = (
             commissions.get(fill.commission_asset, 0.0) + fill.commission
         )
@@ -166,6 +176,7 @@ class BinanceSpot:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         recv_window: int = 5000,
         retries: int = 4,
+        resync: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
         self.client = client
         self.api_key = api_key
@@ -174,6 +185,7 @@ class BinanceSpot:
         self.clock = clock
         self.recv_window = recv_window
         self.retries = retries
+        self.resync = resync  # re-measures the clock after a -1021 timestamp error
         self.rules: dict[str, SymbolRules] = {}
 
     # transport
@@ -189,13 +201,15 @@ class BinanceSpot:
     ) -> Any:
         """Send a request, retrying rate limits and server errors.
 
-        POST is never retried here: an order may have gone through, so callers
-        look it up by client order id before trying again.
+        POST is never retried on these: an order may have gone through, so callers
+        look it up by client order id. Any request rejected for its timestamp (-1021)
+        was not executed, so it is signed again once after a clock resync.
         """
         params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key}
         attempts = 1 if method == "POST" else self.retries
-        for attempt in range(attempts):
+        attempt, resynced = 0, False
+        while True:
             query = self._sign(params) if signed else urlencode(params)
             url = f"{self.base_url}{path}?{query}" if query else f"{self.base_url}{path}"
             response = await self.client.request(method, url, headers=headers, timeout=15.0)
@@ -203,11 +217,22 @@ class BinanceSpot:
                 delay = float(response.headers.get("Retry-After", 2**attempt))
                 log.warning("binance_retry", path=path, status=response.status_code, delay=delay)
                 await asyncio.sleep(delay)
+                attempt += 1
                 continue
             if response.status_code >= 400:
-                raise _error_from(response)
+                error = _error_from(response)
+                if (
+                    error.code == TIMESTAMP_OUTSIDE_WINDOW
+                    and signed
+                    and self.resync
+                    and not resynced
+                ):
+                    log.warning("binance_clock_resync", path=path)
+                    await self.resync()
+                    resynced = True
+                    continue
+                raise error
             return response.json()
-        raise AssertionError("unreachable")
 
     # public
 
@@ -289,6 +314,17 @@ class BinanceSpot:
                 return None
             raise
         return parse_order(data)
+
+    async def my_trades(self, symbol: str, order_id: int) -> list[TradeFill]:
+        """Executions of one order with their commissions."""
+        params: dict[str, str | int | float] = {"symbol": symbol, "orderId": order_id}
+        data = await self._request("GET", "/api/v3/myTrades", params, signed=True)
+        return [
+            TradeFill(
+                float(t["price"]), float(t["qty"]), float(t["commission"]), t["commissionAsset"]
+            )
+            for t in data
+        ]
 
     async def open_orders(self, symbol: str) -> list[Order]:
         data = await self._request("GET", "/api/v3/openOrders", {"symbol": symbol}, signed=True)

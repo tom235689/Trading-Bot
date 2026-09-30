@@ -2,4 +2,4 @@
 # Block pushes carrying Hangul or secrets anywhere in outgoing history, then run tests.
 set -e
 uv run --quiet --frozen python scripts/git_guard.py pre-push "$@"
-uv run --quiet --frozen pytest -q
+uv run --quiet --frozen python -m pytest -q

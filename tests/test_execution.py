@@ -1,3 +1,4 @@
+import math
 from datetime import UTC, datetime
 
 import pytest
@@ -67,3 +68,16 @@ def test_risk_limits() -> None:
     }
     short = RiskLimits(long_only=False, max_symbol_weight=0.5)
     assert short.apply({"A": -0.9}) == {"A": -0.5}
+
+
+def test_plan_sells_everything_rather_than_leave_an_unsellable_rest() -> None:
+    # 15 of 100 held, target 5%: selling 10 would leave 5, under the minimum of 10.
+    assert plan_orders({"A": 0.05}, {"A": 0.15}, PRICES, 100, RULES) == {"A": -0.15}
+
+
+def test_plan_and_broker_skip_broken_prices() -> None:
+    assert plan_orders({"A": 0.5}, {}, {"A": 0.0}, 1000, RULES) == {}
+    assert plan_orders({"A": 0.5}, {"A": 1.0}, {"A": math.nan}, 1000, RULES) == {}
+    broker = SimulatedBroker(COSTS)
+    assert broker.fill(T0, "A", math.nan, 100.0, 1000.0, 0.0) is None
+    assert broker.fill(T0, "A", 1.0, math.nan, 1000.0, 0.0) is None

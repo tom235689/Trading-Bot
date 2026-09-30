@@ -156,7 +156,7 @@ class LiveFeed:
             if overdue:
                 try:
                     await self.catch_up(overdue)
-                except (httpx.HTTPError, LookupError, ValueError) as exc:  # REST down too
+                except (httpx.HTTPError, LookupError, ValueError, OSError) as exc:  # retried
                     log.warning("catch_up_failed", error=repr(exc))
             if self.on_stale is None:
                 continue

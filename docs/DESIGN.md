@@ -1,6 +1,6 @@
 # Trading Bot Design
 
-Status: Draft v1 (2026-09-23)
+Status: v1, phases 0-6 implemented (updated 2026-09-30)
 
 ## 1. Goals and Non-Goals
 
@@ -51,7 +51,7 @@ The core stays timeframe-agnostic so faster strategies (e.g. 15m) can be added l
 
 ```
                 +--------------------+
- Binance   <--> |  Exchange Adapter  |  (ccxt REST + WebSocket)
+ Binance   <--> |  Exchange Adapter  |  (own REST adapter + kline WebSocket)
                 +--------------------+
                    | market data           ^ orders / fills
                    v                       |
@@ -83,7 +83,7 @@ The core stays timeframe-agnostic so faster strategies (e.g. 15m) can be added l
 |---|---|---|---|
 | `backtest` | Historical replay | Simulated broker | Simulated |
 | `paper` | Live Binance data | Simulated broker | Wall clock |
-| `testnet` | Binance testnet | Binance testnet adapter | Wall clock |
+| `testnet` | Live Binance data | Binance testnet adapter | Wall clock |
 | `live` | Live Binance data | Binance adapter | Wall clock |
 
 `paper` checks strategy behavior on real prices. `testnet` checks the real order path. Both are needed before `live`.
@@ -92,7 +92,7 @@ The core stays timeframe-agnostic so faster strategies (e.g. 15m) can be added l
 
 ### 5.1 Core Models
 
-- `Bar`, `TargetExposure`, `OrderIntent`, `Order`, `Fill`, `Position`, `Balance`, `RiskEvent`.
+- Bars are polars frames with a fixed schema (`tbot/data/schema.py`); `Fill` and `Trade` are the shared records (`tbot/core/models.py`); exchange orders and balances live in the adapter (`tbot/exchange/binance.py`). Strategy targets are plain `symbol -> weight` mappings.
 - All timestamps are UTC. A bar is keyed by its open time and only used after it closes.
 - Prices and quantities use `Decimal` at the exchange boundary; research code may use floats.
 
@@ -104,7 +104,7 @@ The core stays timeframe-agnostic so faster strategies (e.g. 15m) can be added l
 - **Off-grid bars**: Binance has stretches of bars not aligned to the timeframe grid (1h bars at :28 after the February 2018 outage). They are dropped, not snapped: snapping would leak future prices into a bar.
 - **Live** (`tbot/live/feed.py`): kline WebSocket for closed bars, REST catch-up on connect, after every reconnect, and from a watchdog that polls whenever a bar is overdue. Every emitted bar is first written to the same Parquet store, and the store's last bar is the memory of what was seen, so nothing is emitted twice or out of order. Bars from streams that close at the same instant are grouped into one event (short wait for stragglers), as in the backtest; events are consumed in close-time order, so a catch-up of several bars keeps every stream in sequence. A socket bar that does not follow the last emitted one triggers a REST catch-up first, so a missed close never leaves a hole. A failed catch-up is logged and retried at the next poll. A stream whose next bar is overdue by more than `stale_after_seconds` raises a stale alert once.
 - **Quality checks**: errors are duplicates, off-grid bars, unclosed bars, and invalid prices. Gaps, zero-volume bars, and large moves are warnings, since they are usually real exchange events. Keep delisted symbols to avoid survivorship bias.
-- **Perpetuals**: also store funding rate history.
+- **Perpetuals** (deferred): would also need funding rate history.
 
 ### 5.3 Strategy Plugins
 
@@ -127,7 +127,7 @@ class Strategy(ABC):
 **Contract**
 
 - Pure logic: no exchange calls, no file or network I/O, no wall clock. `StrategyContext` provides read-only arrays of closed bars and current portfolio exposures.
-- Deterministic: same input gives the same output. Internal state is allowed only if it derives from bars seen through `on_bar`, so replaying history rebuilds it.
+- Deterministic: same input gives the same output. Internal state is allowed only if it derives from bars seen through `on_bar`. A restart replays only recent bars, which may not reach the event that set path-dependent state (an entry weeks ago), so such strategies also implement `restore(targets)`: the session saves every slot's targets after each event and hands them back once the replay reaches that time.
 - Output is target exposure as a fraction of the strategy's allocated capital, not order size. Weights across symbols should sum to at most 1. Negative values are clipped to zero in spot mode.
 - Registered with `@register_strategy`; each strategy validates its params with its own pydantic model (unknown keys are rejected).
 
@@ -156,7 +156,7 @@ strategies:
 
 ### 5.5 Risk Manager
 
-Independent layer with veto power. Values below are the intended live defaults and live in config. Backtest defaults are permissive (weight and gross caps of 100%) so strategies can be studied unconstrained; implemented so far: per-symbol cap, gross cap, long-only.
+Independent layer with veto power. Values below are the intended live defaults and live in config. Backtest defaults are permissive (weight and gross caps of 100%) so strategies can be studied unconstrained. Not implemented yet: risk per trade sized from a stop distance, and rejecting prices far from mid (market orders use the book price at the moment).
 
 | Rule | Default |
 |---|---|
@@ -171,27 +171,29 @@ Independent layer with veto power. Values below are the intended live defaults a
 
 The kill switch state is persisted. A restart does not resume trading; a human must reset it.
 
-**Implementation** (`tbot/live/guard.py`, applied by `SessionTrader` in paper, testnet, and live): the `guard` config section holds `daily_loss_limit`, `max_drawdown`, and `stale_seconds` (zero disables a rule). Each event: equity below the day's opening equity by the daily limit puts the session in reduce-only mode (orders may only shrink positions); equity below the running peak by the drawdown limit flattens every position and halts; a bar older than `stale_seconds` when it arrives blocks that event. Guard state (peak, day open, halted) is saved in the ledger after every check, so a restart stays halted; `tbot resume <config>` clears it and resets the peak, and a running session re-reads the state each event, so the resume takes effect at the next bar. The kill switch is announced when it trips and whenever flattening fills something, not on every bar, since dust below the exchange minimum can remain. Per-symbol and gross exposure caps are applied earlier by `RiskLimits`; order sanity (tick, step, minimum notional) by the executor; unknown state (reconciliation failure) by alerting and adopting the exchange.
+**Implementation** (`tbot/live/guard.py`, applied by `SessionTrader` in paper, testnet, and live): the `guard` config section holds `daily_loss_limit`, `max_drawdown`, and `stale_seconds` (zero disables a rule). Each event: equity below the day's opening equity by the daily limit puts the session in reduce-only mode (orders may only shrink positions); equity below the running peak by the drawdown limit flattens every position and halts; a bar older than `stale_seconds` when it arrives blocks that event (announced once per streak, then logged). Money that enters or leaves the book from outside (reconciliation adjustments: deposits, withdrawals, manual trades) shifts the peak and day-open levels, so it never counts as a loss or a gain. Guard state (peak, day open, halted) is saved in the ledger after every check, so a restart stays halted; `tbot resume <config>` clears it and resets the peak, and a running session re-reads the state each event, so the resume takes effect at the next bar. The kill switch is announced when it trips and whenever flattening fills something, not on every bar, since dust below the exchange minimum can remain. Per-symbol and gross exposure caps are applied earlier by `RiskLimits`; order sanity (tick, step, minimum notional) by the executor; unknown state by pausing new orders after three failed reconciliations in a row, with an alert, until one succeeds.
 
 ### 5.6 Execution
 
 - **Executor** (`tbot/live/executor.py`): the session hands signed order quantities to an executor. `PaperExecutor` fills through the simulated broker; `LiveExecutor` trades on Binance spot. The same `SessionTrader` drives both.
-- **Write-ahead**: the order is written to the ledger as `pending` before it is sent, then updated to `filled`, `skipped`, `unfilled`, or `failed`.
-- **Idempotency**: the client order id is derived from the bar close time, symbol, and side (`tb<close ms><symbol><B|S>`). Before sending, the executor asks the exchange for that id; an order that already exists (crash after send, lost response) is adopted, never re-sent. A transport failure while sending is followed by the same lookup.
-- **Sizing at the exchange**: buys are capped by free quote balance (with fee and a small margin), sells by free base balance; quantities are rounded down to the lot step and orders below the exchange minimum are skipped.
+- **Write-ahead**: every order gets a row with its client order id before it is sent (`pending`), then a row that ends it: `filled`, `unfilled`, or `failed` (`skipped` orders are never sent).
+- **Client order ids**: `tb<close ms><symbol><B|S>`, plus `r<n>` when a second decision at the same close needs a new id (a stream that arrived late), so an id is never reused.
+- **Outcome in doubt**: Binance says a 5xx or -1007 answer to an order leaves its execution unknown, and a lost response says nothing. The executor then looks the id up a few times; found means booked, never seen means failed. If the exchange cannot be asked, the row becomes `unknown`. Before every reconciliation, and at startup, `settle` looks up every `pending` or `unknown` order (including ones left by a crash) and books or fails it; commissions of an order read back this way come from its trades (`myTrades`).
+- **Sizing at the exchange**: buys are capped by free quote balance and by the book's own cash (with fee and a small margin), sells by free base balance; quantities are rounded down to the lot step and orders below the exchange minimum are skipped.
 - **Fees**: commission paid in the base asset reduces the filled quantity; every commission is converted into quote and booked as the fill's fee (BNB and others via the ticker), so the book stays equal to the exchange balances.
 - **Order type**: market orders for now. Post-only limit with a market fallback is a later improvement.
-- **Protective stops**: after every event a `STOP_LOSS_LIMIT` sell sits on the exchange for each held position at `protective_stop_pct` below the last close (limit 0.5% under the stop). Stops are cancelled before a sell (they lock the balance) and re-placed afterwards. A stop that fires while the bot is down shows up as a reconciliation adjustment.
-- **Reconciliation** (`tbot/live/reconcile.py`): on startup and every `reconcile_seconds`, base balances (free plus locked) are compared with booked positions and free quote with booked cash. Differences beyond the lot step or `reconcile_tolerance` (cash: at least one quote unit) are adopted from the exchange, written to the ledger's `adjustments` table, and alerted. Restoring a book replays fills and adjustments in time order. Reconciliation and event handling share a lock, so the book is never compared with the exchange while an order is in flight. Testnet and live default to separate ledgers and log files (`data/<mode>.sqlite`, `logs/<mode>.jsonl`).
+- **Protective stops**: after every event a `STOP_LOSS_LIMIT` sell sits on the exchange for each held position at `protective_stop_pct` below the last close (limit 0.5% under the stop; in a gap through the limit it may not fill). Stops are cancelled before a sell (they lock the balance) and re-placed afterwards. The stop in force is remembered in the ledger; whatever part of it executed, between events or while the bot was down, is booked as a fill (fee at the configured rate) before the next reconciliation.
+- **Ownership** (`ownership` in testnet and live configs): `budget` (default) means the bot owns `initial_cash` and what it buys with it; every other balance in the account, including coins of the traded symbols bought by hand, is the owner's and is never adopted or sold. `account` means the bot owns the whole spot account; use it only for a dedicated account.
+- **Reconciliation** (`tbot/live/reconcile.py`): on startup and every `reconcile_seconds`, after `settle`, base balances (free plus locked) are compared with booked positions and free quote with booked cash. Differences beyond the lot step or `reconcile_tolerance` (cash: at least one quote unit) move the book to the exchange, in `budget` mode only downward; they are written to the ledger's `adjustments` table and alerted. Restoring a book replays fills and adjustments in time order. Reconciliation and event handling share a lock, so the book is never compared with the exchange while an order is in flight. Testnet and live default to separate ledgers and log files (`data/<mode>.sqlite`, `logs/<mode>.jsonl`).
 
 ### 5.7 Binance Adapter
 
 - `tbot/exchange/binance.py` talks to the spot REST API directly (no ccxt): the bot needs about ten endpoints, and a small adapter is easier to test against a fake exchange. Signed requests use HMAC-SHA256 with a timestamp from the server-synced clock and `recv_window`.
-- GET and DELETE retry on rate limits (418, 429) and server errors with backoff; POST never retries, the executor's client-id lookup handles uncertainty.
+- GET and DELETE retry on rate limits (418, 429) and server errors with backoff; POST never retries, the executor's client-id lookup handles uncertainty. A request rejected for its timestamp (-1021) was not executed, so it is signed again once after a clock resync.
 - Symbol rules from `exchangeInfo` (`PRICE_FILTER`, `LOT_SIZE`, `NOTIONAL`) round prices and quantities with `Decimal`; symbols that are not `TRADING` refuse to start.
 - Order and fill updates come from the order response (`newOrderRespType=FULL`) and periodic reconciliation; the user data stream is a later improvement.
 - Client order ids: at most 36 characters, only characters Binance allows.
-- Fees come from config and are checked against the account's actual fee rates (BNB discount, VIP tier).
+- Fees: `costs.fee_rate` sizes buys and estimates the fee of stop fills; market order fees are the real commissions. Commissions paid in BNB lower the book's cash while the exchange takes BNB instead, so in `account` mode reconciliation hands that cash back; turn BNB payment off or accept the drift.
 - Testnet (`https://testnet.binance.vision`) has the same API with fake balances; signals still use production market data, so testnet fills happen at testnet prices and only prove the mechanics.
 - Binance blocks some regions, including the US. The host must run from an allowed region.
 
@@ -202,15 +204,15 @@ Two tiers:
 1. **Research (vectorized)**: pandas or polars over full arrays. Screens many ideas quickly. Never used for final decisions.
 2. **Validation (event-driven)**: reuses the live engine with a simulated broker.
 
-**Event loop** (validation tier): events are bar close times across all loaded streams. At each event the engine reveals bars closing now, fills pending orders, marks positions at the latest close and records equity, runs strategies whose bars closed, then combines targets, applies risk limits, and queues orders. Before `start`, strategies run to build state but nothing trades.
+**Event loop** (validation tier): events are bar close times across all loaded streams. At each event the engine reveals bars closing now, fills pending orders, marks positions at the latest close and records equity, runs strategies whose bars closed, then combines targets, applies risk limits, and queues orders for the symbols whose execution stream (finest loaded timeframe) closed now; other symbols keep their pending orders, so a faster stream of another symbol never postpones a fill. Paper and live plan orders the same way. Before `start`, strategies run to build state but nothing trades.
 
 **Fill model**
 
 - Signals use closed bars only. Market orders fill at the open of the next bar of the symbol's finest loaded timeframe, plus slippage. After a data gap, the order waits for the next available bar.
 - Spot broker rules: buys are capped by cash (including the fee), sells by the position.
-- Rebalance rules: a zero target closes the exact position; other changes below `rebalance_threshold` of equity or below `min_notional` are skipped.
+- Rebalance rules: a zero target closes the exact position, and so does a reduction that would leave less than `min_notional`, which could never be sold; other changes below `rebalance_threshold` of equity or below `min_notional` are skipped. A remainder worth less than `min_notional` after a sale (lot rounding, commissions) ends the round trip.
 - Limit orders fill only if the next bar trades through the price, not just touches it (not implemented yet).
-- Fees, slippage (bps, configurable), and funding (perpetuals, at each funding time) are always applied.
+- Fees and slippage (bps, configurable) are always applied; funding would be for perpetuals, which are deferred.
 
 **Config** (YAML): `start`, optional `end` (exclusive), `initial_cash`, `costs`, `risk`, `rebalance`, and `strategies` as in 5.3. Allocations must sum to at most 1. See `config/donchian_trend.yaml`.
 
@@ -221,26 +223,28 @@ Two tiers:
 ### 5.9 Persistence
 
 - **Market data**: Parquet, read and written with polars.
-- **Ledger**: SQLite, moving to PostgreSQL if needed. Tables: `runs`, `signals`, `order_intents`, `orders`, `fills`, `positions`, `equity_snapshots`, `risk_events`.
-- Every signal, order, and fill is recorded, so live results can be compared with a backtest over the same period.
+- **Ledger** (`tbot/live/ledger.py`): SQLite in WAL mode with full sync. Tables: `meta` (config hash, guard state, strategy checkpoint, protective stop in force), `signals`, `orders` (with client ids), `fills`, `adjustments`, `equity`, `events`. Positions are not stored: they are rebuilt from fills and adjustments.
+- One process per ledger: a lock file next to it (released by the operating system when the process dies) refuses a second session on the same book.
+- Every signal, order, and fill is recorded. To compare paper with a backtest, run the same trading settings as a backtest from the paper start; paper fills at the book price at the close, the backtest at the next bar's open, so expect small differences per trade.
 
 ### 5.10 Monitoring and Alerts
 
 - Structured logs (structlog): readable console output plus rotating JSON lines in `logs/`. Error entries never include request URLs, which carry the Telegram token and the heartbeat URL.
-- Telegram alerts (`TBOT_TELEGRAM_TOKEN`, `TBOT_TELEGRAM_CHAT_ID`): start and stop, every fill, failed price lookups, stale streams, task crashes, and a daily summary at `summary_hour_utc`. Without a token, alerts go to the log. A failed send is logged and never stops trading. Risk limit hits, kill switch, and reconciliation mismatches are added with the live phase.
-- External heartbeat (`TBOT_HEARTBEAT_URL`): the bot pings an outside monitor every `heartbeat_seconds`. If pings stop, the monitor alerts. A dead bot cannot alert on its own.
+- Telegram alerts (`TBOT_TELEGRAM_TOKEN`, `TBOT_TELEGRAM_CHAT_ID`): start and stop, every fill, failed price lookups, stale streams, task crashes, and a daily summary at `summary_hour_utc`. Without a token, alerts go to the log. A failed send is logged and never stops trading. Also sent: kill switch, entries blocked, paused and resumed trading, reconciliation adjustments and failures, orders in doubt and their resolution, protective stops that executed, and a failed start. `tbot notify` sends a test message.
+- External heartbeat (`TBOT_HEARTBEAT_URL`): the bot pings an outside monitor every `heartbeat_seconds`. If pings stop, the monitor alerts. A dead bot cannot alert on its own, so this is the only way to learn about a hard kill; it means alive, not trading (a halted bot keeps pinging).
 - `tbot status <config>` prints the ledger: equity, positions, recent fills and events, and the last stored bar per stream.
 - Dashboard (`tbot dashboard <config>`, `tbot backtest --html`; `tbot/monitoring/dashboard.py`): one self-contained HTML file with stat tiles, equity and drawdown charts (inline SVG, crosshair tooltip, light and dark mode, table view), open positions, recent fills and events. Static on purpose: nothing listens on the trading machine; generate it on demand or on a schedule. Per-strategy performance is the attribution report.
 
-**Paper session** (`tbot paper <config>`, `tbot/live/paper.py`): the session (`tbot/live/session.py`) runs the backtest's decision path one event at a time: append the bars that closed, mark, run the strategies whose bars closed, combine targets, apply risk limits, plan orders. Paper fills happen at once at the live book price (ask for buys, bid for sells) through the same simulated broker with fees and slippage. Every signal, order, fill, and equity snapshot goes to a SQLite ledger. On start the bot syncs the store, rebuilds the portfolio by replaying the ledger's fills, rebuilds strategy state by replaying stored history through the strategies, and warns if the trading config changed since the ledger was created. Fills are timestamped with the wall clock; equity snapshots with the bar close. A test proves the session reproduces the backtest engine bar for bar when fills use the next bar's open.
+**Paper session** (`tbot paper <config>`, `tbot/live/runner.py`): the session (`tbot/live/session.py`) runs the backtest's decision path one event at a time: append the bars that closed, mark, run the strategies whose bars closed, combine targets, apply risk limits, plan orders. Paper fills happen at once at the live book price (ask for buys, bid for sells) through the same simulated broker with fees and slippage. Every signal, order, fill, and equity snapshot goes to a SQLite ledger. On start the bot syncs the store, rebuilds the portfolio by replaying the ledger's fills and adjustments, rebuilds strategy state by replaying stored history and restoring the saved targets (ignored if the strategies changed), and warns if the trading config changed since the ledger was created. A start that fails is logged and alerted with exit code 1. On a graceful stop, an event in progress finishes its orders first (up to a minute). Fills are timestamped with the wall clock; equity snapshots with the bar close. A test proves the session reproduces the backtest engine bar for bar when fills use the next bar's open.
 
 ### 5.11 Security and Configuration
 
-- API keys: trading permission only, withdrawals disabled, IP whitelist enabled.
+- API keys: spot trading permission only, withdrawals disabled, IP whitelist enabled when the host has a static IP (with a changing home IP, every signed call fails after a change).
 - Secrets live in `.env`, never committed. Git hooks scan for secrets.
 - Config: YAML for settings, environment variables for secrets, validated with pydantic.
 - Secrets come from the environment or a `.env` file (`TBOT_` prefix, see `.env.example`), validated by pydantic-settings.
-- Paper and live are separate commands with separate configs. `live` will require both `mode: live` in config and an explicit `--live` CLI flag.
+- Paper and live are separate commands with separate configs. Real money requires both `mode: live` in the config and the `--live` flag; `--live` is refused for testnet so the flag keeps its meaning.
+- Paths in configs and defaults (`.env`, `data/`, `logs/`, ledgers) are relative to the working directory: run the bot from the repository root (`uv --directory <repo> run ...` under a scheduler).
 
 ## 6. Initial Strategy Candidates
 
@@ -287,15 +291,15 @@ A strategy is promoted to live only after passing every step:
 | Area | Choice |
 |---|---|
 | Runtime | Python 3.12, uv |
-| Exchange access | ccxt (REST + WebSocket) |
+| Exchange access | own Binance spot REST adapter (httpx), websockets |
 | Data | polars, numpy |
 | Storage | Parquet (polars), SQLite |
 | HTTP | httpx |
 | Config and models | pydantic, pydantic-settings, YAML |
 | Concurrency | asyncio |
-| Quality | ruff, mypy, pytest, hypothesis, git hooks (`.githooks/`) |
+| Quality | ruff, mypy, pytest, git hooks (`.githooks/`) |
 | Alerts | Telegram Bot API |
-| Deployment | Docker on a VPS in an allowed region (e.g. Tokyo) |
+| Deployment | a Windows or Linux host under a supervisor that restarts on exit; a VPS in an allowed region later |
 
 ## 9. Repository Layout
 
@@ -305,17 +309,19 @@ Trading-Bot/
   config/                # yaml configs
   docs/
   src/tbot/
-    core/                # models, events, clock
-    data/                # download, storage, live feed
+    core/                # config, models, timeframes
+    data/                # download, storage, quality checks
+    live/                # feed, session, executor, guard, ledger, reconciliation
     strategies/          # base, registry, plugins
     portfolio/           # positions, pnl, allocation
-    risk/                # rules, kill switch
-    execution/           # order manager, sim broker
+    risk/                # exposure limits, volatility targeting
+    execution/           # rebalance planning, sim broker
     exchange/            # binance adapter
     backtest/            # engine, cost models, reports
-    research/            # vectorized tests, walk-forward, optimization
-    monitoring/          # logging, alerts, heartbeat
-    cli.py               # download | backtest | paper | testnet | live
+    research/            # sweep, walk-forward, Monte Carlo, trial log, validation
+    monitoring/          # logging, alerts, heartbeat, dashboard
+    cli.py               # download check backtest validate paper live status resume
+                         # account dashboard notify
   tests/
 ```
 
@@ -333,7 +339,7 @@ Trading-Bot/
 
 Perpetuals are deferred: they add a second API surface (USD-M futures), margin and liquidation handling, funding accrual, and shorting to every layer, which deserves its own design pass. The validation results say exposure control on spot was the more valuable step.
 
-No live trading before a strategy passes phase 3 validation.
+No live trading before a strategy passes phase 3 validation. As of 2026-09-30 no configuration has passed the gate: the best candidate (Donchian with volatility targeting 0.4, used by the paper, testnet, and live configs) misses the out-of-sample drawdown limit by two points. Going live anyway is the owner's decision, with a small budget.
 
 ## 11. Open Questions
 

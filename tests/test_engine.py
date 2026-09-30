@@ -124,3 +124,25 @@ def test_invalid_targets_raise(targets: dict[str, float], message: str) -> None:
 def test_missing_stream_raises() -> None:
     with pytest.raises(ValueError, match="no bars loaded for ETH"):
         run(Scripted(["ETH"]), {("BTC", H1): price_bars(T0, H1, [100], [100])})
+
+
+def test_every_symbol_fills_when_timeframes_are_mixed() -> None:
+    btc = price_bars(T0, H4, [100.0, 101.0, 102.0], [101.0, 102.0, 103.0])
+    eth = price_bars(T0, H1, [50.0] * 12, [50.0] * 12)
+    engine = BacktestEngine(
+        [
+            StrategySlot(Scripted(["BTC"], {"script": {at(4): {"BTC": 0.4}}}), H4, 0.5),
+            StrategySlot(Scripted(["ETH"], {"script": {at(1): {"ETH": 0.4}}}), H1, 0.5),
+        ],
+        {("BTC", H4): btc, ("ETH", H1): eth},
+        start=T0,
+        initial_cash=1000.0,
+        costs=COSTS,
+        risk=RiskLimits(),
+        rules=RULES,
+    )
+    fills = engine.run().fills
+    # Hourly ETH decisions no longer push the BTC order back forever.
+    btc_fills = fills.filter(pl.col("symbol") == "BTC").select("time", "price").rows()
+    assert btc_fills == [(at(4), pytest.approx(101.0 * 1.001))]
+    assert fills.filter(pl.col("symbol") == "ETH").height == 1

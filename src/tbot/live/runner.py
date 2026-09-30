@@ -1,18 +1,22 @@
 """Paper, testnet, and live sessions: one event loop, different executors."""
 
 import asyncio
+import json
 import signal
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+import sys
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import httpx
 import polars as pl
 import structlog
 
 from tbot.backtest.runner import WARMUP_MARGIN, history_bars
+from tbot.core.config import TradingConfig
 from tbot.core.models import Fill
 from tbot.data.downloader import sync
 from tbot.data.store import BarStore
@@ -22,11 +26,11 @@ from tbot.live.clock import ServerClock
 from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings
 from tbot.live.executor import BinanceBookTicker, Executor, LiveExecutor, PaperExecutor
 from tbot.live.feed import Batch, LiveFeed, bars_since, close_time, utc_now
-from tbot.live.guard import GuardState, Mode, RiskGuard
-from tbot.live.history import BarHistory
+from tbot.live.guard import Decision, GuardState, Mode, RiskGuard
+from tbot.live.history import MAX_BARS, BarHistory
 from tbot.live.ledger import Adjustment, Ledger, config_hash
 from tbot.live.reconcile import reconcile
-from tbot.live.session import StreamKey, TradingSession, replay_history
+from tbot.live.session import Checkpoint, StreamKey, TradingSession, replay_history
 from tbot.monitoring.heartbeat import heartbeat_loop
 from tbot.monitoring.telegram import LogNotifier, Notifier, Telegram
 from tbot.portfolio.allocation import StrategySlot, build_slots
@@ -36,8 +40,22 @@ from tbot.risk.limits import RiskLimits
 log = structlog.get_logger(__name__)
 CLOCK_RESYNC_SECONDS = 600
 SYNC_LOOKBACK_BARS = 400
+SHUTDOWN_GRACE_SECONDS = 60  # an event in progress may finish its orders before shutdown
+RECONCILE_ALERT_AFTER = 3  # consecutive failed reconciliations before trading pauses
 GUARD_META = "guard"
+TARGETS_META = "targets"
 _background: set[asyncio.Task[bool]] = set()
+
+
+class AlreadyRunning(RuntimeError):
+    """Another process holds this session's ledger."""
+
+
+@dataclass
+class Health:
+    """A condition outside the risk guard that pauses new orders; empty when all is well."""
+
+    blocked: str = ""
 
 
 class SessionTrader:
@@ -53,6 +71,7 @@ class SessionTrader:
         clock: Callable[[], datetime] = utc_now,
         label: str = "paper",
         lock: asyncio.Lock | None = None,
+        health: Health | None = None,
     ) -> None:
         self.session = session
         self.ledger = ledger
@@ -62,6 +81,8 @@ class SessionTrader:
         self.clock = clock
         self.label = label
         self.lock = lock or asyncio.Lock()  # one writer to the book at a time
+        self.health = health or Health()
+        self._paused = False  # a blocked bar was announced; later ones are only logged
 
     async def handle(self, batch: Batch) -> list[Fill]:
         async with self.lock:
@@ -74,18 +95,29 @@ class SessionTrader:
         for slot in session.slots:
             if any((s, slot.timeframe) in batch for s in slot.strategy.symbols):
                 self.ledger.add_signals(now, slot.strategy.name, slot.targets)
+        self.save_checkpoint(now)
 
         self.reload_guard()
         was_halted = self.guard.state.halted
         decision = self.guard.check(self.clock(), session.portfolio.equity(session.marks), now)
+        if decision.mode != Mode.HALT and self.health.blocked:
+            decision = Decision(Mode.BLOCK, self.health.blocked)
         self.save_guard()
         fills: list[Fill] = []
         if decision.mode == Mode.HALT:
             fills = await self._halt(decision.reason, now, announce=not was_halted)
         elif decision.mode == Mode.BLOCK:
             self.ledger.add_event(now, "warning", f"blocked: {decision.reason}")
-            await self.notifier.send(f"[{self.label}] no trading this bar: {decision.reason}")
+            if not self._paused:
+                await self.notifier.send(
+                    f"[{self.label}] no trading this bar: {decision.reason}. "
+                    f"Further blocked bars are logged, not sent."
+                )
+            self._paused = True
         else:
+            if self._paused:
+                self._paused = False
+                await self.notifier.send(f"[{self.label}] trading again")
             allowed = self.guard.filter_orders(orders, session.portfolio.positions, decision.mode)
             if decision.mode == Mode.REDUCE_ONLY and allowed != dict(orders):
                 self.ledger.add_event(now, "warning", f"reduce only: {decision.reason}")
@@ -117,10 +149,12 @@ class SessionTrader:
             fills = await self.executor.execute(orders, now, session.portfolio, session.marks)
             await self.executor.after_event(session.portfolio, session.marks)
         if announce or fills:
+            left = sum(1 for quantity in session.portfolio.positions.values() if quantity)
+            rest = f", {left} left below the exchange minimum" if left else ""
             self.ledger.add_event(now, "error", f"kill switch: {reason}")
             await self.notifier.send(
                 f"[{self.label}] KILL SWITCH: {reason}. Positions flattened ({len(fills)} "
-                f"fills). Trading stays halted until `tbot resume`."
+                f"fills{rest}). Trading stays halted until `tbot resume`."
             )
         return fills
 
@@ -136,6 +170,35 @@ class SessionTrader:
             stored = GuardState.model_validate_json(raw)
             if not stored.halted:
                 self.guard.state = stored
+
+    def save_checkpoint(self, now: datetime) -> None:
+        """Strategy targets after this event, so a restart continues from them."""
+        checkpoint = self.session.checkpoint(now)
+        payload = {
+            "time": now.isoformat(),
+            "strategies": strategies_hash(self.session.config),
+            "targets": checkpoint.targets,
+        }
+        self.ledger.set_meta(TARGETS_META, json.dumps(payload))
+
+
+def strategies_hash(config: TradingConfig) -> str:
+    return config_hash(
+        json.dumps([s.model_dump(mode="json") for s in config.strategies], sort_keys=True)
+    )
+
+
+def load_checkpoint(config: SessionConfig, ledger: Ledger) -> Checkpoint | None:
+    """The last event's strategy targets, if the strategies are still the same."""
+    raw = ledger.get_meta(TARGETS_META)
+    if raw is None:
+        return None
+    data = json.loads(raw)
+    if data.get("strategies") != strategies_hash(config):
+        log.warning("checkpoint_ignored", reason="strategies changed since the last run")
+        return None
+    targets = [{str(k): float(v) for k, v in slot.items()} for slot in data["targets"]]
+    return Checkpoint(datetime.fromisoformat(data["time"]), targets)
 
 
 def load_guard(config: SessionConfig, ledger: Ledger) -> RiskGuard:
@@ -160,7 +223,7 @@ def lookback_bars(slots: Sequence[StrategySlot], risk: RiskLimits) -> dict[Strea
 
 def restore_portfolio(config: SessionConfig, ledger: Ledger) -> Portfolio:
     """Fills and reconciliation adjustments, replayed in time order, rebuild the book."""
-    portfolio = Portfolio(config.initial_cash)
+    portfolio = Portfolio(config.initial_cash, dust_notional=config.rebalance.min_notional)
     events: list[tuple[datetime, int, Fill | Adjustment]] = []
     events.extend((f.time, 0, f) for f in ledger.fills())
     events.extend((a.time, 1, a) for a in ledger.adjustments())
@@ -173,7 +236,11 @@ def restore_portfolio(config: SessionConfig, ledger: Ledger) -> Portfolio:
 
 
 def build_session(
-    config: SessionConfig, store: BarStore, portfolio: Portfolio, now: datetime
+    config: SessionConfig,
+    store: BarStore,
+    portfolio: Portfolio,
+    now: datetime,
+    checkpoint: Checkpoint | None = None,
 ) -> TradingSession:
     slots = build_slots(config.strategies)
     lookback = lookback_bars(slots, config.risk)
@@ -182,18 +249,24 @@ def build_session(
         frames[key] = bars_since(store, key, count, now)
         if frames[key].height < count // WARMUP_MARGIN:
             raise ValueError(f"not enough stored bars for {key[0]} {key[1]}; run `tbot download`")
-    histories = {key: BarHistory(key[1]) for key in lookback}
+    histories = {
+        key: BarHistory(key[1], max_bars=max(MAX_BARS, count)) for key, count in lookback.items()
+    }
     session = TradingSession(config, slots, histories, portfolio)
-    replay_history(session, frames)
+    replay_history(session, frames, checkpoint)
     return session
 
 
 def summary_text(session: TradingSession, ledger: Ledger, now: datetime, label: str) -> str:
     equity = session.portfolio.equity(session.marks)
     earlier = ledger.equity_before(now - timedelta(days=1))
-    change = f"{equity / earlier.equity - 1:+.2%} over 24h" if earlier else "no 24h reference"
+    change = (
+        f"{equity / earlier.equity - 1:+.2%} over 24h"
+        if earlier and earlier.equity > 0
+        else "no 24h reference"
+    )
     positions = ", ".join(
-        f"{symbol} {qty:.6f} ({qty * session.marks[symbol]:,.0f})"
+        f"{symbol} {qty:.6f} ({qty * session.marks.get(symbol, 0.0):,.0f})"
         for symbol, qty in sorted(session.portfolio.positions.items())
     )
     return (
@@ -212,7 +285,10 @@ async def summary_loop(
         if target <= now:
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
-        await notifier.send(summary_text(session, ledger, utc_now(), label))
+        try:
+            await notifier.send(summary_text(session, ledger, utc_now(), label))
+        except Exception as exc:  # a report must never stop trading
+            log.error("summary_failed", error=repr(exc))
 
 
 async def clock_loop(clock: ServerClock, interval: float) -> None:
@@ -245,6 +321,43 @@ def install_stop_handlers(stop: asyncio.Event) -> None:
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
 
 
+@contextmanager
+def instance_lock(ledger: Path) -> Iterator[None]:
+    """One process per ledger: a second one would trade the same book twice.
+
+    The operating system releases the lock when the process dies, so a crash never
+    leaves a stale lock behind.
+    """
+    path = ledger.with_name(ledger.name + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        try:
+            _lock(handle, lock=True)
+        except OSError:
+            raise AlreadyRunning(
+                f"another tbot process is using {ledger.resolve()}; stop it first"
+            ) from None
+        try:
+            yield
+        finally:
+            _lock(handle, lock=False)
+    finally:
+        handle.close()
+
+
+def _lock(handle: IO[str], *, lock: bool) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK if lock else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), (fcntl.LOCK_EX | fcntl.LOCK_NB) if lock else fcntl.LOCK_UN)
+
+
 @dataclass
 class Context:
     """What an executor setup needs from the running session."""
@@ -259,6 +372,8 @@ class Context:
     keys: list[StreamKey]
     label: str
     lock: asyncio.Lock  # held while the book is read or written
+    guard: RiskGuard
+    health: Health
 
 
 Setup = Callable[[Context], Awaitable[tuple[Executor, list[Coroutine[Any, Any, None]]]]]
@@ -274,13 +389,22 @@ async def run_session(
     stop: asyncio.Event | None = None,
 ) -> int:
     """Run until stopped. Returns a process exit code."""
-    ledger = Ledger(config.ledger)
-    try:
-        return await _run_session(
-            config, settings, data_dir, ledger, label=label, setup=setup, stop=stop
-        )
-    finally:
-        ledger.close()
+    new_ledger = not config.ledger.exists()
+    with instance_lock(config.ledger):
+        ledger = Ledger(config.ledger)
+        try:
+            return await _run_session(
+                config,
+                settings,
+                data_dir,
+                ledger,
+                label=label,
+                setup=setup,
+                stop=stop,
+                new_ledger=new_ledger,
+            )
+        finally:
+            ledger.close()
 
 
 async def _run_session(
@@ -292,33 +416,61 @@ async def _run_session(
     label: str,
     setup: Setup,
     stop: asyncio.Event | None,
+    new_ledger: bool,
 ) -> int:
     stop = stop or asyncio.Event()
     install_stop_handlers(stop)
     store = BarStore(data_dir)
     keys = stream_keys(config)
     lock = asyncio.Lock()
+    health = Health()
     async with httpx.AsyncClient() as aclient:
         notifier = make_notifier(settings, aclient)
         with httpx.Client(timeout=30.0) as client:
-            clock = ServerClock(client)
-            await asyncio.to_thread(clock.sync)
-            now = clock.now()
-            log.info("syncing_store", streams=[f"{s}:{tf}" for s, tf in keys])
-            for symbol, timeframe in keys:
-                start = now - timeframe.delta * SYNC_LOOKBACK_BARS
-                await asyncio.to_thread(sync, store, client, symbol, timeframe, start, now)
+            try:
+                clock = ServerClock(client)
+                await asyncio.to_thread(clock.sync)
+                now = clock.now()
+                log.info("syncing_store", streams=[f"{s}:{tf}" for s, tf in keys])
+                for symbol, timeframe in keys:
+                    start = now - timeframe.delta * SYNC_LOOKBACK_BARS
+                    await asyncio.to_thread(sync, store, client, symbol, timeframe, start, now)
 
-            portfolio = restore_portfolio(config, ledger)
-            session = build_session(config, store, portfolio, now)
-            _check_config(config, ledger)
-            context = Context(
-                config, settings, session, ledger, notifier, clock, aclient, keys, label, lock
-            )
-            executor, extra = await setup(context)
-            guard = load_guard(config, ledger)
+                portfolio = restore_portfolio(config, ledger)
+                checkpoint = load_checkpoint(config, ledger)
+                session = build_session(config, store, portfolio, now, checkpoint)
+                _check_config(config, ledger)
+                guard = load_guard(config, ledger)
+                context = Context(
+                    config,
+                    settings,
+                    session,
+                    ledger,
+                    notifier,
+                    clock,
+                    aclient,
+                    keys,
+                    label,
+                    lock,
+                    guard,
+                    health,
+                )
+                executor, extra = await setup(context)
+            except Exception as exc:  # tell the operator; a supervisor would restart silently
+                log.error("start_failed", error=repr(exc))
+                ledger.add_event(utc_now(), "error", f"failed to start: {exc!r}")
+                await notifier.send(f"[{label}] failed to start: {exc}")
+                return 1
             trader = SessionTrader(
-                session, ledger, executor, notifier, guard, clock.now, label, lock=lock
+                session,
+                ledger,
+                executor,
+                notifier,
+                guard,
+                clock.now,
+                label,
+                lock=lock,
+                health=health,
             )
 
             feed = LiveFeed(
@@ -331,11 +483,14 @@ async def _run_session(
                 on_stale=lambda key, last: _report_stale(ledger, notifier, label, key, last),
             )
             point = session.snapshot(now)
-            ledger.add_event(now, "info", f"started ({label})")
+            where = config.ledger.resolve()
+            ledger.add_event(now, "info", f"started ({label}), ledger {where}")
             halted = f", HALTED: {guard.state.halt_reason}" if guard.state.halted else ""
+            fresh = " (new)" if new_ledger else ""
             await notifier.send(
                 f"[{label}] started: {len(keys)} streams, equity {point.equity:,.2f}, "
-                f"positions {len(portfolio.positions)}, fills so far {len(portfolio.fills)}{halted}"
+                f"positions {len(portfolio.positions)}, fills so far {len(portfolio.fills)}, "
+                f"ledger {where}{fresh}{halted}"
             )
 
             tasks = [
@@ -366,9 +521,18 @@ async def _run_session(
                     ledger.add_event(utc_now(), "error", f"{task.get_name()} crashed: {error}")
                     await notifier.send(f"[{label}] CRASHED in {task.get_name()}: {error}")
                     code = 1
+            # An event in progress finishes its orders and ledger rows before anything stops.
+            try:
+                await asyncio.wait_for(lock.acquire(), SHUTDOWN_GRACE_SECONDS)
+                held = True
+            except TimeoutError:
+                held = False
+                log.error("shutdown_during_event", hint="the next start settles open orders")
             for task in [*tasks, stopper]:
                 task.cancel()
             await asyncio.gather(*tasks, stopper, return_exceptions=True)
+            if held:
+                lock.release()
             ledger.add_event(utc_now(), "info", "stopped")
             equity = session.portfolio.equity(session.marks)
             await notifier.send(f"[{label}] stopped, equity {equity:,.2f}")
@@ -401,7 +565,11 @@ async def run_paper(
 
 
 def make_spot(
-    config: LiveConfig, settings: Settings, client: httpx.AsyncClient, clock: Callable[[], datetime]
+    config: LiveConfig,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    clock: Callable[[], datetime],
+    resync: Callable[[], Awaitable[object]] | None = None,
 ) -> BinanceSpot:
     if not settings.binance_api_key or not settings.binance_api_secret:
         raise ValueError("set TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET")
@@ -412,6 +580,7 @@ def make_spot(
         base_url=TESTNET_URL if config.mode == "testnet" else PRODUCTION_URL,
         clock=clock,
         recv_window=config.recv_window,
+        resync=resync,
     )
 
 
@@ -428,7 +597,10 @@ async def run_live(
     label = config.mode
 
     async def setup(ctx: Context) -> tuple[Executor, list[Coroutine[Any, Any, None]]]:
-        spot = make_spot(config, settings, ctx.aclient, ctx.clock.now)
+        async def resync() -> None:
+            await asyncio.to_thread(ctx.clock.sync)
+
+        spot = make_spot(config, settings, ctx.aclient, ctx.clock.now, resync)
         symbols = symbols_of(config)
         await spot.load_rules(symbols)
         executor = LiveExecutor(
@@ -443,7 +615,9 @@ async def run_live(
         portfolio = ctx.session.portfolio
 
         async def reconcile_once() -> None:
-            await reconcile(
+            """Book what the exchange did between events, then compare the rest."""
+            await executor.settle(portfolio)
+            adjustments = await reconcile(
                 spot,
                 portfolio,
                 symbols,
@@ -451,20 +625,45 @@ async def run_live(
                 ctx.notifier,
                 ctx.clock.now(),
                 tolerance=config.reconcile_tolerance,
+                ownership=config.ownership,
                 label=label,
             )
+            if adjustments:
+                # Money moved from outside: not a profit or loss for the guard.
+                moved = sum(
+                    a.cash + a.quantity * ctx.session.marks.get(a.symbol, 0.0) for a in adjustments
+                )
+                ctx.guard.shift(moved)
+                ctx.ledger.set_meta(GUARD_META, ctx.guard.state.model_dump_json())
+                await executor.after_event(portfolio, ctx.session.marks)  # stops for what changed
 
-        await reconcile_once()
-        await executor.after_event(portfolio, ctx.session.marks)  # stops for held positions
+        async with ctx.lock:
+            await reconcile_once()
+            await executor.after_event(portfolio, ctx.session.marks)  # stops for held positions
 
         async def reconcile_loop() -> None:
+            failures = 0
             while True:
                 await asyncio.sleep(config.reconcile_seconds)
                 try:
                     async with ctx.lock:  # never while an order is in flight
                         await reconcile_once()
                 except (BinanceError, httpx.HTTPError) as exc:
-                    log.warning("reconcile_failed", error=repr(exc))
+                    failures += 1
+                    log.warning("reconcile_failed", failures=failures, error=repr(exc))
+                    if failures == RECONCILE_ALERT_AFTER:
+                        reason = f"reconciliation failing ({exc})"
+                        ctx.health.blocked = reason
+                        ctx.ledger.add_event(utc_now(), "error", reason)
+                        await ctx.notifier.send(
+                            f"[{label}] {reason}; new orders wait until it works again"
+                        )
+                    continue
+                if failures >= RECONCILE_ALERT_AFTER:
+                    ctx.health.blocked = ""
+                    ctx.ledger.add_event(utc_now(), "info", "reconciliation works again")
+                    await ctx.notifier.send(f"[{label}] reconciliation works again")
+                failures = 0
 
         return executor, [reconcile_loop()]
 
@@ -545,7 +744,7 @@ def status_text(config: SessionConfig, store: BarStore) -> str:
         guard = load_guard(config, ledger)
         point = ledger.latest_equity()
         lines = [
-            f"ledger {config.ledger}",
+            f"ledger {config.ledger.resolve()}",
             f"created {ledger.get_meta('created_at') or '-'}",
             (
                 f"equity {point.equity:,.2f} at {point.time:%Y-%m-%d %H:%M} UTC, "
@@ -556,6 +755,9 @@ def status_text(config: SessionConfig, store: BarStore) -> str:
             f"fills {len(portfolio.fills)}, round trips {len(portfolio.trades)}, "
             f"adjustments {len(ledger.adjustments())}",
         ]
+        unresolved = ledger.unresolved_orders()
+        if unresolved:
+            lines.append(f"orders in doubt {len(unresolved)} (settled when the bot runs)")
         if guard.state.halted:
             lines.append(f"HALTED: {guard.state.halt_reason} (run `tbot resume`)")
         for symbol, qty in sorted(portfolio.positions.items()):

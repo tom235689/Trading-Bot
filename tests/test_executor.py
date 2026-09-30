@@ -52,6 +52,11 @@ def run[T](
     return asyncio.run(go())
 
 
+@pytest.fixture(autouse=True)
+def fast_lookups(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tbot.live.executor.LOOKUP_DELAYS", (0.0, 0.0, 0.0))
+
+
 def statuses(ledger: Ledger) -> list[str]:
     rows = ledger.conn.execute("SELECT status FROM orders ORDER BY id").fetchall()
     return [row[0] for row in rows]
@@ -60,7 +65,9 @@ def statuses(ledger: Ledger) -> list[str]:
 def test_order_id_is_deterministic() -> None:
     assert order_id(T0, BTC, 1.0) == "tb1704067200000BTCUSDTB"
     assert order_id(T0, BTC, -1.0) == "tb1704067200000BTCUSDTS"
+    assert order_id(T0, BTC, 1.0, attempt=2) == "tb1704067200000BTCUSDTBr2"
     assert len(order_id(T0, "A" * 40, 1.0)) == 36
+    assert len(order_id(T0, "A" * 40, 1.0, attempt=12)) == 36
 
 
 def test_buy_shrinks_by_base_commission_and_places_stop(tmp_path: Path) -> None:
@@ -117,18 +124,21 @@ def test_lost_response_is_recovered_by_client_order_id(tmp_path: Path) -> None:
     fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
     fake.lose_next_order_response = True
 
-    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> None:
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
         portfolio = Portfolio(1000.0)
         fills = await executor.execute({BTC: 0.01}, T0, portfolio, MARKS)
         assert len(fills) == 1
-        assert len(ledger.fills()) == 1
         assert statuses(ledger) == ["pending", "filled"]
-        # The same event again (crash and restart): recovered, not re-sent.
-        again = await executor.execute({BTC: 0.01}, T0, Portfolio(1000.0), MARKS)
+        # A second decision at the same close (a stream arrived late) is a new order.
+        again = await executor.execute({BTC: 0.005}, T0, portfolio, MARKS)
         assert len(again) == 1
+        assert len(ledger.fills()) == 2
+        return portfolio
 
-    run(fake, tmp_path, action)
-    assert fake.order_count("MARKET") == 1
+    portfolio = run(fake, tmp_path, action, stop_pct=0.0)
+    ids = [o["clientOrderId"] for o in fake.orders]
+    assert ids == ["tb1704067200000BTCUSDTB", "tb1704067200000BTCUSDTBr2"]
+    assert portfolio.position(BTC) == pytest.approx(fake.balances["BTC"])  # none twice
 
 
 def test_below_minimum_is_skipped_and_cash_caps_buys(tmp_path: Path) -> None:
@@ -189,6 +199,106 @@ def test_stop_gone_before_cancel_is_not_an_error(
             raise BinanceError(NOTHING_TO_CANCEL, "Unknown order sent.", 400)
 
         monkeypatch.setattr(executor.spot, "cancel_order", gone)
-        return await executor.cancel_stops(BTC)
+        return await executor.cancel_stops(BTC, portfolio)
 
     assert run(fake, tmp_path, action) == 0
+
+
+def test_order_in_doubt_after_a_server_error_is_looked_up(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+    fake.error_after_next_order = httpx.Response(503)  # executed, but the answer is an error
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        portfolio = Portfolio(1000.0)
+        [fill] = await executor.execute({BTC: 0.01}, T0, portfolio, MARKS)
+        assert fill.quantity == pytest.approx(0.00999)  # commission read from its trades
+        assert statuses(ledger) == ["pending", "filled"]
+        return portfolio
+
+    portfolio = run(fake, tmp_path, action, stop_pct=0.0)
+    assert fake.order_count("MARKET") == 1
+    assert portfolio.cash == pytest.approx(fake.balances["USDT"])
+
+
+def test_order_state_unknown_is_settled_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+    fake.error_after_next_order = httpx.Response(503)
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        portfolio = Portfolio(1000.0)
+        lookup = executor.spot.get_order
+
+        async def unreachable(symbol: str, client_id: str) -> Order | None:
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(executor.spot, "get_order", unreachable)
+        assert await executor.execute({BTC: 0.01}, T0, portfolio, MARKS) == []
+        assert statuses(ledger) == ["pending", "unknown"]
+        assert "state unknown" in notifier.messages[0]
+        monkeypatch.setattr(executor.spot, "get_order", lookup)
+        await executor.settle(portfolio)
+        assert statuses(ledger) == ["pending", "unknown", "filled"]
+        assert ledger.unresolved_orders() == []
+        return portfolio
+
+    portfolio = run(fake, tmp_path, action, stop_pct=0.0)
+    assert portfolio.position(BTC) == pytest.approx(fake.balances["BTC"])
+
+
+def test_settle_resolves_orders_left_by_a_crash(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        # A previous run wrote two pending rows and died; only one order reached the exchange.
+        sent, lost = order_id(T0, BTC, 1.0), order_id(T0, "ETHUSDT", 1.0)
+        ledger.add_order(T0, BTC, 0.01, "pending", "", sent)
+        ledger.add_order(T0, "ETHUSDT", 0.1, "pending", "", lost)
+        await executor.spot.market_order(BTC, 0.01, sent)
+        portfolio = Portfolio(1000.0)
+        await executor.settle(portfolio)
+        assert ledger.unresolved_orders() == []
+        rows = ledger.conn.execute(
+            "SELECT client_id, status, note FROM orders WHERE id > 2 ORDER BY id"
+        ).fetchall()
+        assert rows == [(sent, "filled", ""), (lost, "failed", "not on exchange")]
+        assert "booked an order" in notifier.messages[0]
+        return portfolio
+
+    portfolio = run(fake, tmp_path, action)
+    assert portfolio.position(BTC) == pytest.approx(0.00999)
+
+
+def test_triggered_stop_is_booked_as_a_fill(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        portfolio = Portfolio(1000.0)
+        await executor.execute({BTC: 0.01}, T0, portfolio, MARKS)
+        await executor.after_event(portfolio, MARKS)
+        fake.trigger_stop(BTC)  # the market fell through the stop between events
+        await executor.settle(portfolio)
+        assert portfolio.position(BTC) == pytest.approx(0.0, abs=1e-12)
+        assert ledger.get_meta("stop:" + BTC) is None
+        assert any("protective stop sold" in m for m in notifier.messages)
+        await executor.settle(portfolio)  # booked once
+        assert len(ledger.fills()) == 2
+        return portfolio
+
+    portfolio = run(fake, tmp_path, action)
+    assert portfolio.cash == pytest.approx(fake.balances["USDT"], abs=0.01)
+    assert len(portfolio.trades) == 1
+
+
+def test_buys_never_spend_more_than_the_book_holds(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> None:
+        portfolio = Portfolio(100.0)  # the bot's budget; the other 900 USDT are the owner's
+        [fill] = await executor.execute({BTC: 0.01}, T0, portfolio, MARKS)
+        assert fill.quantity * fill.price < 100.0
+        assert portfolio.cash >= 0.0
+
+    run(fake, tmp_path, action, stop_pct=0.0)
+    assert fake.balances["USDT"] > 900.0

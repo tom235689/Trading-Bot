@@ -20,8 +20,10 @@ class _OpenTrade:
 
 
 class Portfolio:
-    def __init__(self, cash: float) -> None:
+    def __init__(self, cash: float, dust_notional: float = 0.0) -> None:
         self.cash = cash
+        # A remainder worth less than this after a sale cannot be traded: the round trip ends.
+        self.dust_notional = dust_notional
         self.positions: dict[str, float] = {}
         self.fills: list[Fill] = []
         self.trades: list[Trade] = []
@@ -62,26 +64,41 @@ class Portfolio:
         after = before + fill.quantity
         if abs(after) < EPSILON:
             after = 0.0
+        dust = (
+            after != 0
+            and (after > 0) == (before > 0)
+            and abs(after) < abs(before)
+            and abs(after) * fill.price < self.dust_notional
+        )
 
         if before and (after == 0 or (after > 0) != (before > 0)):
             # Closes the position, maybe flipping it: split the fill at zero.
             share = -before / fill.quantity
-            self._track(fill, -before, fill.fee * share)
+            self._track(fill, -before, fill.fee * share, _sign(before))
             self._close(fill.symbol, fill.time)
             if after:
-                self._track(fill, after, fill.fee * (1 - share))
+                self._track(fill, after, fill.fee * (1 - share), _sign(after))
+        elif dust and fill.symbol in self._open:
+            # Sold down to an untradable remainder: the round trip is over, the dust stays.
+            self._track(fill, fill.quantity, fill.fee, _sign(before))
+            self._close(fill.symbol, fill.time)
         else:
-            self._track(fill, fill.quantity, fill.fee)
+            self._track(fill, fill.quantity, fill.fee, _sign(after))
 
         if after:
             self.positions[fill.symbol] = after
         else:
             self.positions.pop(fill.symbol, None)
 
-    def _track(self, fill: Fill, quantity: float, fee: float) -> None:
+    def _track(self, fill: Fill, quantity: float, fee: float, direction: int) -> None:
+        """Add a fill to the open round trip; `direction` is the position's side if it opens one.
+
+        A position adopted from the exchange has no open trade, so its first sale opens
+        one on the position's side rather than looking like a short.
+        """
         trade = self._open.get(fill.symbol)
         if trade is None:
-            trade = _OpenTrade(direction=1 if quantity > 0 else -1, entry_time=fill.time)
+            trade = _OpenTrade(direction=direction, entry_time=fill.time)
             self._open[fill.symbol] = trade
         trade.cash_flow -= quantity * fill.price + fee
         trade.fees += fee
@@ -101,3 +118,7 @@ class Portfolio:
                 cost=trade.cost,
             )
         )
+
+
+def _sign(value: float) -> int:
+    return 1 if value > 0 else -1

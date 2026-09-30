@@ -85,3 +85,8 @@ class RsiReversion(Strategy):
             elif self._long[symbol] and value > self.params.high:
                 self._long[symbol] = False
         return {symbol: weight if self._long[symbol] else 0.0 for symbol in self.symbols}
+
+    def restore(self, targets: Mapping[str, float]) -> None:
+        for symbol in self.symbols:
+            if symbol in targets:
+                self._long[symbol] = targets[symbol] > 0

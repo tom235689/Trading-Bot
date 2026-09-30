@@ -8,7 +8,9 @@ Each event is a bar close time. At every event, in order:
 4. Run strategies whose bars closed now; they see only closed bars.
 5. Combine targets, apply risk limits, and queue orders for the next bar.
 
-A symbol's fills and marks use its finest loaded timeframe.
+A symbol's fills and marks use its finest loaded timeframe (its execution stream).
+Orders for a symbol are planned only at events where that stream closes, as in
+paper and live, so another symbol's faster bars never postpone its fills.
 """
 
 from collections.abc import Mapping, Sequence
@@ -106,7 +108,7 @@ class BacktestEngine:
 
         self.start_ms = to_millis(start)
         self.initial_cash = initial_cash
-        self.portfolio = Portfolio(initial_cash)
+        self.portfolio = Portfolio(initial_cash, dust_notional=rules.min_notional)
         self.broker = SimulatedBroker(costs)
         self.risk = risk
         self.rules = rules
@@ -125,7 +127,7 @@ class BacktestEngine:
             if trading:
                 self._record(now)
             if self._run_strategies(now, revealed) and trading:
-                self._rebalance(now_ms)
+                self._rebalance(now_ms, revealed)
         return self._result()
 
     def _fill_pending(self, revealed: set[StreamKey]) -> None:
@@ -177,7 +179,7 @@ class BacktestEngine:
             updated = True
         return updated
 
-    def _rebalance(self, now_ms: int) -> None:
+    def _rebalance(self, now_ms: int, revealed: set[StreamKey]) -> None:
         scales = None
         if self.risk.target_volatility:
             scales = {
@@ -192,7 +194,9 @@ class BacktestEngine:
         orders = decide_orders(
             self.slots, self.portfolio, self.marks, self.risk, self.rules, scales
         )
-        self.pending = [PendingOrder(now_ms, s, q) for s, q in orders.items()]
+        fresh = {symbol for symbol, key in self.exec_keys.items() if key in revealed}
+        kept = [order for order in self.pending if order.symbol not in fresh]
+        self.pending = kept + [PendingOrder(now_ms, s, q) for s, q in orders.items() if s in fresh]
 
     def _result(self) -> BacktestResult:
         time_type = pl.Datetime("ms", "UTC")

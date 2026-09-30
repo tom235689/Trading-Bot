@@ -60,3 +60,20 @@ def test_backtest_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     )
     assert main(["backtest", str(config), "--data-dir", str(tmp_path)]) == 0
     assert "CAGR" in capsys.readouterr().out
+
+
+def test_notify_needs_telegram_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)  # no .env here
+    for name in ("TBOT_TELEGRAM_TOKEN", "TBOT_TELEGRAM_CHAT_ID"):
+        monkeypatch.delenv(name, raising=False)
+    assert main(["notify"]) == 1
+    assert "TBOT_TELEGRAM_TOKEN" in capsys.readouterr().out
+
+
+def test_wrong_kind_of_config_is_explained() -> None:
+    with pytest.raises(SystemExit, match="a backtest config"):
+        main(["paper", "config/donchian_voltarget.yaml"])
+    with pytest.raises(SystemExit, match="only for mode: live"):
+        main(["live", "config/testnet.yaml", "--live"])

@@ -1,7 +1,16 @@
-"""Compare the bot's book with the exchange account; the exchange wins."""
+"""Compare the bot's book with the exchange account.
+
+Two ownership modes:
+- "budget": the bot owns `initial_cash` and what it bought with it; the rest of the
+  account belongs to the owner. The exchange can only shrink the book (a manual
+  sale, a withdrawal, fees paid elsewhere); balances beyond the book are ignored.
+- "account": the bot owns the whole account (a dedicated account); the exchange wins
+  both ways.
+"""
 
 from collections.abc import Sequence
 from datetime import datetime
+from typing import Literal
 
 import structlog
 
@@ -12,6 +21,7 @@ from tbot.portfolio.portfolio import Portfolio
 
 log = structlog.get_logger(__name__)
 CASH_TOLERANCE = 1.0  # quote units; fee assets like BNB make small cash drift normal
+Ownership = Literal["budget", "account"]
 
 
 async def reconcile(
@@ -23,9 +33,10 @@ async def reconcile(
     now: datetime,
     *,
     tolerance: float,
+    ownership: Ownership = "account",
     label: str = "live",
 ) -> list[Adjustment]:
-    """Adopt exchange balances that differ from the book beyond tolerance; record why."""
+    """Move the book to the exchange where they differ beyond tolerance; record why."""
     balances = await spot.balances()
     quotes = {spot.rules[s].quote for s in symbols}
     if len(quotes) != 1:
@@ -38,14 +49,18 @@ async def reconcile(
         held = balances[base].total if base in balances else 0.0
         booked = portfolio.position(symbol)
         step = float(spot.rules[symbol].step_size)
-        if abs(held - booked) > max(step, tolerance * max(abs(held), abs(booked))):
-            note = f"{symbol} position: book {booked:.6f}, exchange {held:.6f}"
-            adjustments.append(Adjustment(now, symbol, held - booked, 0.0, note))
+        if abs(held - booked) <= max(step, tolerance * max(abs(held), abs(booked))):
+            continue
+        if ownership == "budget" and held > booked:
+            continue  # the owner's own coins
+        note = f"{symbol} position: book {booked:.6f}, exchange {held:.6f}"
+        adjustments.append(Adjustment(now, symbol, held - booked, 0.0, note))
 
     cash = balances[quote].free if quote in balances else 0.0
-    if abs(cash - portfolio.cash) > max(
+    beyond = abs(cash - portfolio.cash) > max(
         CASH_TOLERANCE, tolerance * max(abs(cash), abs(portfolio.cash))
-    ):
+    )
+    if beyond and not (ownership == "budget" and cash > portfolio.cash):
         note = f"cash: book {portfolio.cash:.2f}, exchange {cash:.2f}"
         adjustments.append(Adjustment(now, "", 0.0, cash - portfolio.cash, note))
 

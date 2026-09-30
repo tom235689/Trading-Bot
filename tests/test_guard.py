@@ -66,3 +66,12 @@ def test_filter_orders_by_mode() -> None:
         "BTC": -2.0,
         "XRP": 1.0,
     }
+
+
+def test_money_moved_from_outside_shifts_the_levels() -> None:
+    guard = RiskGuard(GuardConfig(daily_loss_limit=0.03, max_drawdown=0.15, stale_seconds=0))
+    now = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    assert guard.check(now, 1000.0, now).mode == Mode.NORMAL
+    guard.shift(-300.0)  # a withdrawal is not a 30% loss
+    assert guard.check(now, 700.0, now).mode == Mode.NORMAL
+    assert (guard.state.peak_equity, guard.state.day_open_equity) == (700.0, 700.0)

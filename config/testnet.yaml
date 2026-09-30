@@ -1,6 +1,7 @@
-# Binance spot testnet: real order path, fake money. Signals use production market data,
-# fills use testnet prices, so PnL here only checks the mechanics.
+# Binance spot testnet: the real order path with fake money. Signals use production market
+# data, fills use testnet prices, so PnL here only checks the mechanics.
 mode: testnet
+ownership: budget      # the bot trades initial_cash; the testnet's other balances stay put
 initial_cash: 10000
 costs:
   fee_rate: 0.001
@@ -8,6 +9,8 @@ costs:
 risk:
   max_symbol_weight: 0.5
   max_gross_exposure: 1.0
+  target_volatility: 0.4
+  volatility_lookback_days: 30
 rebalance:
   min_notional: 10
   rebalance_threshold: 0.02

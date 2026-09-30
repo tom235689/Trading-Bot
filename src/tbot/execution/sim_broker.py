@@ -1,5 +1,6 @@
 """Simulated spot broker with fees and slippage."""
 
+import math
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -29,6 +30,8 @@ class SimulatedBroker:
         cash: float,
         position: float,
     ) -> Fill | None:
+        if not (math.isfinite(quantity) and math.isfinite(reference_price)) or reference_price <= 0:
+            return None
         slip = self.costs.slippage_bps / 10_000
         price = reference_price * (1 + slip if quantity > 0 else 1 - slip)
         if quantity > 0:

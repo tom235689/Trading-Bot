@@ -54,3 +54,24 @@ def test_rejects_wrong_schema(tmp_path: Path) -> None:
     bars = make_bars(NEW_YEAR_EVE, 2, H4).drop("trades")
     with pytest.raises(ValueError, match="schema"):
         BarStore(tmp_path).write("BTCUSDT", H4, bars)
+
+
+def test_write_retries_while_another_process_reads_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BarStore(tmp_path)
+    real = Path.replace
+    calls: list[Path] = []
+
+    def busy_twice(self: Path, target: Path) -> Path:
+        calls.append(target)
+        if len(calls) < 3:
+            raise PermissionError("in use")
+        return real(self, target)
+
+    monkeypatch.setattr(Path, "replace", busy_twice)
+    monkeypatch.setattr("tbot.data.store.time.sleep", lambda seconds: None)
+    store.write("BTCUSDT", H4, make_bars(datetime(2024, 1, 1, tzinfo=UTC), 3, H4))
+    assert len(calls) == 3
+    assert store.read("BTCUSDT", H4).height == 3
+    assert not list(store.directory("BTCUSDT", H4).glob("*.tmp"))

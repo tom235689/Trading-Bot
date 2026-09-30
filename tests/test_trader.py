@@ -150,3 +150,26 @@ def test_halt_is_announced_once_while_dust_remains(tmp_path: Path) -> None:
     assert h.bar(3, 85.0) == [pytest.approx(-1000 / 100.1)]  # flattened now: announced again
     assert sum("KILL SWITCH" in m for m in h.notifier.messages) == 2
     h.ledger.close()
+
+
+def test_blocked_bars_are_announced_once(tmp_path: Path) -> None:
+    guard = GuardConfig(daily_loss_limit=0, max_drawdown=0, stale_seconds=60)
+    h = Harness(tmp_path, guard, {})
+    assert h.bar(0, 100.0) == []  # closed at 1h, the clock says 9h: stale
+    assert h.bar(1, 100.0) == []
+    assert sum("no trading this bar" in m for m in h.notifier.messages) == 1
+    assert h.bar(8, 100.0) == []  # closes at 9h: fresh again
+    assert h.notifier.messages[-1].endswith("trading again")
+    h.ledger.close()
+
+
+def test_failing_reconciliation_pauses_orders(tmp_path: Path) -> None:
+    guard = GuardConfig(daily_loss_limit=0, max_drawdown=0, stale_seconds=0)
+    h = Harness(tmp_path, guard, {at(1): {"BTC": 1.0}})
+    h.trader.health.blocked = "reconciliation failing (down)"
+    assert h.bar(0, 100.0) == []
+    assert "reconciliation failing" in h.notifier.messages[0]
+    h.trader.health.blocked = ""
+    assert len(h.bar(1, 100.0)) == 1
+    assert h.ledger.get_meta("targets") is not None  # strategy targets saved every event
+    h.ledger.close()

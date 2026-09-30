@@ -56,6 +56,7 @@ python_version = "3.12"
 strict = true
 files = ["src", "tests", "scripts"]
 mypy_path = ["scripts", "tests"]
+sqlite_cache = false  # works where the sqlite3 module cannot load
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -76,6 +76,14 @@ class RiskGuard:
         self.state.halted = True
         self.state.halt_reason = reason
 
+    def shift(self, amount: float) -> None:
+        """Move the reference levels by money that entered or left the book from outside
+        (deposits, withdrawals, manual trades), so they are not counted as profit or loss."""
+        if self.state.peak_equity:
+            self.state.peak_equity = max(self.state.peak_equity + amount, 0.0)
+        if self.state.day is not None:
+            self.state.day_open_equity = max(self.state.day_open_equity + amount, 0.0)
+
     def resume(self) -> None:
         """Human action: clear the kill switch and start the drawdown count from here."""
         self.state.halted = False

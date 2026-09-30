@@ -58,6 +58,8 @@ def downsample[T](values: Sequence[T], limit: int = MAX_POINTS) -> list[T]:
 
 def nice_ticks(low: float, high: float, count: int = 5) -> list[float]:
     """Round tick values (1, 2, 5 times a power of ten) covering [low, high]."""
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return [0.0, 1.0]
     if high <= low:
         high = low + 1
     raw = (high - low) / max(count - 1, 1)
@@ -84,11 +86,14 @@ def _line_chart(
     chart_id: str, times: Sequence[datetime], values: Sequence[float], *, percent: bool
 ) -> str:
     """SVG line with a 10% area wash, recessive gridlines, and clean ticks."""
-    if not values:
+    finite = [v for v in values if math.isfinite(v)]
+    if not finite:
         return '<p class="muted">no data</p>'
-    low, high = min(values), max(values)
+    low, high = min(finite), max(finite)
     if percent:
         low, high = min(low, 0.0), max(high, 0.0)
+        if high - low < 0.05:  # no drawdown yet: a small span, not 0% to 100%
+            low = high - 0.05
     ticks = nice_ticks(low, high)
     y_min, y_max = ticks[0], ticks[-1]
     x0, x1 = PAD_LEFT, WIDTH - PAD_RIGHT
@@ -371,7 +376,8 @@ def from_ledger(config: SessionConfig, store: BarStore, title: str) -> Dashboard
             f"{len(portfolio.fills)} fills, {len(ledger.adjustments())} adjustments",
             times=times,
             equity=equity,
-            initial=config.initial_cash,
+            # Adjustments move money in or out of the book; then the first snapshot is the base.
+            initial=equity[0] if equity and ledger.adjustments() else config.initial_cash,
             positions=positions,
             fills=ledger.fills(),
             events=ledger.recent_events(20),

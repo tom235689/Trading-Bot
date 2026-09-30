@@ -1,13 +1,26 @@
 """SQLite ledger: the durable record of a paper or live session."""
 
 import hashlib
-import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
+from typing import Self
 
 from tbot.core.models import Fill
+
+try:
+    import sqlite3
+except ImportError as exc:  # e.g. Windows Smart App Control blocking _sqlite3.pyd
+    SQLITE_ERROR: ImportError | None = exc
+else:
+    SQLITE_ERROR = None
+
+
+class LedgerUnavailable(RuntimeError):
+    """The SQLite driver cannot be loaded, so no session can keep a ledger."""
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -16,7 +29,7 @@ CREATE TABLE IF NOT EXISTS fills (
     price REAL NOT NULL, fee REAL NOT NULL, reference_price REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY, time TEXT NOT NULL, symbol TEXT NOT NULL, quantity REAL NOT NULL,
-    status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '');
+    status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', client_id TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY, time TEXT NOT NULL, strategy TEXT NOT NULL, symbol TEXT NOT NULL,
     target REAL NOT NULL);
@@ -30,6 +43,17 @@ CREATE TABLE IF NOT EXISTS adjustments (
     cash REAL NOT NULL, note TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS equity_time ON equity (time);
 """
+# Order rows that end an order's story; "pending" and "unknown" still need an answer.
+RESOLVED = ("filled", "unfilled", "failed")
+
+
+@dataclass(frozen=True)
+class OrderRecord:
+    time: datetime
+    symbol: str
+    quantity: float
+    status: str
+    client_id: str
 
 
 @dataclass(frozen=True)
@@ -68,13 +92,39 @@ def _parse(text: str) -> datetime:
 
 class Ledger:
     def __init__(self, path: Path) -> None:
+        if SQLITE_ERROR is not None:
+            raise LedgerUnavailable(
+                f"cannot load SQLite ({SQLITE_ERROR}). On Windows, Smart App Control can "
+                "block unsigned Python modules: install Python from python.org and run "
+                "`uv venv --python <path to its python.exe>` then `uv sync`, as the "
+                "README explains."
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=FULL")  # every committed row survives power loss
         self.conn.executescript(SCHEMA)
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(orders)")}
+        if "client_id" not in columns:  # ledgers from before client ids were stored
+            with self.conn:
+                self.conn.execute(
+                    "ALTER TABLE orders ADD COLUMN client_id TEXT NOT NULL DEFAULT ''"
+                )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS orders_client ON orders (client_id)")
 
     def close(self) -> None:
         self.conn.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        kind: type[BaseException] | None,
+        error: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
 
     # meta
 
@@ -85,6 +135,10 @@ class Ledger:
     def set_meta(self, key: str, value: str) -> None:
         with self.conn:
             self.conn.execute("REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+    def delete_meta(self, key: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
 
     # fills and orders
 
@@ -110,16 +164,45 @@ class Ledger:
         return [Fill(_parse(t), s, q, p, f) for t, s, q, p, f in rows]
 
     def recent_fills(self, limit: int) -> list[Fill]:
-        return self.fills()[-limit:]
+        rows = self.conn.execute(
+            "SELECT time, symbol, quantity, price, fee FROM fills ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [Fill(_parse(t), s, q, p, f) for t, s, q, p, f in reversed(rows)]
 
     def add_order(
-        self, time: datetime, symbol: str, quantity: float, status: str, note: str = ""
+        self,
+        time: datetime,
+        symbol: str,
+        quantity: float,
+        status: str,
+        note: str = "",
+        client_id: str = "",
     ) -> None:
         with self.conn:
             self.conn.execute(
-                "INSERT INTO orders (time, symbol, quantity, status, note) VALUES (?, ?, ?, ?, ?)",
-                (_iso(time), symbol, quantity, status, note),
+                "INSERT INTO orders (time, symbol, quantity, status, note, client_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (_iso(time), symbol, quantity, status, note, client_id),
             )
+
+    def client_id_used(self, client_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM orders WHERE client_id = ? LIMIT 1", (client_id,)
+        ).fetchone()
+        return row is not None
+
+    def unresolved_orders(self) -> list[OrderRecord]:
+        """Orders sent, or maybe sent, whose outcome was never recorded (a crash, an outage)."""
+        marks = ", ".join("?" * len(RESOLVED))
+        rows = self.conn.execute(
+            "SELECT time, symbol, quantity, status, client_id, MIN(id) FROM orders o "
+            "WHERE status IN ('pending', 'unknown') AND client_id != '' AND NOT EXISTS ("
+            f"SELECT 1 FROM orders r WHERE r.client_id = o.client_id AND r.status IN ({marks})) "
+            "GROUP BY client_id ORDER BY MIN(id)",
+            RESOLVED,
+        ).fetchall()
+        return [OrderRecord(_parse(t), s, q, st, c) for t, s, q, st, c, _ in rows]
 
     # adjustments: reconciliation deltas applied on top of fills
 

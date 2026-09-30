@@ -157,3 +157,24 @@ def test_parse_order_without_fills() -> None:
         {**data, "status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"}
     )
     assert aggregate_fill(unfilled, T0) == (None, {})
+
+
+def test_timestamp_error_resyncs_the_clock_and_signs_again() -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={"BTCUSDT": 50000.0})
+    resyncs: list[int] = []
+
+    async def go() -> float:
+        async def resync() -> None:
+            resyncs.append(1)
+
+        async with fake.client() as client:
+            spot = BinanceSpot(
+                client, fake.api_key, fake.secret, base_url=TESTNET_URL, resync=resync
+            )
+            fake.fail_next = [
+                httpx.Response(400, json={"code": -1021, "msg": "Timestamp outside recvWindow."})
+            ]
+            return (await spot.balances())["USDT"].free
+
+    assert asyncio.run(go()) == 1000.0
+    assert resyncs == [1]

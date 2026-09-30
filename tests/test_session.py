@@ -14,7 +14,7 @@ from tbot.portfolio.allocation import StrategySlot
 from tbot.portfolio.portfolio import Portfolio
 from tbot.risk.limits import RiskLimits
 
-H1 = Timeframe.H1
+H1, H4 = Timeframe.H1, Timeframe.H4
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
 COSTS = CostModel(fee_rate=0.001, slippage_bps=10)
 RULES = RebalanceRules(min_notional=0, rebalance_threshold=0.05)
@@ -118,3 +118,32 @@ def test_session_requires_history_for_each_symbol() -> None:
             {("BTC", H1): BarHistory(H1)},
             Portfolio(1000.0),
         )
+
+
+def test_session_orders_a_symbol_only_when_its_own_stream_closes() -> None:
+    config = TradingConfig(
+        initial_cash=1000.0,
+        costs=COSTS,
+        risk=RiskLimits(),
+        rebalance=RebalanceRules(min_notional=0, rebalance_threshold=0),
+        strategies=[
+            StrategyConfig(name="scripted", symbols=["BTC"], timeframe=H4, allocation=0.5),
+            StrategyConfig(name="scripted", symbols=["ETH"], timeframe=H1, allocation=0.5),
+        ],
+    )
+    btc_slot = StrategySlot(Scripted(["BTC"], {"script": {at(4): {"BTC": 0.4}}}), H4, 0.5)
+    session = TradingSession(
+        config,
+        [btc_slot, StrategySlot(Scripted(["ETH"]), H1, 0.5)],
+        {("BTC", H4): BarHistory(H4), ("ETH", H1): BarHistory(H1)},
+        Portfolio(1000.0),
+    )
+    btc = price_bars(T0, H4, [100.0], [100.0])
+    eth = price_bars(T0, H1, [50.0] * 4, [50.0] * 4)
+    btc_slot.targets = {"BTC": 0.4}  # e.g. restored after a restart
+    session.marks["BTC"] = 100.0
+    for i in range(3):  # only ETH closes: BTC waits for its own bar, as in the backtest
+        orders = session.ingest({("ETH", H1): eth.slice(i, 1)}, at(i + 1))
+        assert "BTC" not in orders
+    both = {("ETH", H1): eth.slice(3, 1), ("BTC", H4): btc}
+    assert "BTC" in session.ingest(both, at(4))

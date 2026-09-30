@@ -59,3 +59,23 @@ def test_adjust_to_flat_ends_the_open_trade() -> None:
     [trade] = p.trades
     assert trade.entry_time == T0 + timedelta(hours=1)  # a fresh round trip, not the old one
     assert trade.pnl == pytest.approx(5.0 - 0.2)
+
+
+def test_dust_left_by_a_sale_ends_the_round_trip() -> None:
+    p = Portfolio(1000.0, dust_notional=10.0)
+    p.apply(fill(0, 1.0, 100.0, 0.1))
+    p.apply(fill(1, -0.95, 110.0, 0.1))  # 0.05 left, worth 5.5: it cannot be sold
+    [trade] = p.trades
+    assert trade.exit_time == T0 + timedelta(hours=1)
+    assert p.position("BTC") == pytest.approx(0.05)
+    p.apply(fill(2, 1.0, 100.0, 0.1))
+    p.apply(fill(3, -1.05, 105.0, 0.1))
+    assert [t.entry_time for t in p.trades] == [T0, T0 + timedelta(hours=2)]
+
+
+def test_selling_an_adopted_position_is_a_long_round_trip() -> None:
+    p = Portfolio(1000.0)
+    p.adjust("BTC", 1.0, 0.0)  # adopted from the exchange: no entry fill
+    p.apply(fill(0, -1.0, 100.0, 0.1))
+    [trade] = p.trades
+    assert trade.direction == 1

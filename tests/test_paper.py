@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -18,16 +19,20 @@ from tbot.live.guard import GuardConfig, RiskGuard
 from tbot.live.history import BarHistory
 from tbot.live.ledger import Ledger
 from tbot.live.runner import (
+    AlreadyRunning,
     SessionTrader,
     build_session,
+    instance_lock,
+    load_checkpoint,
     lookback_bars,
     make_notifier,
     restore_portfolio,
     status_text,
+    strategies_hash,
     stream_keys,
     summary_text,
 )
-from tbot.live.session import TradingSession
+from tbot.live.session import Checkpoint, TradingSession
 from tbot.monitoring.telegram import LogNotifier, Telegram
 from tbot.portfolio.allocation import StrategySlot, build_slots
 from tbot.portfolio.portfolio import Portfolio
@@ -139,7 +144,8 @@ def test_restore_portfolio_replays_ledger_fills(tmp_path: Path) -> None:
     live = trader.session.portfolio
     ledger.close()
 
-    restored = restore_portfolio(paper_config(tmp_path), Ledger(paper_config(tmp_path).ledger))
+    with Ledger(paper_config(tmp_path).ledger) as reopened:
+        restored = restore_portfolio(paper_config(tmp_path), reopened)
     assert restored.cash == pytest.approx(live.cash)
     assert restored.positions == {"BTC": pytest.approx(5.0)}
 
@@ -217,12 +223,16 @@ def test_configs_and_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     paper = load_paper_config(Path("config/paper.yaml"))
     assert paper.ledger == Path("data/paper.sqlite")
     assert paper.risk.max_symbol_weight == 0.5
+    assert paper.risk.target_volatility == 0.4  # the validated candidate's sizing
     testnet = load_session_config(Path("config/testnet.yaml"))
     assert isinstance(testnet, LiveConfig)
     assert testnet.mode == "testnet"
     live = load_session_config(Path("config/live.yaml"))
     assert isinstance(live, LiveConfig)
     assert (live.mode, live.protective_stop_pct, live.guard.max_drawdown) == ("live", 0.2, 0.15)
+    assert live.ownership == "budget"
+    for session in (testnet, live):  # what paper rehearses is what goes live
+        assert (session.risk, session.strategies) == (paper.risk, paper.strategies)
     assert isinstance(load_session_config(Path("config/paper.yaml")), PaperConfig)
     assert LiveConfig(mode="testnet", strategies=live.strategies).ledger == Path(
         "data/testnet.sqlite"
@@ -277,3 +287,60 @@ def test_live_command_needs_the_flag_for_real_money(tmp_path: Path) -> None:
     )
     with pytest.raises(SystemExit, match="--live"):
         main(["live", str(config_path), "--data-dir", str(tmp_path / "data")])
+
+
+def test_restart_continues_the_strategy_state(tmp_path: Path) -> None:
+    config = PaperConfig(
+        strategies=[
+            StrategyConfig(
+                name="donchian_trend",
+                symbols=["BTCUSDT"],
+                timeframe=H4,
+                allocation=1.0,
+                params={"entry": 5, "exit": 3},
+            )
+        ],
+        ledger=tmp_path / "paper.sqlite",
+    )
+    # A breakout long ago, then a quiet range: the 12 bars a restart replays look flat.
+    closes = [100.0] * 10 + [110.0] + [109.5] * 30
+    store = BarStore(tmp_path / "data")
+    store.write("BTCUSDT", H4, price_bars(T0, H4, [closes[0], *closes[:-1]], closes))
+    now = T0 + timedelta(hours=4 * len(closes), minutes=10)
+    portfolio = Portfolio(1000.0)
+    portfolio.positions["BTCUSDT"] = 9.0
+
+    assert build_session(config, store, portfolio, now).slots[0].targets == {"BTCUSDT": 0.0}
+    checkpoint = Checkpoint(T0 + timedelta(hours=4 * 35), [{"BTCUSDT": 1.0}])
+    session = build_session(config, store, portfolio, now, checkpoint)
+    assert session.slots[0].targets == {"BTCUSDT": 1.0}  # still long: nothing is sold
+
+    with Ledger(config.ledger) as ledger:
+        payload = {
+            "time": checkpoint.time.isoformat(),
+            "strategies": strategies_hash(config),
+            "targets": checkpoint.targets,
+        }
+        ledger.set_meta("targets", json.dumps(payload))
+        assert load_checkpoint(config, ledger) == checkpoint
+        other = StrategyConfig(
+            name="donchian_trend",
+            symbols=["BTCUSDT"],
+            timeframe=H4,
+            allocation=1.0,
+            params={"entry": 6, "exit": 3},
+        )
+        assert load_checkpoint(config.model_copy(update={"strategies": [other]}), ledger) is None
+
+    stray = Portfolio(1000.0)
+    stray.positions["SOLUSDT"] = 1.0
+    with pytest.raises(ValueError, match="SOLUSDT"):
+        build_session(config, store, stray, now)
+
+
+def test_one_process_per_ledger(tmp_path: Path) -> None:
+    ledger = tmp_path / "paper.sqlite"
+    with instance_lock(ledger), pytest.raises(AlreadyRunning), instance_lock(ledger):
+        pass
+    with instance_lock(ledger):  # released when the first one ends
+        pass

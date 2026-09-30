@@ -47,6 +47,7 @@ class FakeSpot:
     requests: list[httpx.Request] = field(default_factory=list)
     fail_next: list[httpx.Response] = field(default_factory=list)
     lose_next_order_response: bool = False  # place the order, then fail the response
+    error_after_next_order: httpx.Response | None = None  # place it, then answer this
     next_id: int = 1000
 
     def client(self) -> httpx.AsyncClient:
@@ -74,6 +75,14 @@ class FakeSpot:
                     executedQty=order["origQty"],
                     cummulativeQuoteQty=f"{qty * price:.8f}",
                 )
+                order["trades"] = [
+                    {
+                        "price": f"{price:.8f}",
+                        "qty": order["origQty"],
+                        "commission": f"{qty * price * self.fee_rate:.8f}",
+                        "commissionAsset": quote,
+                    }
+                ]
                 return
         raise LookupError(f"no open stop order for {symbol}")
 
@@ -116,12 +125,19 @@ class FakeSpot:
             if self.lose_next_order_response and response.status_code == 200:
                 self.lose_next_order_response = False
                 raise httpx.ConnectError("response lost")
+            if self.error_after_next_order is not None and response.status_code == 200:
+                error, self.error_after_next_order = self.error_after_next_order, None
+                return error
             return response
         if path == "/api/v3/order" and request.method == "GET":
             order = self._find(params.get("origClientOrderId"))
             if order is None:
                 return _error(400, -2013, "Order does not exist.")
-            return httpx.Response(200, json=order)
+            return httpx.Response(200, json={k: v for k, v in order.items() if k != "fills"})
+        if path == "/api/v3/myTrades":
+            found = [o for o in self.orders if str(o["orderId"]) == params.get("orderId")]
+            trades = found[0].get("trades", found[0]["fills"]) if found else []
+            return httpx.Response(200, json=trades)
         if path == "/api/v3/order" and request.method == "DELETE":
             for order in self.orders:
                 if str(order["orderId"]) == params.get("orderId") and order["status"] == "NEW":

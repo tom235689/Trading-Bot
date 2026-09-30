@@ -60,3 +60,11 @@ def test_donchian_enters_on_breakout_and_exits_on_breakdown() -> None:
     # Bar 4 closes at 12.5, above the prior 3-bar high of 12.
     # Bar 7 closes at 9.5, below the prior 2-bar low of 11.
     assert targets == [0, 0, 0, 0, 0.5, 0.5, 0.5, 0]
+
+
+def test_restore_continues_from_saved_targets() -> None:
+    from tbot.strategies.rsi import RsiReversion
+
+    for strategy in (DonchianTrend(["BTC", "ETH"]), RsiReversion(["BTC", "ETH"])):
+        strategy.restore({"BTC": 0.5, "ETH": 0.0})
+        assert strategy._long == {"BTC": True, "ETH": False}

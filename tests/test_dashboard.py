@@ -1,3 +1,4 @@
+import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from tbot.live.config import PaperConfig
 from tbot.live.ledger import EquityPoint, Ledger
 from tbot.monitoring.dashboard import (
     DashboardData,
+    _line_chart,
     downsample,
     drawdowns,
     from_backtest,
@@ -162,3 +164,11 @@ def test_from_backtest() -> None:
     assert data.positions == [("BTC", 1.0, 105.0)]  # marked at the last close, not the fill
     assert len(data.fills) == 1
     assert "Backtest" in render(data)
+
+
+def test_axes_survive_degenerate_values() -> None:
+    assert nice_ticks(math.nan, math.nan) == [0.0, 1.0]
+    times = [T0, T0 + timedelta(hours=1)]
+    flat = _line_chart("drawdown", times, [0.0, 0.0], percent=True)
+    assert "100%" not in flat  # no drawdown yet: a small axis, not 0% to 100%
+    assert "no data" in _line_chart("equity", times, [math.nan, math.nan], percent=False)

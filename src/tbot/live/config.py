@@ -27,6 +27,9 @@ class PaperConfig(SessionConfig):
 class LiveConfig(SessionConfig):
     mode: Literal["testnet", "live"]
     ledger: Path = Path("data/live.sqlite")  # data/testnet.sqlite in testnet mode
+    # budget: the bot owns initial_cash and what it buys; other balances are left alone.
+    # account: the bot owns the whole spot account (use only for a dedicated account).
+    ownership: Literal["budget", "account"] = "budget"
     protective_stop_pct: float = Field(default=0.2, ge=0, lt=1)  # 0 disables exchange stops
     reconcile_seconds: int = Field(default=300, ge=30)
     reconcile_tolerance: float = Field(default=0.002, ge=0)  # relative mismatch that is noise
