@@ -72,8 +72,12 @@ def objective_value(metrics: Metrics, objective: str, min_trades: int) -> float:
 
 
 def best_run(runs: Sequence[SweepRun], objective: str, min_trades: int) -> SweepRun:
+    """The qualifying run with the highest objective; an error when none qualifies."""
     scores = [objective_value(run.metrics, objective, min_trades) for run in runs]
-    return runs[max(range(len(runs)), key=lambda i: scores[i])]
+    index = max(range(len(runs)), key=lambda i: scores[i])
+    if scores[index] == -math.inf:
+        raise ValueError(f"no parameter set has {min_trades} trades and a finite {objective}")
+    return runs[index]
 
 
 def sweep_table(runs: Sequence[SweepRun], objective: str) -> pl.DataFrame:
@@ -81,7 +85,10 @@ def sweep_table(runs: Sequence[SweepRun], objective: str) -> pl.DataFrame:
         {**run.params, **{name: getattr(run.metrics, name) for name in TABLE_METRICS}}
         for run in runs
     ]
-    return pl.DataFrame(rows).sort(objective, descending=True, nulls_last=True)
+    # NaN sorts above every number in polars; treat it as missing so it lands at the bottom.
+    return pl.DataFrame(rows).sort(
+        pl.col(objective).fill_nan(None), descending=True, nulls_last=True
+    )
 
 
 def neighborhood_mean(
@@ -111,4 +118,6 @@ def rank_of(runs: Sequence[SweepRun], params: Mapping[str, Any], objective: str)
     """1-based rank of params by raw objective among all runs."""
     scores = [float(getattr(run.metrics, objective)) for run in runs]
     target = next(s for s, run in zip(scores, runs, strict=True) if run.params == dict(params))
+    if not math.isfinite(target):
+        return len(runs)
     return 1 + sum(score > target for score in scores)

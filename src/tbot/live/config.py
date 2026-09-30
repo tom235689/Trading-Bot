@@ -1,10 +1,10 @@
 """Paper and live session configuration (YAML) and secrets (environment)."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tbot.core.config import TradingConfig
@@ -26,11 +26,18 @@ class PaperConfig(SessionConfig):
 
 class LiveConfig(SessionConfig):
     mode: Literal["testnet", "live"]
-    ledger: Path = Path("data/live.sqlite")
+    ledger: Path = Path("data/live.sqlite")  # data/testnet.sqlite in testnet mode
     protective_stop_pct: float = Field(default=0.2, ge=0, lt=1)  # 0 disables exchange stops
     reconcile_seconds: int = Field(default=300, ge=30)
     reconcile_tolerance: float = Field(default=0.002, ge=0)  # relative mismatch that is noise
     recv_window: int = Field(default=5000, ge=1000, le=60000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def ledger_per_mode(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "ledger" not in data and data.get("mode") == "testnet":
+            return {**data, "ledger": Path("data/testnet.sqlite")}
+        return data
 
 
 def load_paper_config(path: Path) -> PaperConfig:

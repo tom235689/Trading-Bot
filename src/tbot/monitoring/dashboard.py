@@ -51,7 +51,7 @@ def downsample[T](values: Sequence[T], limit: int = MAX_POINTS) -> list[T]:
         return list(values)
     step = math.ceil(len(values) / limit)
     kept = list(values[::step])
-    if kept[-1] is not values[-1]:
+    if (len(values) - 1) % step:
         kept.append(values[-1])
     return kept
 
@@ -153,7 +153,7 @@ def _tile(label: str, value: str, delta_class: str = "") -> str:
 def render(data: DashboardData) -> str:
     times = downsample(data.times)
     equity = downsample(data.equity)
-    dd = drawdowns(equity, data.initial)
+    dd = downsample(drawdowns(data.equity, data.initial))  # peaks between kept points count
     final = data.equity[-1] if data.equity else data.initial
     total_return = final / data.initial - 1 if data.initial else 0.0
     max_dd = min(drawdowns(data.equity, data.initial), default=0.0)
@@ -390,10 +390,12 @@ def from_backtest(result: BacktestResult, title: str, subtitle: str) -> Dashboar
             "time", "symbol", "quantity", "price", "fee"
         ).rows()
     ]
-    last_close: dict[str, float] = {}
+    last_fill: dict[str, float] = {}
     for fill in reversed(fills):
-        last_close.setdefault(fill.symbol, fill.price)
-    positions = [(s, q, last_close.get(s)) for s, q in sorted(result.positions.items())]
+        last_fill.setdefault(fill.symbol, fill.price)
+    positions = [
+        (s, q, result.marks.get(s, last_fill.get(s))) for s, q in sorted(result.positions.items())
+    ]
     return DashboardData(
         title=title,
         subtitle=subtitle,

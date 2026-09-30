@@ -11,9 +11,16 @@ from tbot.cli import main
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.research.report import format_report
-from tbot.research.sweep import best_run, grid_points, neighborhood_mean, rank_of, run_sweep
+from tbot.research.sweep import (
+    best_run,
+    grid_points,
+    neighborhood_mean,
+    rank_of,
+    run_sweep,
+    sweep_table,
+)
 from tbot.research.trials import TrialLog
-from tbot.research.validate import load_validation_config, run_validation
+from tbot.research.validate import WalkForwardConfig, load_validation_config, run_validation
 from tbot.research.walkforward import Window, add_months, run_walk_forward, stitch, windows
 
 H4 = Timeframe.H4
@@ -76,7 +83,8 @@ def test_sweep_ranks_and_neighborhood(data_dir: Path) -> None:
     best = best_run(runs, "sharpe", min_trades=1)
     assert rank_of(runs, best.params, "sharpe") == 1
     assert best.metrics.sharpe == max(run.metrics.sharpe for run in runs)
-    assert best_run(runs, "sharpe", min_trades=10**6) is runs[0]  # nothing qualifies
+    with pytest.raises(ValueError, match="no parameter set"):
+        best_run(runs, "sharpe", min_trades=10**6)  # nothing qualifies
 
     everything = neighborhood_mean(runs, GRID, best.params, "sharpe", 1)
     assert everything == pytest.approx(sum(r.metrics.sharpe for r in runs) / len(runs))
@@ -86,6 +94,25 @@ def test_sweep_in_processes(data_dir: Path) -> None:
     serial = run_sweep(BASE, {"entry": [5, 10]}, data_dir, workers=1)
     parallel = run_sweep(BASE, {"entry": [5, 10]}, data_dir, workers=2)
     assert [r.metrics for r in parallel] == [r.metrics for r in serial]
+    # The grid varies entry only; exit keeps the base value instead of the default.
+    assert [r.config.strategies[0].params for r in serial] == [
+        {"entry": 5, "exit": 3},
+        {"entry": 10, "exit": 3},
+    ]
+
+
+def test_no_trade_runs_rank_last(data_dir: Path) -> None:
+    runs = run_sweep(BASE, {"entry": [5, 10_000], "exit": [3]}, data_dir)
+    assert runs[1].metrics.trades == 0
+    assert sweep_table(runs, "sharpe")["entry"].to_list() == [5, 10_000]
+    assert rank_of(runs, {"entry": 10_000, "exit": 3}, "sharpe") == 2
+    assert best_run(runs, "sharpe", min_trades=1) is runs[0]
+
+
+def test_walk_forward_step_must_match_test_length() -> None:
+    assert WalkForwardConfig(train_months=24, test_months=6, step_months=6).step_months == 6
+    with pytest.raises(ValueError, match="step_months"):
+        WalkForwardConfig(train_months=24, test_months=12, step_months=6)
 
 
 def test_month_arithmetic_and_windows() -> None:

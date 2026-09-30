@@ -177,13 +177,85 @@ def test_batches_group_streams_closing_together(tmp_path: Path) -> None:
     assert asyncio.run(take(2)) == [{BTC1, eth1, btc4}, {BTC1}]
 
 
+def test_batches_keep_each_stream_in_order_after_catch_up(tmp_path: Path) -> None:
+    eth1 = ("ETHUSDT", H1)
+    feed, _, _ = make_feed(tmp_path, [BTC1, eth1], now=at(6), batch_wait=0.05)
+    for key in (BTC1, eth1):  # catch-up queues all bars of one stream, then the next stream
+        for i in range(3):
+            feed.queue.put_nowait((key, from_rows(make_rows(at(i), 1, H1))))
+
+    async def take(n: int) -> list[dict[StreamKey, datetime]]:
+        batches = feed.batches()
+        return [
+            {key: bar["open_time"][0] for key, bar in (await anext(batches)).items()}
+            for _ in range(n)
+        ]
+
+    assert asyncio.run(take(3)) == [{BTC1: at(i), eth1: at(i)} for i in range(3)]
+
+
+def test_websocket_fills_a_gap_via_rest_before_emitting(tmp_path: Path) -> None:
+    rows = {BTC1: make_rows(T0, 6, H1)}
+    store = BarStore(tmp_path / "data")
+    store.write(*BTC1, from_rows(rows[BTC1][:2]))  # opens 0h and 1h
+    client, _ = rest_client(rows)
+    clock = {"now": at(2.5)}  # nothing to catch up when the socket connects
+    feed = LiveFeed([BTC1], store, client, clock=lambda: clock["now"])
+
+    @asynccontextmanager
+    async def connect(url: str) -> AsyncIterator[AsyncIterator[str | bytes]]:
+        async def stream() -> AsyncIterator[str | bytes]:
+            clock["now"] = at(5.1)  # the 2h and 3h closes were missed while connected
+            yield kline_message(BTC1, at(4), closed=True)
+            await asyncio.Event().wait()
+
+        yield stream()
+
+    feed.connector = connect
+
+    async def run() -> list[datetime]:
+        task = asyncio.create_task(feed.run_websocket())
+        opens = []
+        for _ in range(3):
+            _, bar = await asyncio.wait_for(feed.queue.get(), 5)
+            opens.append(bar["open_time"][0])
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return opens
+
+    assert asyncio.run(run()) == [at(2), at(3), at(4)]
+    assert feed.queue.empty()  # the socket's own copy of the 4h bar is not emitted again
+    assert store.last_open_time(*BTC1) == at(4)
+
+
+def test_watchdog_survives_a_rest_failure(tmp_path: Path) -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, headers={"Retry-After": "0"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    feed = LiveFeed(
+        [BTC1], BarStore(tmp_path / "data"), client, clock=lambda: at(5.5), poll_seconds=0.01
+    )
+    feed.last[BTC1] = at(2)
+
+    async def run() -> bool:
+        task = asyncio.create_task(feed.run_watchdog())
+        await asyncio.sleep(0.15)
+        alive = not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return alive
+
+    assert asyncio.run(run())
+
+
 def test_overdue_seconds(tmp_path: Path) -> None:
     feed, _, _ = make_feed(tmp_path, [BTC1], now=at(5.25))
     assert feed._overdue_seconds(BTC1, at(5.25)) == pytest.approx(15 * 60)  # nothing seen yet
     feed.last[BTC1] = at(4)
     assert feed._overdue_seconds(BTC1, at(5.25)) == 0.0
-    feed.last[BTC1] = at(2)
-    assert feed._overdue_seconds(BTC1, at(5.25)) == pytest.approx(15 * 60)
+    feed.last[BTC1] = at(2)  # the 3h bar was due at 4h
+    assert feed._overdue_seconds(BTC1, at(5.25)) == pytest.approx(75 * 60)
 
 
 def test_watchdog_polls_rest_and_reports_stale_once(tmp_path: Path) -> None:
@@ -226,3 +298,22 @@ def test_server_clock_measures_offset() -> None:
     assert clock.now() - datetime.now(UTC) == pytest.approx(
         timedelta(seconds=5), abs=timedelta(seconds=0.5)
     )
+
+
+def test_server_clock_ignores_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    from tbot.live.clock import ServerClock
+
+    calls = [0]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls[0] += 1
+        if calls[0] == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"serverTime": int((time.time() + 5) * 1000)})
+
+    monkeypatch.setattr("tbot.live.clock.time.sleep", lambda seconds: None)
+    clock = ServerClock(httpx.Client(transport=httpx.MockTransport(handle)))
+    assert clock.sync() == pytest.approx(5.0, abs=0.3)
+    assert calls[0] == 2

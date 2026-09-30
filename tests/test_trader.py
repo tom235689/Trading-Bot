@@ -31,8 +31,11 @@ def at(hours: int) -> datetime:
 class Prices:
     def __init__(self) -> None:
         self.current = 100.0
+        self.fail = False
 
     async def price(self, symbol: str, side: int) -> float:
+        if self.fail:
+            raise RuntimeError("quote down")
         return self.current
 
 
@@ -108,8 +111,7 @@ def test_drawdown_halts_flattens_and_needs_resume(tmp_path: Path) -> None:
 
     assert h.bar(2, 100.0) == []  # still halted: the strategy wants to be long, nothing trades
     assert resume(h.config).startswith("resumed")  # operator action, own connection
-    h.trader.guard = load_guard(h.config, h.ledger)  # what a restart does
-    assert h.bar(3, 100.0) == [pytest.approx(8.4745, rel=1e-3)]  # trades again
+    assert h.bar(3, 100.0) == [pytest.approx(8.4745, rel=1e-3)]  # picked up, no restart
     assert resume(h.config) == "not halted"
     h.ledger.close()
 
@@ -133,4 +135,18 @@ def test_stale_bar_is_blocked(tmp_path: Path) -> None:
     assert h.bar(0, 100.0) == []  # bar closed at 1h, clock says 9h
     assert h.ledger.recent_events(1)[0].message.startswith("blocked: bar is")
     assert any("no trading this bar" in m for m in h.notifier.messages)
+    h.ledger.close()
+
+
+def test_halt_is_announced_once_while_dust_remains(tmp_path: Path) -> None:
+    guard = GuardConfig(daily_loss_limit=0, max_drawdown=0.1, stale_seconds=0)
+    h = Harness(tmp_path, guard, {at(1): {"BTC": 1.0}})
+    assert len(h.bar(0, 100.0)) == 1
+    h.prices.fail = True  # flattening cannot fill, so the position stays behind
+    assert h.bar(1, 85.0) == []
+    assert h.bar(2, 85.0) == []
+    assert sum("KILL SWITCH" in m for m in h.notifier.messages) == 1
+    h.prices.fail = False
+    assert h.bar(3, 85.0) == [pytest.approx(-1000 / 100.1)]  # flattened now: announced again
+    assert sum("KILL SWITCH" in m for m in h.notifier.messages) == 2
     h.ledger.close()

@@ -1,5 +1,6 @@
 """Build and run a backtest from config and stored bars."""
 
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, time
 
 import polars as pl
@@ -7,9 +8,11 @@ import polars as pl
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import BacktestEngine, BacktestResult, StreamKey
 from tbot.data.store import BarStore
-from tbot.portfolio.allocation import build_slots
+from tbot.portfolio.allocation import StrategySlot, build_slots
+from tbot.risk.limits import RiskLimits
+from tbot.risk.volatility import lookback_bars as volatility_bars
 
-# Extra history loaded before start, as a multiple of warmup, to cover data gaps.
+# Extra history loaded before start, as a multiple of the bars needed, to cover data gaps.
 WARMUP_MARGIN = 2
 
 
@@ -17,20 +20,35 @@ def _utc(day: date) -> datetime:
     return datetime.combine(day, time(), tzinfo=UTC)
 
 
-def run_backtest(config: BacktestConfig, store: BarStore) -> BacktestResult:
-    start = _utc(config.start)
-    end = _utc(config.end) if config.end else None
-    slots = build_slots(config.strategies)
+def history_bars(slots: Sequence[StrategySlot], risk: RiskLimits) -> dict[StreamKey, int]:
+    """Closed bars each stream needs before the first decision.
 
-    # Each stream loads enough history before start for its longest warmup.
+    Every stream needs the warmup of its strategies. The finest stream of a symbol
+    also drives volatility targeting, so it needs the volatility window plus one close.
+    """
     lookback: dict[StreamKey, int] = {}
     for slot in slots:
         for symbol in slot.strategy.symbols:
             key = (symbol, slot.timeframe)
             lookback[key] = max(lookback.get(key, 0), slot.strategy.warmup)
+    if risk.target_volatility:
+        finest: dict[str, StreamKey] = {}
+        for key in sorted(lookback, key=lambda key: key[1].millis):
+            finest.setdefault(key[0], key)
+        for key in finest.values():
+            needed = volatility_bars(key[1], risk.volatility_lookback_days) + 1
+            lookback[key] = max(lookback[key], needed)
+    return lookback
+
+
+def run_backtest(config: BacktestConfig, store: BarStore) -> BacktestResult:
+    start = _utc(config.start)
+    end = _utc(config.end) if config.end else None
+    slots = build_slots(config.strategies)
+
     bars: dict[StreamKey, pl.DataFrame] = {}
-    for (symbol, timeframe), warmup in lookback.items():
-        frame = store.read(symbol, timeframe, start - timeframe.delta * warmup * WARMUP_MARGIN, end)
+    for (symbol, timeframe), needed in history_bars(slots, config.risk).items():
+        frame = store.read(symbol, timeframe, start - timeframe.delta * needed * WARMUP_MARGIN, end)
         if frame.is_empty():
             raise ValueError(f"no stored bars for {symbol} {timeframe}; run `tbot download`")
         bars[(symbol, timeframe)] = frame

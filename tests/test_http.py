@@ -3,7 +3,7 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
-from tbot.data.http import get_bytes
+from tbot.data.http import describe_error, get_bytes
 
 URL = "https://example.test/x"
 
@@ -59,3 +59,11 @@ def test_client_error_is_not_retried() -> None:
     with pytest.raises(httpx.HTTPStatusError):
         get_bytes(client, URL, backoff=0)
     assert calls == [1]
+
+
+def test_error_description_never_carries_the_url() -> None:
+    request = httpx.Request("POST", "https://api.telegram.org/botSECRET/sendMessage")
+    response = httpx.Response(401, text='{"ok":false}', request=request)
+    status = httpx.HTTPStatusError("boom", request=request, response=response)
+    assert describe_error(status) == 'HTTP 401: {"ok":false}'
+    assert describe_error(httpx.ConnectError("x", request=request)) == "ConnectError"

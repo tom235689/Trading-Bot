@@ -35,7 +35,9 @@ def fetch_klines(
         if not rows:
             break
         frames.append(from_rows(rows))
-        cursor = int(rows[-1][0]) + timeframe.millis
+        if len(rows) < MAX_LIMIT:  # a short page is the last one
+            break
+        cursor = int(rows[-1][0]) + 1  # not one bar on: after an off-grid row that skips one
     if not frames:
         return empty_bars()
     return pl.concat(frames).filter(pl.col("open_time") >= start, pl.col("open_time") < end)

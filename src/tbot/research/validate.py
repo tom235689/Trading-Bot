@@ -5,12 +5,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import numpy as np
 import numpy.typing as npt
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from tbot.backtest.config import BacktestConfig, load_config
 from tbot.backtest.metrics import DAYS_PER_YEAR, Metrics, compute_metrics, daily_returns
@@ -36,6 +36,13 @@ class WalkForwardConfig(BaseModel):
     train_months: int = Field(default=36, ge=1)
     test_months: int = Field(default=12, ge=1)
     step_months: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def check_step(self) -> Self:
+        """Test segments are stitched into one curve, so they may neither overlap nor gap."""
+        if self.step_months is not None and self.step_months != self.test_months:
+            raise ValueError("step_months must equal test_months")
+        return self
 
 
 class MonteCarloConfig(BaseModel):
@@ -189,8 +196,9 @@ def run_validation(
     deflated = _deflated(daily_returns(baseline_result), log.selection_sharpes(baseline_record))
 
     progress("holdout")
-    _, holdout = evaluate(base.with_period(config.holdout_start, base.end), data_dir)
-    log.append([make_record(base, holdout, "holdout")])
+    holdout_config = base.with_period(config.holdout_start, base.end)
+    _, holdout = evaluate(holdout_config, data_dir)
+    log.append([make_record(holdout_config, holdout, "holdout")])
 
     return ValidationReport(
         config=config,
@@ -218,11 +226,13 @@ def _plateau(
     objective: str,
     min_trades: int,
 ) -> Plateau:
-    in_grid = set(params) == set(grid) and all(params[n] in grid[n] for n in grid)
+    # Sweep runs carry only the grid's keys; the base params may hold more.
+    in_grid = all(n in params and params[n] in grid[n] for n in grid)
+    point = {n: params[n] for n in grid} if in_grid else {}
     return Plateau(
-        rank=rank_of(runs, params, objective) if in_grid else 0,
+        rank=rank_of(runs, point, objective) if in_grid else 0,
         neighborhood=(
-            neighborhood_mean(runs, grid, params, objective, min_trades) if in_grid else math.nan
+            neighborhood_mean(runs, grid, point, objective, min_trades) if in_grid else math.nan
         ),
         best_neighborhood=neighborhood_mean(runs, grid, best_params, objective, min_trades),
     )

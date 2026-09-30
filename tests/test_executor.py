@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from binance_spot_fake import FakeSpot
-from tbot.exchange.binance import TESTNET_URL, BinanceSpot
+from tbot.exchange.binance import NOTHING_TO_CANCEL, TESTNET_URL, BinanceError, BinanceSpot, Order
 from tbot.live.executor import LiveExecutor, order_id
 from tbot.live.ledger import Ledger
 from tbot.portfolio.portfolio import Portfolio
@@ -172,3 +172,23 @@ def test_exchange_error_is_reported(tmp_path: Path) -> None:
         assert "order failed for BTCUSDT" in notifier.messages[0]
 
     run(fake, tmp_path, action)
+
+
+def test_stop_gone_before_cancel_is_not_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> int:
+        portfolio = Portfolio(1000.0)
+        await executor.execute({BTC: 0.01}, T0, portfolio, MARKS)
+        await executor.after_event(portfolio, MARKS)
+        assert fake.order_count("STOP_LOSS_LIMIT") == 1
+
+        async def gone(symbol: str, order_id: int) -> Order:  # triggered a moment ago
+            raise BinanceError(NOTHING_TO_CANCEL, "Unknown order sent.", 400)
+
+        monkeypatch.setattr(executor.spot, "cancel_order", gone)
+        return await executor.cancel_stops(BTC)
+
+    assert run(fake, tmp_path, action) == 0

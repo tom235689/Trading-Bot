@@ -21,7 +21,15 @@ from pathlib import Path, PurePosixPath
 ZERO_SHA = "0" * 40
 ALLOW_SECRET = "guard: allow-secret"
 REPLACEMENT_CHAR = chr(0xFFFD)
-DIFF_OPTS = ("--no-color", "--no-ext-diff", "--no-textconv", "-U0", "--diff-filter=ACMRT")
+DIFF_OPTS = (
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "-U0",
+    "--diff-filter=ACMRT",
+    "--src-prefix=a/",  # user diff config must not change how paths are read
+    "--dst-prefix=b/",
+)
 
 # Built from code points so this file stays ASCII.
 HANGUL_RANGES = (
@@ -137,12 +145,19 @@ def check_staged(cwd: Path | None = None) -> Iterator[Finding]:
 
 
 def check_message(text: str) -> Iterator[Finding]:
-    """Scan a commit message, skipping comments and anything below the scissors line."""
+    """Scan a commit message, skipping git's comments and anything below the scissors line.
+
+    Git's own comments always follow a blank line, so a comment line in the first
+    paragraph is message text: `git commit -m "#12 ..."` keeps it.
+    """
+    first_paragraph = True
     for number, raw in enumerate(text.split("\n"), start=1):
         line = raw.rstrip("\r")
         if SCISSORS.match(line):
             break
-        if not line.startswith("#"):
+        if not line.strip():
+            first_paragraph = False
+        if first_paragraph or not line.startswith("#"):
             yield from scan_line(f"commit message:{number}", line)
 
 
@@ -187,7 +202,7 @@ def check_push(remote: str, lines: Iterable[str], cwd: Path | None = None) -> It
 def audit(cwd: Path | None = None) -> Iterator[Finding]:
     """Scan tracked files, ref names, tags, and every commit in history."""
     root = Path(git("rev-parse", "--show-toplevel", cwd=cwd).strip())
-    paths = split_z(git("ls-files", "-z", cwd=cwd))
+    paths = split_z(git("ls-files", "-z", "--full-name", cwd=cwd))  # from any directory
     yield from scan_paths(paths)
     for path in paths:
         file = root / path

@@ -64,6 +64,7 @@ def stitch(results: Sequence[BacktestResult], initial_cash: float) -> BacktestRe
     equity, fills, trades = [], [], []
     level = initial_cash
     positions: dict[str, float] = {}
+    marks: dict[str, float] = {}
     for result in results:
         if result.equity.is_empty():
             continue
@@ -75,7 +76,8 @@ def stitch(results: Sequence[BacktestResult], initial_cash: float) -> BacktestRe
         scaled = [pl.col(name) * factor for name in ("pnl", "fees", "cost")]
         trades.append(result.trades.with_columns(*scaled))
         level = float(result.equity["equity"][-1]) * factor
-        positions = result.positions
+        positions = {symbol: quantity * factor for symbol, quantity in result.positions.items()}
+        marks = result.marks
     if not equity:
         raise ValueError("no walk-forward test segment produced equity records")
     return BacktestResult(
@@ -84,6 +86,7 @@ def stitch(results: Sequence[BacktestResult], initial_cash: float) -> BacktestRe
         fills=pl.concat(fills),
         trades=pl.concat(trades),
         positions=positions,
+        marks=marks,
     )
 
 

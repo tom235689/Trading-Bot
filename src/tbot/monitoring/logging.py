@@ -37,6 +37,7 @@ def configure_logging(log_file: Path | None = None, level: int = logging.INFO) -
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.dev.ConsoleRenderer(colors=False),
             ],
+            foreign_pre_chain=shared,  # websockets, httpx: same timestamp and level
         )
     )
     root.addHandler(console)
@@ -52,6 +53,7 @@ def configure_logging(log_file: Path | None = None, level: int = logging.INFO) -
                     structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                     structlog.processors.JSONRenderer(),
                 ],
+                foreign_pre_chain=shared,
             )
         )
         root.addHandler(file)

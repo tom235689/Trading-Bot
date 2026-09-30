@@ -42,8 +42,9 @@ class TradingConfig(BaseModel):
         return self
 
     def with_params(self, params: Mapping[str, Any]) -> Self:
-        """Copy with the first strategy's params replaced."""
-        first = self.strategies[0].model_copy(update={"params": dict(params)})
+        """Copy with these params set on the first strategy; the others keep their values."""
+        merged = {**self.strategies[0].params, **params}
+        first = self.strategies[0].model_copy(update={"params": merged})
         return self.model_copy(update={"strategies": [first, *self.strategies[1:]]})
 
     def with_cost_multiplier(self, multiplier: float) -> Self:

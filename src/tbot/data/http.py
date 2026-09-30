@@ -35,3 +35,10 @@ def get_bytes(
         response.raise_for_status()
         return response.content
     raise ValueError("retries must be positive")
+
+
+def describe_error(exc: httpx.HTTPError) -> str:
+    """Error text without the request URL, which may carry a token."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"
+    return type(exc).__name__

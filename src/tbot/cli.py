@@ -47,7 +47,9 @@ def fmt(moment: datetime | None) -> str:
 
 def load_session_config(path: Path) -> SessionConfig:
     """A config with `mode` is a live config; anything else is paper."""
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise SystemExit(f"{path}: expected a mapping of settings")
     if "mode" in raw:
         return LiveConfig.model_validate(raw)
     return PaperConfig.model_validate(raw)
@@ -88,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("config", type=Path)
     live.add_argument("--live", action="store_true", help="required when the config mode is live")
     live.add_argument("--data-dir", type=Path, default=Path("data"))
-    live.add_argument("--log-file", type=Path, default=Path("logs/live.jsonl"))
+    live.add_argument("--log-file", type=Path, help="default: logs/<mode>.jsonl")
 
     status = commands.add_parser("status", help="show a session ledger")
     status.add_argument("config", type=Path)
@@ -194,7 +196,7 @@ def write_dashboard(data: DashboardData, out: Path) -> None:
 
 
 def run_dashboard_command(args: argparse.Namespace) -> int:
-    config = load_session_config(args.config)
+    config = existing_ledger(load_session_config(args.config))
     out = args.out or Path("reports") / f"{args.config.stem}.html"
     title = f"{'Live' if isinstance(config, LiveConfig) else 'Paper'} session {args.config.stem}"
     write_dashboard(from_ledger(config, BarStore(args.data_dir), title), out)
@@ -224,19 +226,28 @@ def run_paper_command(args: argparse.Namespace) -> int:
 
 
 def run_live_command(args: argparse.Namespace) -> int:
-    configure_logging(args.log_file)
     config = load_live_config(args.config)
+    if config.mode == "live" and not args.live:
+        raise SystemExit("config mode is live: pass --live to trade real money")
+    configure_logging(args.log_file or Path("logs") / f"{config.mode}.jsonl")
     return asyncio.run(run_live(config, Settings(), args.data_dir, confirmed=args.live))
 
 
 def run_status_command(args: argparse.Namespace) -> int:
-    print(status_text(load_session_config(args.config), BarStore(args.data_dir)))
+    print(status_text(existing_ledger(load_session_config(args.config)), BarStore(args.data_dir)))
     return 0
 
 
 def run_resume_command(args: argparse.Namespace) -> int:
-    print(resume(load_session_config(args.config)))
+    print(resume(existing_ledger(load_session_config(args.config))))
     return 0
+
+
+def existing_ledger[C: SessionConfig](config: C) -> C:
+    """Opening a ledger creates it; commands that only read must not leave one behind."""
+    if not config.ledger.is_file():
+        raise SystemExit(f"no ledger at {config.ledger}: nothing has run with this config yet")
+    return config
 
 
 def run_account_command(args: argparse.Namespace) -> int:

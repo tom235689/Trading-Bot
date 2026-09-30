@@ -1,5 +1,6 @@
 """Monthly spot kline archives from data.binance.vision."""
 
+import codecs
 import hashlib
 import io
 import zipfile
@@ -48,7 +49,8 @@ def parse_archive(archive: bytes) -> pl.DataFrame:
 
 def parse_csv(data: bytes) -> pl.DataFrame:
     """Parse kline CSV. Some Binance files start with a header row."""
-    if not data.strip():
+    data = data.removeprefix(codecs.BOM_UTF8).lstrip()
+    if not data:
         return empty_bars()
     raw = pl.read_csv(
         io.BytesIO(data),

@@ -11,6 +11,8 @@ from tbot.data.http import get_bytes
 
 SERVER_TIME_URL = "https://data-api.binance.vision/api/v3/time"
 WARN_OFFSET = 1.0  # seconds
+ATTEMPTS = 4
+MAX_ROUND_TRIP = 2.0  # seconds; a slower sample says little about the offset
 
 log = structlog.get_logger(__name__)
 
@@ -21,10 +23,22 @@ class ServerClock:
         self.offset = timedelta(0)  # server minus local
 
     def sync(self) -> float:
-        """Measure the offset with a single round trip; return it in seconds."""
-        before = time.time()
-        body = get_bytes(self.client, SERVER_TIME_URL)
-        after = time.time()
+        """Measure the offset with one quick round trip; return it in seconds.
+
+        Each attempt is timed on its own, so retry backoff never counts as latency.
+        """
+        for attempt in range(ATTEMPTS):
+            before = time.time()
+            try:
+                body = get_bytes(self.client, SERVER_TIME_URL, retries=1)
+            except httpx.HTTPError:
+                if attempt == ATTEMPTS - 1:
+                    raise
+                time.sleep(2**attempt)
+                continue
+            after = time.time()
+            if after - before <= MAX_ROUND_TRIP or attempt == ATTEMPTS - 1:
+                break
         if body is None:
             raise LookupError(f"not found: {SERVER_TIME_URL}")
         server = json.loads(body)["serverTime"] / 1000

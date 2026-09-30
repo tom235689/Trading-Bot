@@ -46,6 +46,8 @@ def test_downsample_keeps_the_last_point() -> None:
     assert kept[0] == 0
     assert kept[-1] == 9999
     assert downsample([1, 2, 3], limit=1000) == [1, 2, 3]
+    # Equal values must keep the same shape as distinct ones: series are zipped later.
+    assert len(downsample([1.0] * 2000, limit=1000)) == len(downsample(list(range(2000)), 1000))
 
 
 def sample_data() -> DashboardData:
@@ -154,8 +156,9 @@ def test_from_backtest() -> None:
         ),
         trades=pl.DataFrame(),
         positions={"BTC": 1.0},
+        marks={"BTC": 105.0},
     )
     data = from_backtest(result, "Backtest", "config x")
-    assert data.positions == [("BTC", 1.0, 100.0)]
+    assert data.positions == [("BTC", 1.0, 105.0)]  # marked at the last close, not the fill
     assert len(data.fills) == 1
     assert "Backtest" in render(data)

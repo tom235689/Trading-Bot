@@ -61,7 +61,7 @@ uv run tbot account config/testnet.yaml          # balances and open orders: che
 uv run tbot live config/testnet.yaml             # real order path, fake money
 uv run tbot live config/live.yaml --live         # real money; the flag is mandatory
 uv run tbot status config/live.yaml
-uv run tbot resume config/live.yaml              # clear the kill switch after a halt
+uv run tbot resume config/live.yaml              # clear the kill switch; a running bot picks it up at its next bar
 ```
 
 Before live: API key with spot trading only, withdrawals off, IP restricted; Windows time sync enabled (the bot warns when the clock is off by more than a second); a supervisor that restarts the process. Every position carries an exchange-side stop `protective_stop_pct` below the last close, so a dead bot still has bounded loss.

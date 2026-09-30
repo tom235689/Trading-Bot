@@ -31,6 +31,7 @@ from tbot.live.session import TradingSession
 from tbot.monitoring.telegram import LogNotifier, Telegram
 from tbot.portfolio.allocation import StrategySlot, build_slots
 from tbot.portfolio.portfolio import Portfolio
+from tbot.risk.limits import RiskLimits
 
 H1, H4 = Timeframe.H1, Timeframe.H4
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -180,10 +181,11 @@ def test_stream_keys_and_lookback() -> None:
         ]
     )
     assert stream_keys(config) == [("ETHUSDT", H1), ("BTCUSDT", H4)]
-    assert lookback_bars(build_slots(config.strategies)) == {
-        ("BTCUSDT", H4): 12,
-        ("ETHUSDT", H1): 22,
-    }
+    slots = build_slots(config.strategies)
+    assert lookback_bars(slots, config.risk) == {("BTCUSDT", H4): 12, ("ETHUSDT", H1): 22}
+    # Volatility targeting needs its window on the finest stream of each symbol.
+    vol = RiskLimits(target_volatility=0.4, volatility_lookback_days=1)
+    assert lookback_bars(slots, vol) == {("BTCUSDT", H4): 14, ("ETHUSDT", H1): 50}
 
 
 def test_build_session_needs_stored_history(tmp_path: Path) -> None:
@@ -222,6 +224,10 @@ def test_configs_and_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert isinstance(live, LiveConfig)
     assert (live.mode, live.protective_stop_pct, live.guard.max_drawdown) == ("live", 0.2, 0.15)
     assert isinstance(load_session_config(Path("config/paper.yaml")), PaperConfig)
+    assert LiveConfig(mode="testnet", strategies=live.strategies).ledger == Path(
+        "data/testnet.sqlite"
+    )
+    assert LiveConfig(mode="live", strategies=live.strategies).ledger == Path("data/live.sqlite")
 
     monkeypatch.chdir(tmp_path)  # no .env here: only the environment counts
     for name in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "HEARTBEAT_URL", "BINANCE_API_KEY"):
@@ -251,9 +257,23 @@ def test_status_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
         f"ledger: {(tmp_path / 'paper.sqlite').as_posix()}\n",
         encoding="utf-8",
     )
+    with pytest.raises(SystemExit, match="no ledger"):  # reading must not create one
+        main(["status", str(config_path), "--data-dir", str(tmp_path / "data")])
+    Ledger(tmp_path / "paper.sqlite").close()
     assert main(["status", str(config_path), "--data-dir", str(tmp_path / "data")]) == 0
     out = capsys.readouterr().out
     assert "no equity snapshots yet" in out
     assert "no bars BTCUSDT" in out
     assert main(["resume", str(config_path)]) == 0
     assert "not halted" in capsys.readouterr().out
+
+
+def test_live_command_needs_the_flag_for_real_money(tmp_path: Path) -> None:
+    config_path = tmp_path / "live.yaml"
+    config_path.write_text(
+        "mode: live\nstrategies:\n"
+        "  - {name: donchian_trend, symbols: [BTCUSDT], timeframe: 4h, allocation: 1.0}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="--live"):
+        main(["live", str(config_path), "--data-dir", str(tmp_path / "data")])

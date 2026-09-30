@@ -11,7 +11,13 @@ import structlog
 
 from tbot.core.models import Fill
 from tbot.core.timeframe import to_millis
-from tbot.exchange.binance import BinanceError, BinanceSpot, Order, aggregate_fill
+from tbot.exchange.binance import (
+    NOTHING_TO_CANCEL,
+    BinanceError,
+    BinanceSpot,
+    Order,
+    aggregate_fill,
+)
 from tbot.execution.sim_broker import SimulatedBroker
 from tbot.live.ledger import Ledger
 from tbot.monitoring.telegram import Notifier
@@ -217,11 +223,19 @@ class LiveExecutor:
     # exchange-side protective stops
 
     async def cancel_stops(self, symbol: str) -> int:
+        """Cancel this bot's stop orders; one that just triggered is already gone."""
         count = 0
         for order in await self.spot.open_orders(symbol):
-            if order.client_order_id.startswith(STOP_PREFIX):
+            if not order.client_order_id.startswith(STOP_PREFIX):
+                continue
+            try:
                 await self.spot.cancel_order(symbol, order.order_id)
-                count += 1
+            except BinanceError as exc:
+                if exc.code != NOTHING_TO_CANCEL:
+                    raise
+                log.info("stop_already_gone", symbol=symbol, order_id=order.order_id)
+                continue
+            count += 1
         return count
 
     async def after_event(self, portfolio: Portfolio, marks: Mapping[str, float]) -> None:

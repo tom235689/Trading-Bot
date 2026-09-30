@@ -46,3 +46,16 @@ def test_equity_and_exposures() -> None:
     portfolio.apply(fill(0, 2, 100, 0.0))
     assert portfolio.equity({"BTC": 150}) == pytest.approx(1100)
     assert portfolio.exposures({"BTC": 150}) == {"BTC": pytest.approx(300 / 1100)}
+
+
+def test_adjust_to_flat_ends_the_open_trade() -> None:
+    p = Portfolio(1000.0)
+    p.apply(fill(0, 1.0, 100.0, 0.1))
+    p.adjust("BTC", -1.0, 99.0)  # an exchange-side stop sold it; reconciliation adopted that
+    assert p.positions == {}
+    assert p.trades == []  # no record: the exit price is not known
+    p.apply(fill(1, 1.0, 90.0, 0.1))
+    p.apply(fill(2, -1.0, 95.0, 0.1))
+    [trade] = p.trades
+    assert trade.entry_time == T0 + timedelta(hours=1)  # a fresh round trip, not the old one
+    assert trade.pnl == pytest.approx(5.0 - 0.2)

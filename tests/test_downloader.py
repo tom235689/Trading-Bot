@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -84,3 +84,26 @@ def test_start_filters_earlier_bars(tmp_path: Path) -> None:
         result = sync(BarStore(tmp_path), client, "BTCUSDT", H1, start, NOW)
     assert result.first == start
     assert result.total_bars == 1786 - 19 * 24
+
+
+def test_unpublished_month_between_archives_comes_from_rest(tmp_path: Path) -> None:
+    rows = make_rows(JAN_1, 24 * 91 + 11, H1)  # through Apr 1 10:00; that bar is still open
+    now = datetime(2024, 4, 1, 10, 30, tzinfo=UTC)
+    fake = FakeBinance("BTCUSDT", H1, rows, unpublished={(2024, 2)})
+    with fake.client() as client:
+        result = sync(BarStore(tmp_path), client, "BTCUSDT", H1, JAN_1, now)
+
+    assert (result.archive_bars, result.rest_bars) == (744 + 744, 696 + 10)
+    assert (result.total_bars, result.last) == (24 * 91 + 10, datetime(2024, 4, 1, 9, tzinfo=UTC))
+
+
+def test_later_start_does_not_skip_bars_after_the_last_stored(tmp_path: Path) -> None:
+    fake = FakeBinance("BTCUSDT", H1, ROWS)
+    store = BarStore(tmp_path)
+    with fake.client() as client:
+        sync(store, client, "BTCUSDT", H1, JAN_1, datetime(2024, 1, 10, 0, 30, tzinfo=UTC))
+        result = sync(store, client, "BTCUSDT", H1, datetime(2024, 3, 1, tzinfo=UTC), NOW)
+
+    assert (result.total_bars, result.last) == (1786, LAST_CLOSED)
+    steps = store.read("BTCUSDT", H1)["open_time"].diff().drop_nulls().unique().to_list()
+    assert steps == [timedelta(hours=1)]

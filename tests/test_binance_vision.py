@@ -49,3 +49,7 @@ def test_fetch_month_rejects_bad_checksum() -> None:
     fake = FakeBinance("BTCUSDT", Timeframe.H4, ROWS, bad_checksum=True)
     with fake.client() as client, pytest.raises(ChecksumError, match="mismatch"):
         fetch_month(client, "BTCUSDT", Timeframe.H4, 2024, 1)
+
+
+def test_parse_csv_ignores_a_byte_order_mark() -> None:
+    assert parse_csv(b"\xef\xbb\xbf" + to_csv(ROWS)).equals(from_rows(ROWS))

@@ -41,12 +41,17 @@ class Portfolio:
         return {symbol: qty * prices[symbol] / equity for symbol, qty in self.positions.items()}
 
     def adjust(self, symbol: str, quantity: float, cash: float) -> None:
-        """Reconciliation delta from the exchange; bypasses trade tracking."""
+        """Reconciliation delta from the exchange; bypasses trade tracking.
+
+        A position the exchange closed ends its round trip without a record, so the
+        next fill in that symbol starts a fresh one instead of extending a stale trade.
+        """
         self.cash += cash
         if symbol:
             after = self.position(symbol) + quantity
             if abs(after) < EPSILON:
                 self.positions.pop(symbol, None)
+                self._open.pop(symbol, None)
             else:
                 self.positions[symbol] = after
 

@@ -103,13 +103,16 @@ def test_message_skips_comments_and_scissors() -> None:
     message = "\n".join(
         [
             "Add feature",
-            f"# {SYLLABLE} comment",
+            "",
+            f"# {SYLLABLE} comment",  # git's own comments always follow a blank line
             "# ------------------------ >8 ------------------------",
             f"+{SYLLABLE} diff below scissors",
         ]
     )
     assert list(gg.check_message(message)) == []
     assert [f.where for f in gg.check_message(f"Title\n\nBody {SYLLABLE}")] == ["commit message:3"]
+    # `git commit -m` keeps a leading `#` line, so the first paragraph is never a comment.
+    assert [f.where for f in gg.check_message(f"#12 {SYLLABLE}")] == ["commit message:1"]
 
 
 # Integration tests against real temporary repositories.

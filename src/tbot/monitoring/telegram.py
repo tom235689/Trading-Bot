@@ -5,6 +5,8 @@ from typing import Protocol
 import httpx
 import structlog
 
+from tbot.data.http import describe_error
+
 log = structlog.get_logger(__name__)
 API = "https://api.telegram.org"
 MAX_LENGTH = 4000  # Telegram allows 4096 characters per message
@@ -35,5 +37,5 @@ class Telegram:
             response.raise_for_status()
             return True
         except httpx.HTTPError as exc:
-            log.warning("telegram_failed", error=repr(exc))
+            log.warning("telegram_failed", error=describe_error(exc))  # never the URL
             return False

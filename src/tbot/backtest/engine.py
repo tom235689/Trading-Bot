@@ -12,7 +12,7 @@ A symbol's fills and marks use its finest loaded timeframe.
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
@@ -45,6 +45,7 @@ class BacktestResult:
     fills: pl.DataFrame
     trades: pl.DataFrame
     positions: dict[str, float]  # open at the end
+    marks: dict[str, float] = field(default_factory=dict)  # last close per symbol
 
 
 class _Stream:
@@ -248,4 +249,5 @@ class BacktestEngine:
             fills=fills,
             trades=trades,
             positions=dict(self.portfolio.positions),
+            marks=dict(self.marks),
         )
