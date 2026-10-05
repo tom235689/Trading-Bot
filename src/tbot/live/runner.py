@@ -432,8 +432,10 @@ async def _run_session(
                 await asyncio.to_thread(clock.sync)
                 now = clock.now()
                 log.info("syncing_store", streams=[f"{s}:{tf}" for s, tf in keys])
+                lookback = lookback_bars(build_slots(config.strategies), config.risk)
                 for symbol, timeframe in keys:
-                    start = now - timeframe.delta * SYNC_LOOKBACK_BARS
+                    depth = max(SYNC_LOOKBACK_BARS, lookback.get((symbol, timeframe), 0))
+                    start = now - timeframe.delta * depth
                     await asyncio.to_thread(sync, store, client, symbol, timeframe, start, now)
 
                 portfolio = restore_portfolio(config, ledger)

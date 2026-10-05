@@ -10,7 +10,7 @@ import httpx
 import polars as pl
 
 from tbot.core.timeframe import Timeframe
-from tbot.data.binance_rest import fetch_klines
+from tbot.data.binance_rest import fetch_klines, first_open_time
 from tbot.data.binance_vision import fetch_month
 from tbot.data.quality import aligned
 from tbot.data.store import BarStore
@@ -69,21 +69,59 @@ def sync(
     workers: int = 8,
     progress: Callable[[str], None] = lambda _: None,
 ) -> SyncResult:
-    """Download closed bars from start, or from the last stored bar, up to now.
+    """Download closed bars from start up to now, without holes.
 
-    Only extends forward, without holes: a start after the last stored bar does not
-    skip the bars in between. To backfill earlier history, delete the stored data first.
+    Extends forward from the last stored bar, and backfills bars before the first
+    stored one when start is earlier.
     """
+    counts = [0, 0, 0]  # archive bars, REST bars, dropped
+    first = store.first_open_time(symbol, timeframe)
     last = store.last_open_time(symbol, timeframe)
-    begin = last if last is not None else start
+    if first is not None and start < first:
+        # One probe first, so a start before the listing costs a request, not a download.
+        earliest = first_open_time(client, symbol, timeframe, start, first)
+        if earliest is not None:
+            _download(store, client, symbol, timeframe, earliest, first, workers, progress, counts)
+    begin = last + timeframe.delta if last is not None else start
+    _download(
+        store, client, symbol, timeframe, begin, timeframe.floor(now), workers, progress, counts
+    )
+
+    stored = store.read(symbol, timeframe)["open_time"]
+    return SyncResult(
+        symbol=symbol,
+        timeframe=timeframe,
+        archive_bars=counts[0],
+        rest_bars=counts[1],
+        dropped=counts[2],
+        total_bars=stored.len(),
+        first=stored[0] if stored.len() else None,
+        last=stored[-1] if stored.len() else None,
+    )
+
+
+def _download(
+    store: BarStore,
+    client: httpx.Client,
+    symbol: str,
+    timeframe: Timeframe,
+    begin: datetime,
+    end: datetime,
+    workers: int,
+    progress: Callable[[str], None],
+    counts: list[int],
+) -> None:
+    """Store bars with open_time in [begin, end): archives for complete months, then REST."""
+    if begin >= end:
+        return
 
     def fetch(year_month: tuple[int, int]) -> pl.DataFrame | None:
         return fetch_month(client, symbol, timeframe, *year_month)
 
     # Complete months come from archives, one year at a time to bound memory.
-    archive_bars = dropped = 0
+    covered = begin  # everything before this is stored
     unpublished: list[tuple[int, int]] = []
-    months = iter_months(begin.date(), now.date())
+    months = iter_months(begin.date(), end.date())
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for year, year_months in groupby(months, key=lambda ym: ym[0]):
             wanted = list(year_months)
@@ -95,38 +133,27 @@ def sync(
                     frames.append(frame)
             if not frames:
                 continue
-            bars = pl.concat(frames).filter(pl.col("open_time") >= begin)
+            bars = pl.concat(frames).filter(pl.col("open_time") >= begin, pl.col("open_time") < end)
             written, skipped = store_aligned(store, symbol, timeframe, bars)
-            archive_bars, dropped = archive_bars + written, dropped + skipped
+            counts[0] += written
+            counts[2] += skipped
+            latest = bars["open_time"].max()
+            if isinstance(latest, datetime):
+                covered = max(covered, latest + timeframe.delta)
             progress(f"{symbol} {timeframe} {year}: {written} bars from archives")
 
     # REST fills months missing between archives, then everything after the last
     # archived bar, which covers months not yet published.
-    last = store.last_open_time(symbol, timeframe)
-    tail_start = last + timeframe.delta if last is not None else start
     ranges = [
         (max(month_start, begin), month_end)
         for month_start, month_end in map(_month_span, unpublished)
-        if month_end <= tail_start
+        if month_end <= covered
     ]
-    tail_end = timeframe.floor(now)
-    if tail_start < tail_end:
-        ranges.append((tail_start, tail_end))
-    rest_bars = 0
+    if covered < end:
+        ranges.append((covered, end))
     for range_start, range_end in ranges:
         bars = fetch_klines(client, symbol, timeframe, range_start, range_end)
         written, skipped = store_aligned(store, symbol, timeframe, bars)
-        rest_bars, dropped = rest_bars + written, dropped + skipped
+        counts[1] += written
+        counts[2] += skipped
         progress(f"{symbol} {timeframe}: {written} bars from REST")
-
-    stored = store.read(symbol, timeframe)["open_time"]
-    return SyncResult(
-        symbol=symbol,
-        timeframe=timeframe,
-        archive_bars=archive_bars,
-        rest_bars=rest_bars,
-        dropped=dropped,
-        total_bars=stored.len(),
-        first=stored[0] if stored.len() else None,
-        last=stored[-1] if stored.len() else None,
-    )

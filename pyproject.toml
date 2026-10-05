@@ -31,6 +31,10 @@ dev = [
     "types-pyyaml>=6.0.12.20260906",
 ]
 
+[tool.uv]
+# Pure Python mypy: Smart App Control blocks its unsigned compiled modules.
+no-binary-package = ["mypy"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

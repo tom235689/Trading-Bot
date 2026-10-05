@@ -22,7 +22,7 @@ uv venv --python "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" --clea
 uv sync
 ```
 
-If a generated launcher such as `tbot.exe` is blocked, use `uv run python -m tbot ...` instead. The hooks already run their tools that way. `backtest`, `download`, `check`, and `validate` do not need SQLite; the session commands print this advice when it cannot load.
+mypy is installed as pure Python (`no-binary-package` in `pyproject.toml`) because its compiled build is unsigned; an environment that still has the compiled one needs `uv sync --reinstall-package mypy`. If a generated launcher such as `tbot.exe` is blocked, use `uv run python -m tbot ...` instead. The hooks already run their tools that way. `backtest`, `download`, `check`, and `validate` do not need SQLite; the session commands print this advice when it cannot load.
 
 ## Market data
 
@@ -32,7 +32,7 @@ uv run tbot check                       # quality report; exit code 1 on errors
 uv run tbot download --symbols SOLUSDT --timeframes 4h --start 2021-01-01
 ```
 
-Downloads only extend forward from the last stored bar and fill any month missing from the archives through the REST API. To re-download a stream from scratch, delete `data/binance/spot/klines/<SYMBOL>/<timeframe>/`.
+Downloads extend forward from the last stored bar and back to `--start` when that is earlier than the first stored bar, so running `paper` first and `download` later still gives the full history. Months missing from the archives come from the REST API. To re-download a stream from scratch, delete `data/binance/spot/klines/<SYMBOL>/<timeframe>/`.
 
 ## Backtest
 

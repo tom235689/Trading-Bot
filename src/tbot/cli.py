@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--start",
         type=parse_date,
         default=parse_date(DEFAULT_START),
-        help=f"first day, YYYY-MM-DD (default {DEFAULT_START}); ignored once bars are stored",
+        help=f"first day, YYYY-MM-DD (default {DEFAULT_START}); earlier history is backfilled",
     )
     check = commands.add_parser("check", help="check stored bars")
     for command in (download, check):

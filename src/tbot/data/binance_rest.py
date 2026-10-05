@@ -6,7 +6,7 @@ from datetime import datetime
 import httpx
 import polars as pl
 
-from tbot.core.timeframe import Timeframe, to_millis
+from tbot.core.timeframe import Timeframe, from_millis, to_millis
 from tbot.data.http import get_bytes
 from tbot.data.schema import empty_bars, from_rows
 
@@ -41,3 +41,21 @@ def fetch_klines(
     if not frames:
         return empty_bars()
     return pl.concat(frames).filter(pl.col("open_time") >= start, pl.col("open_time") < end)
+
+
+def first_open_time(
+    client: httpx.Client, symbol: str, timeframe: Timeframe, start: datetime, end: datetime
+) -> datetime | None:
+    """Open time of the earliest bar in [start, end), or None if Binance has none."""
+    params: dict[str, str | int] = {
+        "symbol": symbol,
+        "interval": str(timeframe),
+        "startTime": to_millis(start),
+        "endTime": to_millis(end) - 1,
+        "limit": 1,
+    }
+    body = get_bytes(client, KLINES_URL, params)
+    if body is None:
+        raise LookupError(f"not found: {KLINES_URL}")
+    rows = json.loads(body)
+    return from_millis(int(rows[0][0])) if rows else None

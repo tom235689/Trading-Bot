@@ -41,6 +41,13 @@ class BarStore:
             bars = bars.filter(pl.col("open_time") < end)
         return bars.sort("open_time")
 
+    def first_open_time(self, symbol: str, timeframe: Timeframe) -> datetime | None:
+        files = self._files(symbol, timeframe)
+        if not files:
+            return None
+        value = pl.read_parquet(files[0], columns=["open_time"])["open_time"].min()
+        return value if isinstance(value, datetime) else None
+
     def last_open_time(self, symbol: str, timeframe: Timeframe) -> datetime | None:
         files = self._files(symbol, timeframe)
         if not files:

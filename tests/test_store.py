@@ -20,6 +20,7 @@ def test_write_splits_by_year_and_reads_back(tmp_path: Path) -> None:
     files = sorted(p.name for p in store.directory("BTCUSDT", H4).iterdir())
     assert files == ["2023.parquet", "2024.parquet"]
     assert store.read("BTCUSDT", H4).equals(bars)
+    assert store.first_open_time("BTCUSDT", H4) == NEW_YEAR_EVE
     assert store.last_open_time("BTCUSDT", H4) == datetime(2024, 1, 1, 20, tzinfo=UTC)
 
 
@@ -47,6 +48,7 @@ def test_write_merges_and_new_rows_win(tmp_path: Path) -> None:
 def test_empty_store(tmp_path: Path) -> None:
     store = BarStore(tmp_path)
     assert store.read("BTCUSDT", H4).is_empty()
+    assert store.first_open_time("BTCUSDT", H4) is None
     assert store.last_open_time("BTCUSDT", H4) is None
 
 

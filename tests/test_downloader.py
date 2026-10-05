@@ -107,3 +107,32 @@ def test_later_start_does_not_skip_bars_after_the_last_stored(tmp_path: Path) ->
     assert (result.total_bars, result.last) == (1786, LAST_CLOSED)
     steps = store.read("BTCUSDT", H1)["open_time"].diff().drop_nulls().unique().to_list()
     assert steps == [timedelta(hours=1)]
+
+
+def test_earlier_start_backfills_before_the_first_stored_bar(tmp_path: Path) -> None:
+    fake = FakeBinance("BTCUSDT", H1, ROWS)
+    store = BarStore(tmp_path)
+    with fake.client() as client:
+        sync(store, client, "BTCUSDT", H1, datetime(2024, 2, 10, tzinfo=UTC), NOW)
+        fake.requests.clear()
+        result = sync(store, client, "BTCUSDT", H1, JAN_1, NOW)
+
+    assert (result.total_bars, result.first, result.last) == (1786, JAN_1, LAST_CLOSED)
+    assert (result.archive_bars, result.rest_bars) == (744, 9 * 24)  # Jan, then Feb 1-9
+    assert [url.rsplit("/", 1)[-1] for url in fake.archive_requests()] == ["BTCUSDT-1h-2024-01.zip"]
+    steps = store.read("BTCUSDT", H1)["open_time"].diff().drop_nulls().unique().to_list()
+    assert steps == [timedelta(hours=1)]
+
+
+def test_start_before_listing_costs_one_probe_per_sync(tmp_path: Path) -> None:
+    fake = FakeBinance("BTCUSDT", H1, ROWS)
+    store = BarStore(tmp_path)
+    before_listing = datetime(2023, 6, 1, tzinfo=UTC)
+    with fake.client() as client:
+        sync(store, client, "BTCUSDT", H1, before_listing, NOW)
+        fake.requests.clear()
+        result = sync(store, client, "BTCUSDT", H1, before_listing, NOW)
+
+    assert (result.total_bars, result.first) == (1786, JAN_1)
+    assert fake.archive_requests() == []
+    assert len(fake.requests) == 1
