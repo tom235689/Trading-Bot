@@ -1,5 +1,5 @@
 import math
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from tbot.backtest.config import BacktestConfig
@@ -48,9 +48,31 @@ def test_log_round_trip_and_filters(tmp_path: Path) -> None:
     assert records[0].params == {"entry": 5}
     assert records[0].timeframe == "4h"
     like = records[0]
-    assert log.selection_sharpes(like) == [1.0]  # holdout and nan excluded
+    sharpes = log.selection_sharpes(like)  # the holdout is no selection; a NaN run is a trial
+    assert sharpes[0] == 1.0
+    assert len(sharpes) == 2
+    assert math.isnan(sharpes[1])
     assert log.count("donchian_trend", "holdout") == 1
     assert log.selection_sharpes(like.model_copy(update={"symbols": ["ETHUSDT"]})) == []
 
-    log.append([make_record(CONFIG, metrics(2.0), "sweep")])  # same params again
-    assert log.selection_sharpes(like) == [2.0]  # latest run replaces, count unchanged
+    log.append([make_record(CONFIG, metrics(1.0), "sweep")])  # the same run again
+    assert len(log.selection_sharpes(like)) == 2
+    tighter = CONFIG.model_copy(
+        update={"risk": CONFIG.risk.model_copy(update={"target_volatility": 0.4})}
+    )
+    log.append([make_record(tighter, metrics(1.2), "sweep")])  # same params, other risk
+    assert len(log.selection_sharpes(like)) == 3
+
+
+def test_every_run_over_the_holdout_is_a_look(tmp_path: Path) -> None:
+    log = TrialLog(tmp_path / "trials.jsonl")
+    in_sample = CONFIG.with_period(date(2024, 1, 1), date(2025, 1, 1))
+    log.append(
+        [
+            make_record(in_sample, metrics(1.0), "sweep"),
+            make_record(CONFIG, metrics(1.0), "backtest"),  # to the latest bar
+            make_record(CONFIG.with_period(date(2025, 1, 1), None), metrics(0.4), "holdout"),
+        ]
+    )
+    like = log.read()[-1]
+    assert log.holdout_looks(like, date(2025, 1, 1)) == 2

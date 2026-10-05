@@ -15,18 +15,22 @@ from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
 from tbot.live.config import LiveConfig, PaperConfig, Settings, load_paper_config
 from tbot.live.executor import PaperExecutor
-from tbot.live.guard import GuardConfig, RiskGuard
 from tbot.live.history import BarHistory
 from tbot.live.ledger import Ledger
 from tbot.live.runner import (
+    GUARD_META,
     AlreadyRunning,
     SessionTrader,
+    adopt_resume,
     build_session,
+    check_budget,
     instance_lock,
     load_checkpoint,
+    load_guard,
     lookback_bars,
     make_notifier,
     restore_portfolio,
+    resume,
     status_text,
     strategies_hash,
     stream_keys,
@@ -36,6 +40,7 @@ from tbot.live.session import Checkpoint, TradingSession
 from tbot.monitoring.telegram import LogNotifier, Telegram
 from tbot.portfolio.allocation import StrategySlot, build_slots
 from tbot.portfolio.portfolio import Portfolio
+from tbot.risk.guard import GuardConfig, Mode, RiskGuard
 from tbot.risk.limits import RiskLimits
 
 H1, H4 = Timeframe.H1, Timeframe.H4
@@ -229,7 +234,7 @@ def test_configs_and_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert testnet.mode == "testnet"
     live = load_session_config(Path("config/live.yaml"))
     assert isinstance(live, LiveConfig)
-    assert (live.mode, live.protective_stop_pct, live.guard.max_drawdown) == ("live", 0.2, 0.15)
+    assert (live.mode, live.protective_stop_pct, live.guard.max_drawdown) == ("live", 0.2, 0.45)
     assert live.ownership == "budget"
     for session in (testnet, live):  # what paper rehearses is what goes live
         assert (session.risk, session.strategies) == (paper.risk, paper.strategies)
@@ -344,3 +349,29 @@ def test_one_process_per_ledger(tmp_path: Path) -> None:
         pass
     with instance_lock(ledger):  # released when the first one ends
         pass
+
+
+def test_a_resume_is_kept_when_reconciliation_writes_the_guard(tmp_path: Path) -> None:
+    config = paper_config(tmp_path)
+    with Ledger(config.ledger) as ledger:
+        guard = load_guard(config, ledger)  # the running bot's copy
+        guard.halt("drawdown")
+        ledger.set_meta(GUARD_META, guard.state.model_dump_json())
+        assert resume(config).startswith("resumed")
+        adopt_resume(guard, ledger)  # what reconciliation does before it shifts the guard
+        guard.shift(-25.0)
+        ledger.set_meta(GUARD_META, guard.state.model_dump_json())
+        assert not load_guard(config, ledger).state.halted
+
+
+def test_a_changed_budget_is_a_transfer_not_a_loss(tmp_path: Path) -> None:
+    config = paper_config(tmp_path)  # initial_cash 1000
+    with Ledger(config.ledger) as ledger:
+        guard = load_guard(config, ledger)
+        check_budget(config, ledger, guard)
+        guard.check(at(1), 1000.0, at(1))
+        smaller = config.model_copy(update={"initial_cash": 400.0})
+        check_budget(smaller, ledger, guard)
+        assert guard.state.peak_equity == pytest.approx(400.0)
+        assert guard.check(at(2), 400.0, at(2)).mode == Mode.NORMAL
+        assert "initial_cash changed" in ledger.recent_events(1)[0].message

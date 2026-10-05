@@ -80,3 +80,13 @@ def test_runs_trend_on_stored_bars(tmp_path: Path) -> None:
 def test_missing_data_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="run `tbot download`"):
         run_backtest(load_config(write_config(tmp_path)), BarStore(tmp_path / "empty"))
+
+
+def test_streams_stop_at_the_earliest_last_close(tmp_path: Path) -> None:
+    store = BarStore(tmp_path / "data")
+    flat = [100.0] * 60
+    store.write("BTCUSDT", H4, price_bars(T0, H4, flat, flat))
+    store.write("ETHUSDT", H4, price_bars(T0, H4, flat[:40], flat[:40]))  # a week behind
+    text = CONFIG.replace("symbols: [btc/usdt]", "symbols: [btc/usdt, eth/usdt]")
+    result = run_backtest(load_config(write_config(tmp_path, text)), store)
+    assert result.equity["time"][-1] == T0 + H4.delta * 40

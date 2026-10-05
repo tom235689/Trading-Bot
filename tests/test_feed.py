@@ -13,7 +13,7 @@ from binance_fake import Row, make_rows
 from tbot.core.timeframe import Timeframe, to_millis
 from tbot.data.schema import from_rows
 from tbot.data.store import BarStore
-from tbot.live.feed import LiveFeed, StreamKey
+from tbot.live.feed import LiveFeed, StreamKey, close_time
 
 H1, H4 = Timeframe.H1, Timeframe.H4
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -317,3 +317,26 @@ def test_server_clock_ignores_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> 
     clock = ServerClock(httpx.Client(transport=httpx.MockTransport(handle)))
     assert clock.sync() == pytest.approx(5.0, abs=0.3)
     assert calls[0] == 2
+
+
+def test_feed_starts_from_what_the_session_has_seen(tmp_path: Path) -> None:
+    store = BarStore(tmp_path / "data")
+    store.write(*BTC1, from_rows(make_rows(T0, 4, H1)))  # another process stored a newer bar
+    client, _ = rest_client({})
+    feed = LiveFeed([BTC1], store, client, clock=lambda: at(4.5), last={BTC1: at(2)})
+    assert feed.last[BTC1] == at(2)
+    assert LiveFeed([BTC1], store, client, clock=lambda: at(4.5)).last[BTC1] == at(3)
+
+
+def test_catch_up_queues_bars_in_close_order(tmp_path: Path) -> None:
+    btc4 = ("BTCUSDT", H4)
+    rows = {BTC1: make_rows(T0, 9, H1), btc4: make_rows(T0, 2, H4)}
+    feed, _, _ = make_feed(tmp_path, [BTC1, btc4], now=at(8.5), rows=rows)
+    feed.last = {BTC1: T0 - H1.delta, btc4: T0 - H4.delta}
+    assert asyncio.run(feed.catch_up()) == 8 + 2
+    closes = []
+    while not feed.queue.empty():
+        key, bar = feed.queue.get_nowait()
+        closes.append((close_time(key, bar), key[1]))
+    assert closes == sorted(closes, key=lambda item: (item[0], item[1].millis))
+    assert closes[3:5] == [(at(4), H1), (at(4), H4)]  # together, before the 5h close

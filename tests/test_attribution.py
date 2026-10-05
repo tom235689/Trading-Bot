@@ -72,3 +72,24 @@ def test_backtest_command_with_attribution(
     assert code == 0
     assert "rsi_reversion" in out
     assert "combined" in out
+
+
+def test_correlation_pairs_days_by_date(store: BarStore) -> None:
+    # The same prices on a second symbol with two days missing: paired by date, the
+    # strategies move together; paired by position, the gap would shift them apart.
+    bars = store.read("BTCUSDT", H1)
+    gap = (bars["open_time"] >= datetime(2024, 1, 20, tzinfo=UTC)) & (
+        bars["open_time"] < datetime(2024, 1, 22, tzinfo=UTC)
+    )
+    store.write("ETHUSDT", H1, bars.filter(~gap))
+    base = BacktestConfig.model_validate({**CONFIG, "start": "2024-01-08"})
+    donchian = base.strategies[0]
+    config = base.model_copy(
+        update={
+            "strategies": [
+                donchian.model_copy(update={"symbols": ["BTCUSDT"]}),
+                donchian.model_copy(update={"symbols": ["ETHUSDT"]}),
+            ]
+        }
+    )
+    assert run_attribution(config, store).correlation[0][1] > 0.9

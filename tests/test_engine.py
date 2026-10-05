@@ -9,6 +9,7 @@ from tbot.core.timeframe import Timeframe
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel
 from tbot.portfolio.allocation import StrategySlot
+from tbot.risk.guard import GuardConfig
 from tbot.risk.limits import RiskLimits
 from tbot.strategies.base import Strategy
 
@@ -146,3 +147,45 @@ def test_every_symbol_fills_when_timeframes_are_mixed() -> None:
     btc_fills = fills.filter(pl.col("symbol") == "BTC").select("time", "price").rows()
     assert btc_fills == [(at(4), pytest.approx(101.0 * 1.001))]
     assert fills.filter(pl.col("symbol") == "ETH").height == 1
+
+
+def test_kill_switch_flattens_and_stays_out() -> None:
+    # Fully long from the 1h close; the 30% fall at the 4h close trips a 15% drawdown limit.
+    closes = [100, 100, 100, 70, 80, 90, 100]
+    bars = price_bars(T0, H1, opens=[100, *closes[:-1]], closes=closes)
+    strategy = Scripted(["BTC"], {"script": {at(1): {"BTC": 1.0}}})
+    engine = BacktestEngine(
+        [StrategySlot(strategy, H1, 1.0)],
+        {("BTC", H1): bars},
+        start=T0,
+        initial_cash=1000.0,
+        costs=COSTS,
+        risk=RiskLimits(),
+        rules=RULES,
+        guard=GuardConfig(daily_loss_limit=0, max_drawdown=0.15, stale_seconds=0),
+    )
+    result = engine.run()
+    assert result.halted.startswith("2024-01-01 04:00: drawdown")
+    bought, sold = result.fills["quantity"].to_list()
+    assert sold == pytest.approx(-bought)
+    assert result.fills["time"][1] == at(4)  # flattened at the next open
+    assert result.positions.get("BTC", 0.0) == 0.0  # the rebound is not bought back
+
+
+def test_daily_loss_limit_blocks_entries_only() -> None:
+    closes = [100, 100, 90, 90, 90]
+    bars = price_bars(T0, H1, opens=[100, *closes[:-1]], closes=closes)
+    script = {at(1): {"BTC": 0.5}, at(3): {"BTC": 1.0}}  # adds after a 5% day loss
+    engine = BacktestEngine(
+        [StrategySlot(Scripted(["BTC"], {"script": script}), H1, 1.0)],
+        {("BTC", H1): bars},
+        start=T0,
+        initial_cash=1000.0,
+        costs=COSTS,
+        risk=RiskLimits(),
+        rules=RULES,
+        guard=GuardConfig(daily_loss_limit=0.03, max_drawdown=0, stale_seconds=0),
+    )
+    result = engine.run()
+    assert result.fills.height == 1  # the add was blocked
+    assert result.halted == ""

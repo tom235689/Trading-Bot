@@ -11,13 +11,13 @@ from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
 from tbot.live.config import PaperConfig
 from tbot.live.executor import PaperExecutor
-from tbot.live.guard import GuardConfig, RiskGuard
 from tbot.live.history import BarHistory
 from tbot.live.ledger import Ledger
 from tbot.live.runner import SessionTrader, load_guard, resume
 from tbot.live.session import TradingSession
 from tbot.portfolio.allocation import StrategySlot
 from tbot.portfolio.portfolio import Portfolio
+from tbot.risk.guard import GuardConfig, RiskGuard
 
 H1 = Timeframe.H1
 T0 = datetime(2024, 1, 1, tzinfo=UTC)

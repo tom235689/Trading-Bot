@@ -26,7 +26,6 @@ from tbot.live.clock import ServerClock
 from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings
 from tbot.live.executor import BinanceBookTicker, Executor, LiveExecutor, PaperExecutor
 from tbot.live.feed import Batch, LiveFeed, bars_since, close_time, utc_now
-from tbot.live.guard import Decision, GuardState, Mode, RiskGuard
 from tbot.live.history import MAX_BARS, BarHistory
 from tbot.live.ledger import Adjustment, Ledger, config_hash
 from tbot.live.reconcile import reconcile
@@ -35,6 +34,7 @@ from tbot.monitoring.heartbeat import heartbeat_loop
 from tbot.monitoring.telegram import LogNotifier, Notifier, Telegram
 from tbot.portfolio.allocation import StrategySlot, build_slots
 from tbot.portfolio.portfolio import Portfolio
+from tbot.risk.guard import Decision, GuardState, Mode, RiskGuard
 from tbot.risk.limits import RiskLimits
 
 log = structlog.get_logger(__name__)
@@ -43,6 +43,7 @@ SYNC_LOOKBACK_BARS = 400
 SHUTDOWN_GRACE_SECONDS = 60  # an event in progress may finish its orders before shutdown
 RECONCILE_ALERT_AFTER = 3  # consecutive failed reconciliations before trading pauses
 GUARD_META = "guard"
+BUDGET_META = "initial_cash"  # the budget the guard levels refer to
 TARGETS_META = "targets"
 _background: set[asyncio.Task[bool]] = set()
 
@@ -162,14 +163,7 @@ class SessionTrader:
         self.ledger.set_meta(GUARD_META, self.guard.state.model_dump_json())
 
     def reload_guard(self) -> None:
-        """Adopt a `tbot resume` issued while this process runs."""
-        if not self.guard.state.halted:
-            return
-        raw = self.ledger.get_meta(GUARD_META)
-        if raw:
-            stored = GuardState.model_validate_json(raw)
-            if not stored.halted:
-                self.guard.state = stored
+        adopt_resume(self.guard, self.ledger)
 
     def save_checkpoint(self, now: datetime) -> None:
         """Strategy targets after this event, so a restart continues from them."""
@@ -199,6 +193,32 @@ def load_checkpoint(config: SessionConfig, ledger: Ledger) -> Checkpoint | None:
         return None
     targets = [{str(k): float(v) for k, v in slot.items()} for slot in data["targets"]]
     return Checkpoint(datetime.fromisoformat(data["time"]), targets)
+
+
+def adopt_resume(guard: RiskGuard, ledger: Ledger) -> None:
+    """Adopt a `tbot resume` issued while this process runs, before writing the guard."""
+    if not guard.state.halted:
+        return
+    raw = ledger.get_meta(GUARD_META)
+    if raw:
+        stored = GuardState.model_validate_json(raw)
+        if not stored.halted:
+            guard.state = stored
+
+
+def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard) -> None:
+    """A changed initial_cash moves money into or out of the book: not a profit or loss."""
+    stored = ledger.get_meta(BUDGET_META)
+    if stored is not None and float(stored) != config.initial_cash:
+        guard.shift(config.initial_cash - float(stored))
+        ledger.set_meta(GUARD_META, guard.state.model_dump_json())
+        ledger.add_event(
+            utc_now(),
+            "warning",
+            f"initial_cash changed from {float(stored):,.2f} to {config.initial_cash:,.2f}; "
+            "the guard treats the difference as a transfer",
+        )
+    ledger.set_meta(BUDGET_META, repr(config.initial_cash))
 
 
 def load_guard(config: SessionConfig, ledger: Ledger) -> RiskGuard:
@@ -443,6 +463,7 @@ async def _run_session(
                 session = build_session(config, store, portfolio, now, checkpoint)
                 _check_config(config, ledger)
                 guard = load_guard(config, ledger)
+                check_budget(config, ledger, guard)
                 context = Context(
                     config,
                     settings,
@@ -479,6 +500,9 @@ async def _run_session(
                 keys,
                 store,
                 client,
+                # From what the session has seen, so a bar another process stored during
+                # the setup above is still handed to this one.
+                last={key: session.histories[key].last_open_time for key in keys},
                 clock=clock.now,
                 stale_after=config.stale_after_seconds,
                 batch_wait=config.batch_wait_seconds,
@@ -619,6 +643,12 @@ async def run_live(
         async def reconcile_once() -> None:
             """Book what the exchange did between events, then compare the rest."""
             await executor.settle(portfolio)
+            balances = await spot.balances()
+            if await executor.settle(portfolio):
+                # Something executed while the balances were read: they may show it or
+                # not, and comparing them now could count it twice. Next round.
+                log.info("reconcile_deferred")
+                return
             adjustments = await reconcile(
                 spot,
                 portfolio,
@@ -629,15 +659,19 @@ async def run_live(
                 tolerance=config.reconcile_tolerance,
                 ownership=config.ownership,
                 label=label,
+                balances=balances,
             )
             if adjustments:
                 # Money moved from outside: not a profit or loss for the guard.
                 moved = sum(
                     a.cash + a.quantity * ctx.session.marks.get(a.symbol, 0.0) for a in adjustments
                 )
+                adopt_resume(ctx.guard, ctx.ledger)
                 ctx.guard.shift(moved)
                 ctx.ledger.set_meta(GUARD_META, ctx.guard.state.model_dump_json())
                 await executor.after_event(portfolio, ctx.session.marks)  # stops for what changed
+            elif executor.unprotected:
+                await executor.protect(portfolio, ctx.session.marks)
 
         async with ctx.lock:
             await reconcile_once()

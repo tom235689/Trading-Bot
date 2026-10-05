@@ -26,6 +26,7 @@ from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
 from tbot.portfolio.allocation import StrategySlot, decide_orders, validate_targets
 from tbot.portfolio.portfolio import Portfolio
+from tbot.risk.guard import GuardConfig, Mode, RiskGuard
 from tbot.risk.limits import RiskLimits
 from tbot.risk.volatility import volatility_scale
 from tbot.strategies.base import BarWindow, StrategyContext
@@ -48,6 +49,7 @@ class BacktestResult:
     trades: pl.DataFrame
     positions: dict[str, float]  # open at the end
     marks: dict[str, float] = field(default_factory=dict)  # last close per symbol
+    halted: str = ""  # why the kill switch stopped trading, if it did
 
 
 class _Stream:
@@ -94,6 +96,7 @@ class BacktestEngine:
         costs: CostModel,
         risk: RiskLimits,
         rules: RebalanceRules,
+        guard: GuardConfig | None = None,
     ) -> None:
         self.slots = list(slots)
         self.streams = {key: _Stream(frame, key[1]) for key, frame in bars.items()}
@@ -115,6 +118,10 @@ class BacktestEngine:
         self.marks: dict[str, float] = {}
         self.pending: list[PendingOrder] = []
         self.records: list[tuple[datetime, float, float, float]] = []
+        # The session's guard on the same equity. Nobody resumes a backtest, so a halt
+        # lasts to the end: that is what an unattended bot would have done.
+        self.guard = RiskGuard(guard) if guard else None
+        self.halted = ""
 
     def run(self) -> BacktestResult:
         events = np.unique(np.concatenate([s.close_ms for s in self.streams.values()]))
@@ -126,9 +133,21 @@ class BacktestEngine:
             now = from_millis(now_ms)
             if trading:
                 self._record(now)
-            if self._run_strategies(now, revealed) and trading:
-                self._rebalance(now_ms, revealed)
+            updated = self._run_strategies(now, revealed)
+            mode = self._check_guard(now, now_ms) if trading else Mode.NORMAL
+            if updated and trading and mode != Mode.HALT:
+                self._rebalance(now_ms, revealed, mode)
         return self._result()
+
+    def _check_guard(self, now: datetime, now_ms: int) -> Mode:
+        if self.guard is None:
+            return Mode.NORMAL
+        decision = self.guard.check(now, self.portfolio.equity(self.marks), now)
+        if decision.mode == Mode.HALT:
+            self.halted = self.halted or f"{now:%Y-%m-%d %H:%M}: {decision.reason}"
+            positions = self.portfolio.positions.items()
+            self.pending = [PendingOrder(now_ms, s, -q) for s, q in positions if q]
+        return decision.mode
 
     def _fill_pending(self, revealed: set[StreamKey]) -> None:
         remaining = []
@@ -179,7 +198,7 @@ class BacktestEngine:
             updated = True
         return updated
 
-    def _rebalance(self, now_ms: int, revealed: set[StreamKey]) -> None:
+    def _rebalance(self, now_ms: int, revealed: set[StreamKey], mode: Mode) -> None:
         scales = None
         if self.risk.target_volatility:
             scales = {
@@ -194,6 +213,8 @@ class BacktestEngine:
         orders = decide_orders(
             self.slots, self.portfolio, self.marks, self.risk, self.rules, scales
         )
+        if mode == Mode.REDUCE_ONLY:
+            orders = RiskGuard.filter_orders(orders, self.portfolio.positions, mode)
         fresh = {symbol for symbol, key in self.exec_keys.items() if key in revealed}
         kept = [order for order in self.pending if order.symbol not in fresh]
         self.pending = kept + [PendingOrder(now_ms, s, q) for s, q in orders.items() if s in fresh]
@@ -254,4 +275,5 @@ class BacktestEngine:
             trades=trades,
             positions=dict(self.portfolio.positions),
             marks=dict(self.marks),
+            halted=self.halted,
         )

@@ -23,6 +23,7 @@ log = structlog.get_logger(__name__)
 PRODUCTION_URL = "https://api.binance.com"
 TESTNET_URL = "https://testnet.binance.vision"
 RETRY_STATUS = frozenset({418, 429, 500, 502, 503, 504})
+MAX_RETRY_WAIT = 30.0  # seconds; a longer Retry-After (an IP ban) fails at once
 ORDER_NOT_FOUND = -2013
 NOTHING_TO_CANCEL = -2011
 TIMESTAMP_OUTSIDE_WINDOW = -1021
@@ -213,8 +214,12 @@ class BinanceSpot:
             query = self._sign(params) if signed else urlencode(params)
             url = f"{self.base_url}{path}?{query}" if query else f"{self.base_url}{path}"
             response = await self.client.request(method, url, headers=headers, timeout=15.0)
-            if response.status_code in RETRY_STATUS and attempt < attempts - 1:
-                delay = float(response.headers.get("Retry-After", 2**attempt))
+            delay = float(response.headers.get("Retry-After", 2**attempt))
+            if (
+                response.status_code in RETRY_STATUS
+                and attempt < attempts - 1
+                and delay <= MAX_RETRY_WAIT  # waiting longer would stall every bar
+            ):
                 log.warning("binance_retry", path=path, status=response.status_code, delay=delay)
                 await asyncio.sleep(delay)
                 attempt += 1
@@ -262,8 +267,19 @@ class BinanceSpot:
 
     # account
 
+    async def account(self) -> dict[str, Any]:
+        """Raw account information: balances, canTrade, permissions."""
+        data: dict[str, Any] = await self._request("GET", "/api/v3/account", signed=True)
+        return data
+
+    async def api_restrictions(self) -> dict[str, Any]:
+        """What this API key may do, e.g. enableWithdrawals. Production only."""
+        path = "/sapi/v1/account/apiRestrictions"
+        data: dict[str, Any] = await self._request("GET", path, signed=True)
+        return data
+
     async def balances(self) -> dict[str, Balance]:
-        data = await self._request("GET", "/api/v3/account", signed=True)
+        data = await self.account()
         result = {}
         for item in data["balances"]:
             balance = Balance(item["asset"], float(item["free"]), float(item["locked"]))

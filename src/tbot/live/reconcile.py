@@ -8,13 +8,13 @@ Two ownership modes:
   both ways.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Literal
 
 import structlog
 
-from tbot.exchange.binance import BinanceSpot
+from tbot.exchange.binance import Balance, BinanceSpot
 from tbot.live.ledger import Adjustment, Ledger
 from tbot.monitoring.telegram import Notifier
 from tbot.portfolio.portfolio import Portfolio
@@ -35,9 +35,15 @@ async def reconcile(
     tolerance: float,
     ownership: Ownership = "account",
     label: str = "live",
+    balances: Mapping[str, Balance] | None = None,
 ) -> list[Adjustment]:
-    """Move the book to the exchange where they differ beyond tolerance; record why."""
-    balances = await spot.balances()
+    """Move the book to the exchange where they differ beyond tolerance; record why.
+
+    In budget mode the book only moves down to the exchange, never below zero: a book
+    that went negative (a fill booked twice) is set back to zero.
+    """
+    if balances is None:
+        balances = await spot.balances()
     quotes = {spot.rules[s].quote for s in symbols}
     if len(quotes) != 1:
         raise ValueError(f"all symbols must share one quote asset, got {sorted(quotes)}")
@@ -48,21 +54,21 @@ async def reconcile(
         base = spot.rules[symbol].base
         held = balances[base].total if base in balances else 0.0
         booked = portfolio.position(symbol)
+        target = _target(booked, held, ownership)  # coins beyond the book are the owner's
         step = float(spot.rules[symbol].step_size)
-        if abs(held - booked) <= max(step, tolerance * max(abs(held), abs(booked))):
+        if abs(target - booked) <= max(step, tolerance * max(abs(target), abs(booked))):
             continue
-        if ownership == "budget" and held > booked:
-            continue  # the owner's own coins
         note = f"{symbol} position: book {booked:.6f}, exchange {held:.6f}"
-        adjustments.append(Adjustment(now, symbol, held - booked, 0.0, note))
+        adjustments.append(Adjustment(now, symbol, target - booked, 0.0, note))
 
-    cash = balances[quote].free if quote in balances else 0.0
-    beyond = abs(cash - portfolio.cash) > max(
-        CASH_TOLERANCE, tolerance * max(abs(cash), abs(portfolio.cash))
-    )
-    if beyond and not (ownership == "budget" and cash > portfolio.cash):
+    # Locked quote counts too: an open buy order of the owner's does not shrink the book.
+    cash = balances[quote].total if quote in balances else 0.0
+    target = _target(portfolio.cash, cash, ownership)
+    if abs(target - portfolio.cash) > max(
+        CASH_TOLERANCE, tolerance * max(abs(target), abs(portfolio.cash))
+    ):
         note = f"cash: book {portfolio.cash:.2f}, exchange {cash:.2f}"
-        adjustments.append(Adjustment(now, "", 0.0, cash - portfolio.cash, note))
+        adjustments.append(Adjustment(now, "", 0.0, target - portfolio.cash, note))
 
     for adjustment in adjustments:
         portfolio.adjust(adjustment.symbol, adjustment.quantity, adjustment.cash)
@@ -73,3 +79,9 @@ async def reconcile(
         lines = "\n".join(a.note for a in adjustments)
         await notifier.send(f"[{label}] book adjusted to the exchange:\n{lines}")
     return adjustments
+
+
+def _target(booked: float, held: float, ownership: Ownership) -> float:
+    if ownership == "account":
+        return held
+    return max(0.0, min(booked, held))

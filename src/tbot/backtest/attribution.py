@@ -3,9 +3,11 @@
 from dataclasses import dataclass
 
 import numpy as np
+import polars as pl
 
 from tbot.backtest.config import BacktestConfig
-from tbot.backtest.metrics import Metrics, compute_metrics, daily_returns
+from tbot.backtest.engine import BacktestResult
+from tbot.backtest.metrics import Metrics, compute_metrics
 from tbot.backtest.runner import run_backtest
 from tbot.data.store import BarStore
 
@@ -26,24 +28,30 @@ class Attribution:
 def run_attribution(config: BacktestConfig, store: BarStore) -> Attribution:
     """Run every strategy on its own with full capital, then the configured combination."""
     rows = []
-    solo_returns = []
+    solo_returns: list[pl.DataFrame] = []
     for strategy in config.strategies:
         solo = config.model_copy(
             update={"strategies": [strategy.model_copy(update={"allocation": 1.0})]}
         )
         result = run_backtest(solo, store)
         rows.append(AttributionRow(strategy.name, strategy.allocation, compute_metrics(result)))
-        solo_returns.append(daily_returns(result))
+        solo_returns.append(_dated_returns(result, f"r{len(solo_returns)}"))
     combined = run_backtest(config, store)
     rows.append(AttributionRow("combined", 1.0, compute_metrics(combined)))
 
-    length = min(len(r) for r in solo_returns)
-    matrix = (
-        np.corrcoef(np.vstack([r[:length] for r in solo_returns]))
-        if len(rows) > 2
-        else np.ones((1, 1))
-    )
+    matrix = np.ones((1, 1))
+    if len(rows) > 2:
+        joined = solo_returns[0]
+        for frame in solo_returns[1:]:  # only days every run has, paired by date
+            joined = joined.join(frame, on="day", how="inner")
+        matrix = np.corrcoef(joined.drop("day").to_numpy().T)
     return Attribution(rows, np.atleast_2d(matrix).tolist())
+
+
+def _dated_returns(result: BacktestResult, name: str) -> pl.DataFrame:
+    daily = result.equity.group_by_dynamic("time", every="1d").agg(pl.col("equity").last())
+    previous = daily["equity"].shift(1).fill_null(result.initial_cash)
+    return pl.DataFrame({"day": daily["time"].dt.date(), name: daily["equity"] / previous - 1})
 
 
 def format_attribution(attribution: Attribution) -> str:

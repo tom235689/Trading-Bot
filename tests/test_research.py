@@ -1,4 +1,6 @@
+from dataclasses import replace
 from datetime import UTC, date, datetime
+from itertools import pairwise
 from pathlib import Path
 
 import polars as pl
@@ -12,11 +14,13 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.research.report import format_report
 from tbot.research.sweep import (
+    SweepRun,
     best_run,
     grid_points,
     neighborhood_mean,
     rank_of,
     run_sweep,
+    select_run,
     sweep_table,
 )
 from tbot.research.trials import TrialLog
@@ -107,6 +111,26 @@ def test_no_trade_runs_rank_last(data_dir: Path) -> None:
     assert sweep_table(runs, "sharpe")["entry"].to_list() == [5, 10_000]
     assert rank_of(runs, {"entry": 10_000, "exit": 3}, "sharpe") == 2
     assert best_run(runs, "sharpe", min_trades=1) is runs[0]
+
+
+def test_neighborhood_selection_prefers_a_plateau(data_dir: Path) -> None:
+    grid = {"entry": [5, 10, 15, 20, 25]}
+    runs = run_sweep(BASE, grid, data_dir)
+    scores = [2.0, 0.5, 1.4, 1.5, 1.2]  # a lone peak at the edge, a plateau around 20
+
+    def scored(trades: dict[int, int]) -> list[SweepRun]:
+        return [
+            replace(run, metrics=replace(run.metrics, sharpe=score, trades=trades.get(i, 10)))
+            for i, (run, score) in enumerate(zip(runs, scores, strict=True))
+        ]
+
+    assert select_run(scored({}), grid, "sharpe", 1, "best").params == {"entry": 5}
+    # Neighborhood means: 1.25, 1.30, 1.13, 1.37, 1.35.
+    assert select_run(scored({}), grid, "sharpe", 1, "neighborhood").params == {"entry": 20}
+    # A point that does not qualify itself is never picked, whatever its neighbors do.
+    assert select_run(scored({3: 0}), grid, "sharpe", 1, "neighborhood").params != {"entry": 20}
+    with pytest.raises(ValueError, match="no parameter set"):
+        select_run(scored({}), grid, "sharpe", 10**6, "neighborhood")
 
 
 def test_walk_forward_step_must_match_test_length() -> None:
@@ -212,3 +236,14 @@ def test_validate_command(
     assert code in (0, 1)
     assert "8. Gate" in out
     assert (data_dir / "trials.jsonl").exists()
+
+
+def test_windows_do_not_drift_after_short_months() -> None:
+    plan = windows(date(2018, 1, 31), date(2018, 7, 1), 1, 1)
+    tests = [(w.train_end, w.test_end) for w in plan]
+    assert tests[:3] == [
+        (date(2018, 2, 28), date(2018, 3, 31)),
+        (date(2018, 3, 31), date(2018, 4, 30)),
+        (date(2018, 4, 30), date(2018, 5, 31)),
+    ]
+    assert all(a[1] == b[0] for a, b in pairwise(tests))

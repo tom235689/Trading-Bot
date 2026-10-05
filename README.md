@@ -55,15 +55,17 @@ uv run tbot validate config/donchian_voltarget_validation.yaml
 
 Runs the in-sample baseline, cost stress, parameter sweep, walk-forward, Monte Carlo, deflated Sharpe, and a single holdout evaluation, then checks the promotion gate. Exit code 1 means the gate failed. Every backtest is appended to `data/trials.jsonl`; keep that file, it is the record of how many things were tried. See [docs/reports/](docs/reports/).
 
-**Status**: no configuration has passed the gate yet. The best candidate, Donchian trend with volatility targeting 0.4, misses the out-of-sample drawdown limit by two points ([report](docs/reports/donchian_voltarget_2026-09-29.md)). The paper, testnet, and live configs all use exactly its trading settings, so paper rehearses what would go live.
+**Status**: no configuration has passed the gate. The best candidate, Donchian trend with volatility targeting 0.4, fails it on out-of-sample Sharpe (0.79) and drawdown (-43.5%) after the validation tools were corrected; its in-sample edge is still significant after 115 logged trials ([report](docs/reports/donchian_voltarget_2026-10-05.md)). Expect drawdowns around 28% in a typical stretch and over 40% in a bad one. The paper, testnet, and live configs all use exactly its trading settings, so paper rehearses what would go live.
 
 ## Paper trading
 
 ```sh
 cp .env.example .env                    # optional: Telegram and heartbeat settings
 uv run tbot notify                      # sends a test Telegram message
+uv run tbot doctor config/paper.yaml    # alerts, ledger, network, clock: fix FAIL lines first
 uv run tbot paper config/paper.yaml     # runs until Ctrl+C; logs to logs/paper.jsonl
 uv run tbot status config/paper.yaml    # equity, positions, recent fills and events
+uv run tbot compare config/paper.yaml   # the same period through the backtest: does it track?
 uv run tbot dashboard config/paper.yaml # reports/paper.html
 ```
 
@@ -77,7 +79,8 @@ The bot syncs the bar store, rebuilds its book from the ledger (`data/paper.sqli
 
 ```sh
 # .env: TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET (testnet keys from testnet.binance.vision)
-uv run tbot account config/testnet.yaml          # balances and open orders: checks the keys
+uv run tbot doctor config/testnet.yaml           # keys, trading permission, budget, alerts
+uv run tbot account config/testnet.yaml          # balances and open orders
 uv run tbot live config/testnet.yaml             # real order path, fake money
 uv run tbot live config/live.yaml --live         # real money; the flag is mandatory
 uv run tbot status config/live.yaml
@@ -88,20 +91,21 @@ uv run tbot resume config/live.yaml              # clear the kill switch; a runn
 
 **Before real money**:
 
-- API key with spot trading only and withdrawals off. Restrict it to your IP only if the IP is static; otherwise every signed call fails after your provider changes it.
+- API key with spot trading only and withdrawals off. Restrict it to your IP only if the IP is static; otherwise every signed call fails after your provider changes it. `tbot doctor config/live.yaml` reads the key's permissions and fails if it can withdraw.
 - Windows time sync on. The bot measures the offset to Binance and warns above one second.
 - A supervisor that restarts the bot (below), Telegram, and the heartbeat.
-- Two weeks of paper and a testnet run without surprises.
+- Two weeks of paper and a testnet run without surprises: `tbot compare` says the paper run tracks the backtest. A gap in fills or prices means the backtest, and so the validation, is too optimistic.
+- `tbot doctor config/live.yaml` reports 0 problems.
 
 Every position carries an exchange-side stop `protective_stop_pct` below the last close, so a dead bot still has bounded loss. The stop's limit sits 0.5% under the trigger; in a gap through both it may not fill.
 
 ## Running unattended
 
 - **Working directory**: `.env`, `data/`, `logs/`, and the ledger paths are relative to it. Always start the bot from the repository root, for example `uv --directory D:\Project\Trading-Bot run python -m tbot paper config/paper.yaml`.
-- **Supervisor**: in Task Scheduler, create a task that starts at log on or at startup, runs that command, runs whether the user is logged on or not, and under Settings restarts every minute if the task fails. The bot exits with code 1 on a crash or a failed start and sends a Telegram alert either way.
+- **Supervisor**: from an elevated PowerShell, `powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1 -Config config\paper.yaml` (add `-Live` for real money, `-DryRun` to only show the task) registers a task that starts at boot, whether anyone is logged on or not, and runs `scripts\run_bot.ps1`. That script starts the bot again after a crash or a failed start (exit code 1, each one alerted on Telegram), first after a minute and then after twice the previous wait, up to 15 minutes. A stop on purpose (exit code 0) or a second process on the same ledger (exit code 2) ends it. Task Scheduler's own restart option does not help here: it only covers a task that fails to launch. Start the task once with `Start-ScheduledTask -TaskName "tbot paper"`.
 - **One process per ledger**: a second session on the same config refuses to start. Paper and testnet can run side by side; they share `data/` safely.
 - **Stopping**: Ctrl+C lets an event in progress finish its orders. Stopping never sells anything; exchange stops stay in place. After a hard kill or a reboot, the next start books any order whose result was not recorded and reconciles with the exchange.
-- **Kill switch**: a 15% drawdown from the peak sells everything and halts. It stays halted across restarts until `tbot resume`, which also restarts the drawdown count from the current equity.
+- **Kill switch**: a 45% drawdown from the peak sells everything and halts (`guard.max_drawdown`). It sits beyond the strategy's normal drawdowns so that it catches a broken strategy, not a bad month; at 15% the backtest halts in November 2018 and never trades again. It stays halted across restarts until `tbot resume`, which also restarts the drawdown count from the current equity. `initial_cash` is still the most the bot can lose.
 - **Deposits and withdrawals**: in budget mode extra money in the account is ignored. Taking out more than the bot's cash shrinks its book, and the guard treats that as a transfer, not a loss.
 - **Logs**: `logs/<mode>.jsonl` rotates at 20 MB with 5 backups. If the supervisor also captures the console, rotate that file too.
 

@@ -81,7 +81,18 @@ def sync(
         # One probe first, so a start before the listing costs a request, not a download.
         earliest = first_open_time(client, symbol, timeframe, start, first)
         if earliest is not None:
-            _download(store, client, symbol, timeframe, earliest, first, workers, progress, counts)
+            _download(
+                store,
+                client,
+                symbol,
+                timeframe,
+                earliest,
+                first,
+                workers,
+                progress,
+                counts,
+                hold=True,
+            )
     begin = last + timeframe.delta if last is not None else start
     _download(
         store, client, symbol, timeframe, begin, timeframe.floor(now), workers, progress, counts
@@ -110,10 +121,24 @@ def _download(
     workers: int,
     progress: Callable[[str], None],
     counts: list[int],
+    *,
+    hold: bool = False,
 ) -> None:
-    """Store bars with open_time in [begin, end): archives for complete months, then REST."""
+    """Store bars with open_time in [begin, end): archives for complete months, then REST.
+
+    With hold, nothing is written until everything is fetched: a backfill that fails
+    halfway would otherwise leave a hole the next sync cannot see.
+    """
     if begin >= end:
         return
+    held: list[pl.DataFrame] = []
+
+    def keep(bars: pl.DataFrame) -> tuple[int, int]:
+        if not hold:
+            return store_aligned(store, symbol, timeframe, bars)
+        kept = bars.filter(aligned(timeframe))
+        held.append(kept)
+        return kept.height, bars.height - kept.height
 
     def fetch(year_month: tuple[int, int]) -> pl.DataFrame | None:
         return fetch_month(client, symbol, timeframe, *year_month)
@@ -134,7 +159,7 @@ def _download(
             if not frames:
                 continue
             bars = pl.concat(frames).filter(pl.col("open_time") >= begin, pl.col("open_time") < end)
-            written, skipped = store_aligned(store, symbol, timeframe, bars)
+            written, skipped = keep(bars)
             counts[0] += written
             counts[2] += skipped
             latest = bars["open_time"].max()
@@ -153,7 +178,9 @@ def _download(
         ranges.append((covered, end))
     for range_start, range_end in ranges:
         bars = fetch_klines(client, symbol, timeframe, range_start, range_end)
-        written, skipped = store_aligned(store, symbol, timeframe, bars)
+        written, skipped = keep(bars)
         counts[1] += written
         counts[2] += skipped
         progress(f"{symbol} {timeframe}: {written} bars from REST")
+    if held:
+        store.write(symbol, timeframe, pl.concat(held))

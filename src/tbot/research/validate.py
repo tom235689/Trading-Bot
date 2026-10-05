@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import numpy as np
 import numpy.typing as npt
@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from tbot.backtest.config import BacktestConfig, load_config
 from tbot.backtest.metrics import DAYS_PER_YEAR, Metrics, compute_metrics, daily_returns
-from tbot.research.montecarlo import MonteCarloSummary, simulate, trade_returns_on_equity
+from tbot.research.montecarlo import MonteCarloSummary, simulate
 from tbot.research.statistics import daily_sharpe, deflated_sharpe, expected_max_sharpe, moments
 from tbot.research.sweep import (
     OBJECTIVES,
@@ -50,7 +50,7 @@ class MonteCarloConfig(BaseModel):
 
     runs: int = Field(default=2000, ge=100)
     seed: int = 1
-    replace: bool = False  # True bootstraps trades with replacement instead of shuffling
+    block_days: int = Field(default=20, ge=1)  # resampled together, keeping streaks
 
 
 class GateConfig(BaseModel):
@@ -71,6 +71,9 @@ class ValidationConfig(BaseModel):
     grid: dict[str, list[Any]] = Field(min_length=1)
     objective: str = "sharpe"
     min_trades: int = Field(default=30, ge=1)  # runs with fewer trades cannot be selected
+    # How walk-forward picks params on each train window: the single best grid point, or
+    # the one whose neighbors do best on average.
+    selection: Literal["best", "neighborhood"] = "best"
     walk_forward: WalkForwardConfig = WalkForwardConfig()
     monte_carlo: MonteCarloConfig = MonteCarloConfig()
     cost_multiplier: float = Field(default=2.0, ge=1)
@@ -158,8 +161,9 @@ def run_validation(
     progress("baseline and cost stress")
     baseline_result, baseline = evaluate(in_sample, data_dir)
     baseline_record = make_record(in_sample, baseline, "baseline")
-    _, stress = evaluate(in_sample.with_cost_multiplier(config.cost_multiplier), data_dir)
-    log.append([baseline_record, make_record(in_sample, stress, "stress")])
+    stressed = in_sample.with_cost_multiplier(config.cost_multiplier)
+    _, stress = evaluate(stressed, data_dir)
+    log.append([baseline_record, make_record(stressed, stress, "stress")])
 
     progress(f"parameter sweep over {math.prod(len(v) for v in config.grid.values())} points")
     runs = run_sweep(in_sample, config.grid, data_dir, workers=workers)
@@ -177,6 +181,7 @@ def run_validation(
         step_months=wf.step_months,
         objective=objective,
         min_trades=min_trades,
+        selection=config.selection,
         workers=workers,
     )
     for window in walk.windows:
@@ -187,10 +192,10 @@ def run_validation(
     progress("Monte Carlo and deflated Sharpe")
     mc = config.monte_carlo
     monte_carlo = simulate(
-        trade_returns_on_equity(baseline_result),
+        daily_returns(baseline_result),
         runs=mc.runs,
         seed=mc.seed,
-        replace=mc.replace,
+        block_days=mc.block_days,
         drawdown_limit=config.gate.max_drawdown,
     )
     deflated = _deflated(daily_returns(baseline_result), log.selection_sharpes(baseline_record))
@@ -198,7 +203,8 @@ def run_validation(
     progress("holdout")
     holdout_config = base.with_period(config.holdout_start, base.end)
     _, holdout = evaluate(holdout_config, data_dir)
-    log.append([make_record(holdout_config, holdout, "holdout")])
+    holdout_record = make_record(holdout_config, holdout, "holdout")
+    log.append([holdout_record])
 
     return ValidationReport(
         config=config,
@@ -213,7 +219,7 @@ def run_validation(
         monte_carlo=monte_carlo,
         deflated=deflated,
         holdout=holdout,
-        holdout_evaluations=log.count(strategy.name, "holdout"),
+        holdout_evaluations=log.holdout_looks(holdout_record, config.holdout_start),
         gate=_gate(config, oos, stress, holdout),
     )
 
@@ -239,14 +245,16 @@ def _plateau(
 
 
 def _deflated(returns: npt.NDArray[np.float64], annual_sharpes: list[float]) -> DeflatedSharpe:
-    trials = [daily_sharpe(s) for s in annual_sharpes]
+    # A trial without a Sharpe (no trades) still counts as an attempt, not in the spread.
+    trials = [daily_sharpe(s) for s in annual_sharpes if math.isfinite(s)]
     variance = float(np.var(trials, ddof=1)) if len(trials) > 1 else 0.0
     std = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
     sharpe = float(returns.mean()) / std if std > 0 else math.nan
     skew, kurt = moments(returns)
-    probability = deflated_sharpe(sharpe, len(returns), skew, kurt, variance, len(trials))
-    luck = expected_max_sharpe(variance, len(trials)) * math.sqrt(DAYS_PER_YEAR)
-    return DeflatedSharpe(len(trials), probability, luck)
+    count = len(annual_sharpes)
+    probability = deflated_sharpe(sharpe, len(returns), skew, kurt, variance, count)
+    luck = expected_max_sharpe(variance, count) * math.sqrt(DAYS_PER_YEAR)
+    return DeflatedSharpe(count, probability, luck)
 
 
 def _gate(

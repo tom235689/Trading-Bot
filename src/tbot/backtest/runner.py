@@ -7,8 +7,10 @@ import polars as pl
 
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import BacktestEngine, BacktestResult, StreamKey
+from tbot.core.config import TradingConfig
 from tbot.data.store import BarStore
 from tbot.portfolio.allocation import StrategySlot, build_slots
+from tbot.risk.guard import GuardConfig
 from tbot.risk.limits import RiskLimits
 from tbot.risk.volatility import lookback_bars as volatility_bars
 
@@ -42,8 +44,20 @@ def history_bars(slots: Sequence[StrategySlot], risk: RiskLimits) -> dict[Stream
 
 
 def run_backtest(config: BacktestConfig, store: BarStore) -> BacktestResult:
-    start = _utc(config.start)
     end = _utc(config.end) if config.end else None
+    return run_period(config, store, _utc(config.start), end, config.guard)
+
+
+def run_period(
+    config: TradingConfig,
+    store: BarStore,
+    start: datetime,
+    end: datetime | None,
+    guard: GuardConfig | None = None,
+) -> BacktestResult:
+    """Trade config's settings from the first bar close at or after start; end excludes bars
+    opening at or after it. Without an end, every stream stops at the earliest last close,
+    so none is valued at a stale price while the others move on."""
     slots = build_slots(config.strategies)
 
     bars: dict[StreamKey, pl.DataFrame] = {}
@@ -52,6 +66,12 @@ def run_backtest(config: BacktestConfig, store: BarStore) -> BacktestResult:
         if frame.is_empty():
             raise ValueError(f"no stored bars for {symbol} {timeframe}; run `tbot download`")
         bars[(symbol, timeframe)] = frame
+    if end is None:
+        common = min(_last_close(key, frame) for key, frame in bars.items())
+        bars = {
+            key: frame.filter(pl.col("open_time") + key[1].delta <= common)
+            for key, frame in bars.items()
+        }
 
     engine = BacktestEngine(
         slots,
@@ -61,5 +81,12 @@ def run_backtest(config: BacktestConfig, store: BarStore) -> BacktestResult:
         costs=config.costs,
         risk=config.risk,
         rules=config.rebalance,
+        guard=guard,
     )
     return engine.run()
+
+
+def _last_close(key: StreamKey, frame: pl.DataFrame) -> datetime:
+    last = frame["open_time"].max()
+    assert isinstance(last, datetime)
+    return last + key[1].delta

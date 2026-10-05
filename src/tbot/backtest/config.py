@@ -8,6 +8,7 @@ import yaml
 from pydantic import model_validator
 
 from tbot.core.config import StrategyConfig, TradingConfig
+from tbot.risk.guard import GuardConfig
 
 __all__ = ["BacktestConfig", "StrategyConfig", "load_config"]
 
@@ -15,6 +16,7 @@ __all__ = ["BacktestConfig", "StrategyConfig", "load_config"]
 class BacktestConfig(TradingConfig):
     start: date
     end: date | None = None  # exclusive; None runs to the latest stored bar
+    guard: GuardConfig | None = None  # the session guard; None trades without one
 
     @model_validator(mode="after")
     def check_period(self) -> Self:

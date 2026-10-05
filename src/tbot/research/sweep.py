@@ -19,6 +19,7 @@ from tbot.data.store import BarStore
 Grid = Mapping[str, Sequence[Any]]
 
 OBJECTIVES = ("sharpe", "sortino", "cagr", "calmar", "total_return")
+SELECTIONS = ("best", "neighborhood")  # how walk-forward picks params on a train window
 TABLE_METRICS = ("total_return", "cagr", "sharpe", "sortino", "max_drawdown", "trades", "fees")
 
 
@@ -78,6 +79,26 @@ def best_run(runs: Sequence[SweepRun], objective: str, min_trades: int) -> Sweep
     if scores[index] == -math.inf:
         raise ValueError(f"no parameter set has {min_trades} trades and a finite {objective}")
     return runs[index]
+
+
+def select_run(
+    runs: Sequence[SweepRun], grid: Grid, objective: str, min_trades: int, selection: str
+) -> SweepRun:
+    """The run to trade next: the best qualifying objective, or for `neighborhood` the
+    qualifying run whose grid neighbors do best on average (a plateau, not a lone peak)."""
+    if selection == "best":
+        return best_run(runs, objective, min_trades)
+    if selection != "neighborhood":
+        raise ValueError(f"selection must be one of {SELECTIONS}")
+    qualifying = [
+        run for run in runs if math.isfinite(objective_value(run.metrics, objective, min_trades))
+    ]
+    if not qualifying:
+        raise ValueError(f"no parameter set has {min_trades} trades and a finite {objective}")
+    return max(
+        qualifying,
+        key=lambda run: neighborhood_mean(runs, grid, run.params, objective, min_trades),
+    )
 
 
 def sweep_table(runs: Sequence[SweepRun], objective: str) -> pl.DataFrame:

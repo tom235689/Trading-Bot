@@ -158,6 +158,7 @@ class LiveExecutor:
         self.fee_rate = fee_rate
         self.protective_stop_pct = protective_stop_pct
         self.label = label
+        self.unprotected: set[str] = set()  # held symbols whose stop is missing
 
     async def execute(
         self,
@@ -183,6 +184,14 @@ class LiveExecutor:
                 log.error("order_failed", symbol=symbol, quantity=quantity, error=repr(exc))
                 self.ledger.add_order(now, symbol, quantity, "failed", repr(exc), client_id)
                 await self.notifier.send(f"[{self.label}] order failed for {symbol}: {exc}")
+                continue
+            except Exception as exc:  # unexpected: the order may be out, so it is looked up
+                log.exception("order_error", symbol=symbol, client_order_id=client_id)
+                self.ledger.add_order(now, symbol, quantity, "unknown", repr(exc), client_id)
+                await self.notifier.send(
+                    f"[{self.label}] order error for {symbol}: {exc!r}; it is looked up again "
+                    f"before the next reconciliation"
+                )
                 continue
             if fill is not None:
                 fills.append(fill)
@@ -211,27 +220,26 @@ class LiveExecutor:
             # Spend neither more than the account holds nor more than the book's own cash:
             # with budget ownership the rest of the account is the owner's money.
             free = balances[rules.quote].free if rules.quote in balances else 0.0
-            spendable = min(free, portfolio.cash)
+            spendable = max(0.0, min(free, portfolio.cash))
             quantity = min(quantity, spendable / (reference * (1 + self.fee_rate + BUY_MARGIN)))
         else:
+            # Never sell more than the book holds: in budget mode the rest is the owner's,
+            # and a stop booked by cancel_stops above may have sold part of it already.
             free = balances[rules.base].free if rules.base in balances else 0.0
-            quantity = max(quantity, -free)
+            quantity = max(quantity, -max(portfolio.position(symbol), 0.0), -free)
         quantity = rules.round_quantity(quantity)
         if quantity == 0 or not rules.acceptable(quantity, reference):
             self.ledger.add_order(now, symbol, quantity, "skipped", "below exchange minimum")
             return None
         self.ledger.add_order(now, symbol, quantity, "pending", "", client_id)  # write-ahead
         order = await self._place(symbol, quantity, client_id)
-        if order is None:
-            self.ledger.add_order(now, symbol, quantity, "failed", "not on exchange", client_id)
-            return None
         return await self._book(order, rules, now, quantity, reference, portfolio, client_id)
 
-    async def _place(self, symbol: str, quantity: float, client_id: str) -> Order | None:
+    async def _place(self, symbol: str, quantity: float, client_id: str) -> Order:
         """Send the order. When the answer leaves its fate open, ask the exchange by client id.
 
-        Returns None only when the exchange says it never saw the order; raises
-        OrderUnknown when it cannot be asked.
+        Raises OrderUnknown when the lookups find nothing: an order whose send status was
+        unknown can still appear later, so settle() asks again before deciding it failed.
         """
         try:
             return await self.spot.market_order(symbol, quantity, client_id)
@@ -242,7 +250,6 @@ class LiveExecutor:
         except httpx.HTTPError as exc:
             cause = exc
         log.warning("order_send_uncertain", symbol=symbol, error=repr(cause))
-        answered = False
         for delay in LOOKUP_DELAYS:
             await asyncio.sleep(delay)
             try:
@@ -253,10 +260,7 @@ class LiveExecutor:
             if order is not None:
                 log.warning("order_recovered", symbol=symbol, client_order_id=client_id)
                 return order
-            answered = True
-        if answered:
-            return None
-        raise OrderUnknown(f"{symbol} {client_id}: sent, then {cause!r}; lookups failed")
+        raise OrderUnknown(f"{symbol} {client_id}: sent, then {cause!r}; not found yet")
 
     async def _book(
         self,
@@ -274,9 +278,10 @@ class LiveExecutor:
             )
             return None
         fill = await self._to_fill(order, rules)
+        with self.ledger.atomic():  # a crash between the two would book it twice
+            self.ledger.add_fill(fill, reference)
+            self.ledger.add_order(time, order.symbol, fill.quantity, "filled", "", client_id)
         portfolio.apply(fill)
-        self.ledger.add_fill(fill, reference)
-        self.ledger.add_order(time, order.symbol, fill.quantity, "filled", "", client_id)
         return fill
 
     async def _to_fill(self, order: Order, rules: SymbolRules) -> Fill:
@@ -312,17 +317,19 @@ class LiveExecutor:
 
     # outside events: orders in doubt and stops that executed
 
-    async def settle(self, portfolio: Portfolio) -> None:
-        """Book what happened on the exchange between events. Run before reconciling."""
+    async def settle(self, portfolio: Portfolio) -> int:
+        """Book what happened on the exchange between events; return the fills booked."""
+        booked = 0
         for record in self.ledger.unresolved_orders():
             if record.symbol not in self.spot.rules:  # no longer traded: the operator decides
                 log.warning("unresolved_order_skipped", symbol=record.symbol)
                 continue
-            await self._resolve(record, portfolio)
+            booked += await self._resolve(record, portfolio)
         for symbol in self.spot.rules:
-            await self._settle_stop(symbol, portfolio)
+            booked += await self._settle_stop(symbol, portfolio)
+        return booked
 
-    async def _resolve(self, record: OrderRecord, portfolio: Portfolio) -> None:
+    async def _resolve(self, record: OrderRecord, portfolio: Portfolio) -> int:
         order = await self.spot.get_order(record.symbol, record.client_id)
         if order is None:
             self.ledger.add_order(
@@ -333,47 +340,61 @@ class LiveExecutor:
                 "not on exchange",
                 record.client_id,
             )
-            return
+            return 0
         if not order.done:
-            return  # still working; asked again next time
+            return 0  # still working; asked again next time
         rules = self.spot.rules[record.symbol]
         price = order.quote_qty / order.executed_qty if order.executed_qty else 0.0
         fill = await self._book(
             order, rules, record.time, record.quantity, price, portfolio, record.client_id
         )
         log.warning("order_resolved", symbol=record.symbol, client_order_id=record.client_id)
-        if fill is not None:
-            await self.notifier.send(
-                f"[{self.label}] booked an order whose result was not recorded: "
-                f"{_fill_summary(fill)}"
-            )
+        if fill is None:
+            return 0
+        await self.notifier.send(
+            f"[{self.label}] booked an order whose result was not recorded: {_fill_summary(fill)}"
+        )
+        return 1
 
-    async def _settle_stop(self, symbol: str, portfolio: Portfolio) -> None:
-        """Book the executed part of this bot's protective stop; forget it once it is done."""
+    async def _settle_stop(self, symbol: str, portfolio: Portfolio) -> int:
+        """Book the executed part of this bot's protective stop; forget it once it is done.
+
+        Returns 1 when it booked a fill.
+        """
         state = self._stop_state(symbol)
         if state is None:
-            return
+            return 0
         order = await self.spot.get_order(symbol, state["id"])
         if order is None:  # never reached the exchange
             self._set_stop_state(symbol, None)
-            return
+            self.unprotected.add(symbol)
+            return 0
         quantity = order.executed_qty - state["qty"]
+        fill = None
         if quantity > 1e-12:
             quote = order.quote_qty - state["quote"]
             price = quote / quantity
             fee = quote * self.fee_rate  # a stop's commission is not in its order record
             fill = Fill(self.clock(), symbol, -quantity, price, fee)
-            portfolio.apply(fill)
-            self.ledger.add_fill(fill, order.stop_price or price)
-            self.ledger.add_order(
-                fill.time, symbol, fill.quantity, "filled", "protective stop", state["id"]
-            )
-            log.warning("stop_executed", symbol=symbol, quantity=quantity, price=price)
-            await self.notifier.send(
-                f"[{self.label}] protective stop sold {quantity:.6f} {symbol} @ {price:,.2f}"
-            )
             state = StopState(id=state["id"], qty=order.executed_qty, quote=order.quote_qty)
-        self._set_stop_state(symbol, None if order.done else state)
+        with self.ledger.atomic():  # booked once, even across a crash
+            if fill is not None:
+                self.ledger.add_fill(fill, order.stop_price or fill.price)
+                self.ledger.add_order(
+                    fill.time, symbol, fill.quantity, "filled", "protective stop", state["id"]
+                )
+            self._set_stop_state(symbol, None if order.done else state)
+        if fill is not None:
+            portfolio.apply(fill)
+        if order.done and portfolio.position(symbol) > 0:
+            self.unprotected.add(symbol)  # cancelled, expired, or only partly executed
+        if fill is None:
+            return 0
+        log.warning("stop_executed", symbol=symbol, quantity=quantity, price=fill.price)
+        await self.notifier.send(
+            f"[{self.label}] protective stop sold {quantity:.6f} {symbol} @ {fill.price:,.2f}"
+        )
+        return 1
 
     def _stop_state(self, symbol: str) -> StopState | None:
         raw = self.ledger.get_meta(STOP_META + symbol)
@@ -408,30 +429,47 @@ class LiveExecutor:
         return count
 
     async def after_event(self, portfolio: Portfolio, marks: Mapping[str, float]) -> None:
+        """Replace every stop at the latest close."""
+        for symbol in self.spot.rules:
+            await self._protect(symbol, portfolio, marks)
+
+    async def protect(self, portfolio: Portfolio, marks: Mapping[str, float]) -> None:
+        """Place stops that are missing: a failed placement, or a stop that ended early."""
+        for symbol in sorted(self.unprotected):
+            await self._protect(symbol, portfolio, marks)
+
+    async def _protect(self, symbol: str, portfolio: Portfolio, marks: Mapping[str, float]) -> None:
         if not self.protective_stop_pct:
+            self.unprotected.discard(symbol)
             return
-        for symbol, rules in self.spot.rules.items():
-            try:
-                await self.cancel_stops(symbol, portfolio)
-                position = portfolio.position(symbol)
-                if position <= 0 or symbol not in marks:
-                    continue
-                balances = await self.spot.balances()
-                free = balances[rules.base].free if rules.base in balances else 0.0
-                quantity = rules.round_quantity(min(position, free))
-                stop = rules.round_price(marks[symbol] * (1 - self.protective_stop_pct))
-                limit = rules.round_price(stop * (1 - STOP_LIMIT_GAP))
-                if quantity == 0 or not rules.acceptable(quantity, limit):
-                    continue
-                client_id = f"{STOP_PREFIX}{symbol}{uuid4().hex[:12]}"
-                self._set_stop_state(symbol, StopState(id=client_id, qty=0.0, quote=0.0))
-                await self.spot.stop_loss_order(symbol, quantity, stop, limit, client_id)
-                log.info("stop_placed", symbol=symbol, quantity=quantity, stop=stop)
-            except (BinanceError, httpx.HTTPError) as exc:
-                log.error("stop_failed", symbol=symbol, error=repr(exc))
+        rules = self.spot.rules[symbol]
+        try:
+            await self.cancel_stops(symbol, portfolio)
+            position = portfolio.position(symbol)
+            if position <= 0 or symbol not in marks:
+                self.unprotected.discard(symbol)
+                return
+            balances = await self.spot.balances()
+            free = balances[rules.base].free if rules.base in balances else 0.0
+            quantity = rules.round_quantity(min(position, free))
+            stop = rules.round_price(marks[symbol] * (1 - self.protective_stop_pct))
+            limit = rules.round_price(stop * (1 - STOP_LIMIT_GAP))
+            if quantity == 0 or not rules.acceptable(quantity, limit):
+                self.unprotected.discard(symbol)  # dust: nothing an exchange stop can hold
+                return
+            client_id = f"{STOP_PREFIX}{symbol}{uuid4().hex[:12]}"
+            self._set_stop_state(symbol, StopState(id=client_id, qty=0.0, quote=0.0))
+            await self.spot.stop_loss_order(symbol, quantity, stop, limit, client_id)
+            self.unprotected.discard(symbol)
+            log.info("stop_placed", symbol=symbol, quantity=quantity, stop=stop)
+        except Exception as exc:  # retried at every reconciliation until it works
+            log.error("stop_failed", symbol=symbol, error=repr(exc))
+            if symbol not in self.unprotected:
                 await self.notifier.send(
-                    f"[{self.label}] protective stop failed for {symbol}: {exc}"
+                    f"[{self.label}] protective stop failed for {symbol}: {exc}; "
+                    f"retrying at every reconciliation"
                 )
+            self.unprotected.add(symbol)
 
 
 class BinanceBookTicker:

@@ -178,3 +178,12 @@ def test_timestamp_error_resyncs_the_clock_and_signs_again() -> None:
 
     assert asyncio.run(go()) == 1000.0
     assert resyncs == [1]
+
+
+def test_a_long_ban_fails_at_once_instead_of_stalling_the_bot() -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={"BTCUSDT": 50000.0})
+    fake.fail_next = [httpx.Response(418, headers={"Retry-After": "7200"})]  # an IP ban
+    with pytest.raises(BinanceError) as exc:
+        run(fake, lambda spot: spot.balances())
+    assert exc.value.status == 418
+    assert len(fake.requests) == 1

@@ -8,7 +8,7 @@ from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tbot.core.config import TradingConfig
-from tbot.live.guard import GuardConfig
+from tbot.risk.guard import GuardConfig
 
 
 class SessionConfig(TradingConfig):

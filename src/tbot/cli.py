@@ -23,8 +23,11 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.quality import QualityReport, check_bars
 from tbot.data.store import BarStore
+from tbot.live.clock import ServerClock
+from tbot.live.compare import compare_session, comparison_text
 from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings
-from tbot.live.ledger import LedgerUnavailable
+from tbot.live.doctor import Check, checks_text, run_checks
+from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.runner import AlreadyRunning, account_text, resume, run_live, run_paper, status_text
 from tbot.monitoring.dashboard import DashboardData, from_backtest, from_ledger, render
 from tbot.monitoring.logging import configure_logging
@@ -56,9 +59,9 @@ def config_kind(raw: dict[str, Any]) -> str:
     if "backtest" in raw and "grid" in raw:
         return "a validation config (tbot validate)"
     if "mode" in raw:
-        return "a testnet or live config (tbot live, account, status, resume, dashboard)"
+        return "a testnet or live config (tbot live, doctor, account, status, compare, resume, ...)"
     if "ledger" in raw:
-        return "a paper config (tbot paper, status, resume, dashboard)"
+        return "a paper config (tbot paper, doctor, status, compare, resume, dashboard)"
     if "start" in raw:
         return "a backtest config (tbot backtest)"
     return "not a tbot config"
@@ -163,6 +166,17 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("config", type=Path)
     status.add_argument("--data-dir", type=Path, default=Path("data"))
 
+    doctor = commands.add_parser(
+        "doctor", help="check keys, permissions, alerts, and the ledger before a session"
+    )
+    doctor.add_argument("config", type=Path)
+
+    compare = commands.add_parser(
+        "compare", help="compare a session with a backtest of the same settings and period"
+    )
+    compare.add_argument("config", type=Path)
+    compare.add_argument("--data-dir", type=Path, default=Path("data"))
+
     resume_cmd = commands.add_parser("resume", help="clear the kill switch of a session")
     resume_cmd.add_argument("config", type=Path)
 
@@ -180,8 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_download(args: argparse.Namespace) -> int:
     store = BarStore(args.data_dir)
-    now = datetime.now(UTC)
     with httpx.Client(timeout=30.0) as client:
+        clock = ServerClock(client)  # a fast local clock would store a bar still open
+        clock.sync()
+        now = clock.now()
         for symbol in args.symbols:
             for timeframe in args.timeframes:
                 result = sync(store, client, symbol, timeframe, args.start, now, progress=print)
@@ -249,6 +265,8 @@ def run_backtest_command(args: argparse.Namespace) -> int:
     print(format_metrics(metrics))
     for symbol, quantity in sorted(result.positions.items()):
         print(f"Open position {symbol} {quantity:.6f}")
+    if result.halted:
+        print(f"Kill switch  {result.halted}; flat from then on")
     if args.attribution:
         print()
         print(format_attribution(run_attribution(config, BarStore(args.data_dir))))
@@ -309,6 +327,29 @@ def run_status_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_doctor_command(args: argparse.Namespace) -> int:
+    config = load_session_config(args.config)
+
+    async def check() -> list[Check]:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            return await run_checks(config, Settings(), client)
+
+    checks = asyncio.run(check())
+    print(checks_text(checks))
+    return 1 if any(c.status == "fail" for c in checks) else 0
+
+
+def run_compare_command(args: argparse.Namespace) -> int:
+    config = existing_ledger(load_session_config(args.config))
+    with Ledger(config.ledger) as ledger:
+        try:
+            comparison = compare_session(config, ledger, BarStore(args.data_dir))
+        except ValueError as exc:
+            raise SystemExit(f"cannot compare: {exc}") from exc
+    print(comparison_text(comparison, str(config.ledger)))
+    return 0 if not comparison.checks() else 1
+
+
 def run_resume_command(args: argparse.Namespace) -> int:
     print(resume(existing_ledger(load_session_config(args.config))))
     return 0
@@ -352,6 +393,8 @@ COMMANDS = {
     "paper": run_paper_command,
     "live": run_live_command,
     "status": run_status_command,
+    "compare": run_compare_command,
+    "doctor": run_doctor_command,
     "resume": run_resume_command,
     "account": run_account_command,
     "dashboard": run_dashboard_command,

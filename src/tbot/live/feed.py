@@ -5,7 +5,7 @@ after being written to the bar store. The store is the memory of what was seen.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
 
@@ -50,6 +50,7 @@ class LiveFeed:
         poll_seconds: float = 30.0,
         batch_wait: float = 5.0,
         on_stale: Callable[[StreamKey, datetime], None] | None = None,
+        last: Mapping[StreamKey, datetime | None] | None = None,
     ) -> None:
         self.keys = list(keys)
         self.store = store
@@ -61,7 +62,7 @@ class LiveFeed:
         self.batch_wait = batch_wait
         self.on_stale = on_stale
         self.last: dict[StreamKey, datetime | None] = {
-            key: store.last_open_time(*key) for key in self.keys
+            key: last[key] if last is not None else store.last_open_time(*key) for key in self.keys
         }
         self.queue: asyncio.Queue[tuple[StreamKey, pl.DataFrame]] = asyncio.Queue()
         self.reconnects = 0
@@ -70,7 +71,16 @@ class LiveFeed:
     # emission
 
     def _emit(self, key: StreamKey, bars: pl.DataFrame, *, exchange_closed: bool = False) -> int:
-        """Store and queue bars that are new, closed, and on the grid. Return the count.
+        """Store and queue bars that are new, closed, and on the grid. Return the count."""
+        accepted = self._accept(key, bars, exchange_closed=exchange_closed)
+        for row in accepted.iter_slices(1):
+            self.queue.put_nowait((key, row))
+        return accepted.height
+
+    def _accept(
+        self, key: StreamKey, bars: pl.DataFrame, *, exchange_closed: bool = False
+    ) -> pl.DataFrame:
+        """Store the bars that are new, closed, and on the grid, and return them.
 
         The exchange marks socket bars closed itself; REST bars are judged by the clock,
         which must be server-synced or a fast local clock stores a still-open bar.
@@ -83,18 +93,20 @@ class LiveFeed:
         if last is not None:
             bars = bars.filter(pl.col("open_time") > last)
         if bars.is_empty():
-            return 0
+            return bars
         bars = bars.sort("open_time")
         self.store.write(*key, bars)
-        for row in bars.iter_slices(1):
-            self.queue.put_nowait((key, row))
         self.last[key] = bars["open_time"][-1]
         self._stale_reported.discard(key)
-        return bars.height
+        return bars
 
     async def catch_up(self, keys: Sequence[StreamKey] | None = None) -> int:
-        """Fetch bars closed since the last emitted one via REST."""
-        total = 0
+        """Fetch bars closed since the last emitted one via REST.
+
+        They are queued only once every stream is fetched, in close order: a 1h bar queued
+        ahead of the 4h bar closing with it would release that event without it.
+        """
+        items: list[_Item] = []
         for key in keys or self.keys:
             symbol, timeframe = key
             last = self.last[key]
@@ -103,11 +115,14 @@ class LiveFeed:
             if start >= end:
                 continue
             bars = await asyncio.to_thread(fetch_klines, self.client, symbol, timeframe, start, end)
-            count = self._emit(key, bars)
-            if count:
-                log.info("catch_up", symbol=symbol, timeframe=str(timeframe), bars=count)
-            total += count
-        return total
+            accepted = self._accept(key, bars)
+            if accepted.height:
+                log.info("catch_up", symbol=symbol, timeframe=str(timeframe), bars=accepted.height)
+            items.extend(_item(key, row) for row in accepted.iter_slices(1))
+        items.sort(key=lambda item: (item[0], item[1][1].millis, item[1][0]))
+        for _, key, row in items:
+            self.queue.put_nowait((key, row))
+        return len(items)
 
     # tasks
 

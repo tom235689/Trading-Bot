@@ -45,7 +45,10 @@ def format_report(r: ValidationReport) -> str:
     lines.append("")
 
     wf = r.config.walk_forward
-    lines.append(f"4. Walk-forward: train {wf.train_months}m, test {wf.test_months}m")
+    lines.append(
+        f"4. Walk-forward: train {wf.train_months}m, test {wf.test_months}m, "
+        f"pick {r.config.selection} {objective}"
+    )
     for w in r.walk_forward.windows:
         m = w.test_metrics
         lines.append(
@@ -59,7 +62,7 @@ def format_report(r: ValidationReport) -> str:
     mc = r.monte_carlo
     lines.extend(
         [
-            f"5. Monte Carlo: {mc.runs} runs over {mc.trades} trades",
+            f"5. Monte Carlo: {mc.runs} runs over {mc.days} days in {mc.block_days}-day blocks",
             f"   max drawdown p5 {mc.drawdown_p5:.1%}  p50 {mc.drawdown_p50:.1%}  "
             f"p95 {mc.drawdown_p95:.1%}; P(drawdown beyond {mc.drawdown_limit:.0%}) = "
             f"{mc.prob_drawdown_beyond:.1%}",
@@ -69,7 +72,8 @@ def format_report(r: ValidationReport) -> str:
             f"Sharpe {r.deflated.expected_max_sharpe:.2f}; P(true Sharpe > 0) = "
             f"{r.deflated.probability:.1%}",
             "",
-            f"7. Holdout (baseline params), evaluated {r.holdout_evaluations} time(s) so far",
+            f"7. Holdout (baseline params), seen {r.holdout_evaluations} time(s) so far, "
+            "counting every backtest over it",
             "   " + _line("", r.holdout),
             "",
             "8. Gate",
@@ -83,10 +87,7 @@ def format_report(r: ValidationReport) -> str:
 
 
 def _return_lines(r: ValidationReport) -> list[str]:
-    """Shuffling keeps the compounded return fixed; only bootstrapping spreads it."""
     mc = r.monte_carlo
-    if not r.config.monte_carlo.replace:
-        return []
     return [
         f"   final return p5 {mc.return_p5:+.1%}  p50 {mc.return_p50:+.1%}  "
         f"p95 {mc.return_p95:+.1%}"

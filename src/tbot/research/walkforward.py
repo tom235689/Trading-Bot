@@ -12,7 +12,7 @@ import polars as pl
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import BacktestResult
 from tbot.backtest.metrics import Metrics
-from tbot.research.sweep import Grid, SweepRun, best_run, evaluate, objective_value, run_sweep
+from tbot.research.sweep import Grid, SweepRun, evaluate, objective_value, run_sweep, select_run
 
 
 @dataclass(frozen=True)
@@ -52,10 +52,12 @@ def windows(
     """Consecutive windows whose test periods end on or before end."""
     step = step_months or test_months
     result = []
-    cursor = start
-    while (test_end := add_months(cursor, train_months + test_months)) <= end:
-        result.append(Window(cursor, add_months(cursor, train_months), test_end))
-        cursor = add_months(cursor, step)
+    offset = 0
+    while (test_end := add_months(start, offset + train_months + test_months)) <= end:
+        result.append(
+            Window(add_months(start, offset), add_months(start, offset + train_months), test_end)
+        )
+        offset += step
     return result
 
 
@@ -100,6 +102,7 @@ def run_walk_forward(
     step_months: int | None = None,
     objective: str,
     min_trades: int,
+    selection: str = "best",
     workers: int = 1,
 ) -> WalkForwardResult:
     if base.end is None:
@@ -111,7 +114,7 @@ def run_walk_forward(
     for window in plan:
         train = base.with_period(window.train_start, window.train_end)
         runs = run_sweep(train, grid, data_dir, workers=workers)
-        best = best_run(runs, objective, min_trades)
+        best = select_run(runs, grid, objective, min_trades, selection)
         test = base.with_period(window.train_end, window.test_end).with_params(best.params)
         test_result, test_metrics = evaluate(test, data_dir)
         results.append(

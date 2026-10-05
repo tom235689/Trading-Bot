@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from tbot.live.guard import GuardConfig, GuardState, Mode, RiskGuard
+from tbot.risk.guard import GuardConfig, GuardState, Mode, RiskGuard
 
 T0 = datetime(2024, 1, 1, 8, tzinfo=UTC)
 CONFIG = GuardConfig(daily_loss_limit=0.03, max_drawdown=0.15, stale_seconds=900)

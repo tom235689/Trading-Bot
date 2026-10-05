@@ -1,11 +1,12 @@
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
 from binance_fake import FakeBinance, make_rows
 from tbot.core.timeframe import Timeframe
-from tbot.data import binance_rest
+from tbot.data import binance_rest, downloader
 from tbot.data.downloader import iter_months, sync
 from tbot.data.store import BarStore
 
@@ -136,3 +137,20 @@ def test_start_before_listing_costs_one_probe_per_sync(tmp_path: Path) -> None:
     assert (result.total_bars, result.first) == (1786, JAN_1)
     assert fake.archive_requests() == []
     assert len(fake.requests) == 1
+
+
+def test_failed_backfill_leaves_the_store_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeBinance("BTCUSDT", H1, ROWS)
+    store = BarStore(tmp_path)
+    with fake.client() as client:
+        sync(store, client, "BTCUSDT", H1, datetime(2024, 2, 10, tzinfo=UTC), NOW)
+
+        def down(*args: object) -> object:
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(downloader, "fetch_klines", down)  # after the January archive
+        with pytest.raises(httpx.ConnectError):
+            sync(store, client, "BTCUSDT", H1, JAN_1, NOW)
+    assert store.first_open_time("BTCUSDT", H1) == datetime(2024, 2, 10, tzinfo=UTC)

@@ -49,6 +49,15 @@ class FakeSpot:
     lose_next_order_response: bool = False  # place the order, then fail the response
     error_after_next_order: httpx.Response | None = None  # place it, then answer this
     next_id: int = 1000
+    can_trade: bool = True
+    restrictions: dict[str, bool] = field(
+        default_factory=lambda: {
+            "ipRestrict": True,
+            "enableReading": True,
+            "enableWithdrawals": False,
+            "enableSpotAndMarginTrading": True,
+        }
+    )
 
     def client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(self.handle))
@@ -119,7 +128,11 @@ class FakeSpot:
         if error is not None:
             return error
         if path == "/api/v3/account":
-            return httpx.Response(200, json={"balances": self._balance_rows()})
+            return httpx.Response(
+                200, json={"canTrade": self.can_trade, "balances": self._balance_rows()}
+            )
+        if path == "/sapi/v1/account/apiRestrictions":
+            return httpx.Response(200, json=self.restrictions)
         if path == "/api/v3/order" and request.method == "POST":
             response = self._place(params)
             if self.lose_next_order_response and response.status_code == 200:

@@ -1,6 +1,6 @@
 # Trading Bot Design
 
-Status: v1, phases 0-6 implemented (updated 2026-09-30)
+Status: v1, phases 0-6 implemented (updated 2026-10-05)
 
 ## 1. Goals and Non-Goals
 
@@ -164,14 +164,14 @@ Independent layer with veto power. Values below are the intended live defaults a
 | Max weight per symbol | 30% |
 | Gross exposure | 100% spot; max 2x leverage on perpetuals |
 | Daily loss limit | -3%: block new entries until next UTC day |
-| Max drawdown | -15%: flatten all and halt (kill switch) |
+| Max drawdown | -45%: flatten all and halt (kill switch); set beyond the strategy's 5th-percentile Monte Carlo drawdown so it trips on a failure, not a normal drawdown |
 | Order sanity | Reject prices far from mid, below min notional, or off tick/step size |
 | Stale data | Block trading if the latest bar is older than expected |
 | Unknown state | Block trading if reconciliation fails |
 
-The kill switch state is persisted. A restart does not resume trading; a human must reset it.
+The kill switch state is persisted. A restart does not resume trading; a human must reset it. The backtest runs the same guard when the config has a `guard` section (a halt lasts to the end of the run), so a level that would stop the strategy during ordinary drawdowns shows up before it goes live: with the shipped settings, 15% halts the backtest in November 2018.
 
-**Implementation** (`tbot/live/guard.py`, applied by `SessionTrader` in paper, testnet, and live): the `guard` config section holds `daily_loss_limit`, `max_drawdown`, and `stale_seconds` (zero disables a rule). Each event: equity below the day's opening equity by the daily limit puts the session in reduce-only mode (orders may only shrink positions); equity below the running peak by the drawdown limit flattens every position and halts; a bar older than `stale_seconds` when it arrives blocks that event (announced once per streak, then logged). Money that enters or leaves the book from outside (reconciliation adjustments: deposits, withdrawals, manual trades) shifts the peak and day-open levels, so it never counts as a loss or a gain. Guard state (peak, day open, halted) is saved in the ledger after every check, so a restart stays halted; `tbot resume <config>` clears it and resets the peak, and a running session re-reads the state each event, so the resume takes effect at the next bar. The kill switch is announced when it trips and whenever flattening fills something, not on every bar, since dust below the exchange minimum can remain. Per-symbol and gross exposure caps are applied earlier by `RiskLimits`; order sanity (tick, step, minimum notional) by the executor; unknown state by pausing new orders after three failed reconciliations in a row, with an alert, until one succeeds.
+**Implementation** (`tbot/risk/guard.py`, applied by `SessionTrader` in paper, testnet, and live): the `guard` config section holds `daily_loss_limit`, `max_drawdown`, and `stale_seconds` (zero disables a rule). Each event: equity below the day's opening equity by the daily limit puts the session in reduce-only mode (orders may only shrink positions); equity below the running peak by the drawdown limit flattens every position and halts; a bar older than `stale_seconds` when it arrives blocks that event (announced once per streak, then logged). Money that enters or leaves the book from outside (reconciliation adjustments: deposits, withdrawals, manual trades) shifts the peak and day-open levels, so it never counts as a loss or a gain. Guard state (peak, day open, halted) is saved in the ledger after every check, so a restart stays halted; `tbot resume <config>` clears it and resets the peak, and a running session re-reads the state each event, so the resume takes effect at the next bar. The kill switch is announced when it trips and whenever flattening fills something, not on every bar, since dust below the exchange minimum can remain. Per-symbol and gross exposure caps are applied earlier by `RiskLimits`; order sanity (tick, step, minimum notional) by the executor; unknown state by pausing new orders after three failed reconciliations in a row, with an alert, until one succeeds.
 
 ### 5.6 Execution
 
@@ -204,7 +204,7 @@ Two tiers:
 1. **Research (vectorized)**: pandas or polars over full arrays. Screens many ideas quickly. Never used for final decisions.
 2. **Validation (event-driven)**: reuses the live engine with a simulated broker.
 
-**Event loop** (validation tier): events are bar close times across all loaded streams. At each event the engine reveals bars closing now, fills pending orders, marks positions at the latest close and records equity, runs strategies whose bars closed, then combines targets, applies risk limits, and queues orders for the symbols whose execution stream (finest loaded timeframe) closed now; other symbols keep their pending orders, so a faster stream of another symbol never postpones a fill. Paper and live plan orders the same way. Before `start`, strategies run to build state but nothing trades.
+**Event loop** (validation tier): events are bar close times across all loaded streams. At each event the engine reveals bars closing now, fills pending orders, marks positions at the latest close and records equity, runs strategies whose bars closed, then combines targets, applies risk limits, and queues orders for the symbols whose execution stream (finest loaded timeframe) closed now; other symbols keep their pending orders, so a faster stream of another symbol never postpones a fill. Paper and live plan orders the same way. Before `start`, strategies run to build state but nothing trades. With a `guard` in the config the engine applies it after marking: reduce-only filters orders, a halt flattens at the next open and ends trading. Without an `end`, every stream stops at the earliest last close among them.
 
 **Fill model**
 
@@ -218,7 +218,7 @@ Two tiers:
 
 **Report**: CAGR, Sharpe and Sortino (daily returns, 365-day year, zero risk-free rate), Calmar, max drawdown, win rate, profit factor, turnover, exposure, fees, average trade return. `--html` writes the dashboard for the run.
 
-**Attribution** (`tbot backtest <config> --attribution`, `tbot/backtest/attribution.py`): runs every strategy alone with full capital and then the configured combination, and prints the metrics side by side with the correlation of the solo daily returns. This is how a candidate second strategy is judged: an uncorrelated strategy only helps if it has positive expectancy on its own. First result (`config/multi.yaml`): the RSI mean-reversion leg loses money alone (Sharpe -0.37) and lowers the mix below Donchian alone despite zero correlation, so it stays an example, not a recommendation.
+**Attribution** (`tbot backtest <config> --attribution`, `tbot/backtest/attribution.py`): runs every strategy alone with full capital and then the configured combination, and prints the metrics side by side with the correlation of the solo daily returns. This is how a candidate second strategy is judged: an uncorrelated strategy only helps if it has positive expectancy on its own. First result (`config/multi.yaml`): the RSI mean-reversion leg loses money alone (Sharpe -0.37) and lowers the mix below Donchian alone despite a low correlation (0.18, days paired by date), so it stays an example, not a recommendation.
 
 ### 5.9 Persistence
 
@@ -233,6 +233,8 @@ Two tiers:
 - Telegram alerts (`TBOT_TELEGRAM_TOKEN`, `TBOT_TELEGRAM_CHAT_ID`): start and stop, every fill, failed price lookups, stale streams, task crashes, and a daily summary at `summary_hour_utc`. Without a token, alerts go to the log. A failed send is logged and never stops trading. Also sent: kill switch, entries blocked, paused and resumed trading, reconciliation adjustments and failures, orders in doubt and their resolution, protective stops that executed, and a failed start. `tbot notify` sends a test message.
 - External heartbeat (`TBOT_HEARTBEAT_URL`): the bot pings an outside monitor every `heartbeat_seconds`. If pings stop, the monitor alerts. A dead bot cannot alert on its own, so this is the only way to learn about a hard kill; it means alive, not trading (a halted bot keeps pinging).
 - `tbot status <config>` prints the ledger: equity, positions, recent fills and events, and the last stored bar per stream.
+- `tbot doctor <config>` checks a session before it runs: ledger (kill switch, orders in doubt, a running process), Telegram and heartbeat settings, Binance reachability and clock offset, tradable symbols, and for testnet and live the API key, the account's trading permission, and in budget mode whether free USDT covers the bot's cash. On production it reads the key's restrictions and fails if the key can withdraw. Exit code 1 on any failure.
+- `tbot compare <config>` replays the session's period through the backtest engine with the same settings, guard included, and compares bar events, fills (matched by symbol, side, and time within one bar), prices against the backtest's, and equity (step 8 of the validation pipeline). Missed bars point at downtime; a mean price gap above the modeled slippage means the backtest underestimates costs. Exit code 1 when it does not track.
 - Dashboard (`tbot dashboard <config>`, `tbot backtest --html`; `tbot/monitoring/dashboard.py`): one self-contained HTML file with stat tiles, equity and drawdown charts (inline SVG, crosshair tooltip, light and dark mode, table view), open positions, recent fills and events. Static on purpose: nothing listens on the trading machine; generate it on demand or on a schedule. Per-strategy performance is the attribution report.
 
 **Paper session** (`tbot paper <config>`, `tbot/live/runner.py`): the session (`tbot/live/session.py`) runs the backtest's decision path one event at a time: append the bars that closed, mark, run the strategies whose bars closed, combine targets, apply risk limits, plan orders. Paper fills happen at once at the live book price (ask for buys, bid for sells) through the same simulated broker with fees and slippage. Every signal, order, fill, and equity snapshot goes to a SQLite ledger. On start the bot syncs the store, rebuilds the portfolio by replaying the ledger's fills and adjustments, rebuilds strategy state by replaying stored history and restoring the saved targets (ignored if the strategies changed), and warns if the trading config changed since the ledger was created. A start that fails is logged and alerted with exit code 1. On a graceful stop, an event in progress finishes its orders first (up to a minute). Fills are timestamped with the wall clock; equity snapshots with the bar close. A test proves the session reproduces the backtest engine bar for bar when fills use the next bar's open.
@@ -270,7 +272,7 @@ A strategy is promoted to live only after passing every step:
 5. **Cost stress**: still profitable with 2x fees and slippage.
 6. **Monte Carlo**: resample trade order to estimate the drawdown distribution.
 7. **Trial log**: record every tested variant and adjust Sharpe for the number of trials (deflated Sharpe).
-8. **Paper trading**: 2-4 weeks; results must track a backtest over the same period.
+8. **Paper trading**: 2-4 weeks; results must track a backtest over the same period (`tbot compare`).
 9. **Small live**: start with small capital and scale gradually.
 
 **Initial promotion gate (tunable)**: out-of-sample Sharpe above 0.8 after costs, max drawdown under 25%, at least 100 trades, profitable under 2x costs.
@@ -278,12 +280,12 @@ A strategy is promoted to live only after passing every step:
 **Implementation** (`tbot validate <validation.yaml>`, code in `src/tbot/research/`):
 
 - A validation config points at a base backtest config and sets `holdout_start`, the parameter `grid`, the `objective` (Sharpe by default), walk-forward window lengths, Monte Carlo settings, the cost multiplier, and gate thresholds. Steps 1-3 and 5-7 run in one command; breadth (step 4) is covered by running the same config on other symbols.
-- Steps run on the in-sample period (base start to `holdout_start`): baseline, cost stress, the full sweep, walk-forward (grid search on each train window, best objective applied to the next test window; a train window in which no grid point reaches `min_trades` is an error, not an arbitrary pick), and Monte Carlo on the baseline's trades. Grid points vary only the listed parameters; the others keep the base config's values. `step_months`, if set, must equal `test_months`, since the test segments are stitched. The holdout runs last, once, with the base params. The report says how many times the holdout has been evaluated, because every look at it weakens it.
+- Steps run on the in-sample period (base start to `holdout_start`): baseline, cost stress, the full sweep, walk-forward (grid search on each train window, best objective applied to the next test window; a train window in which no grid point reaches `min_trades` is an error, not an arbitrary pick; `selection: neighborhood` picks the qualifying point whose grid neighbors do best on average instead of the single best one), and Monte Carlo on the baseline's daily returns. Grid points vary only the listed parameters; the others keep the base config's values. `step_months`, if set, must equal `test_months`, since the test segments are stitched. The holdout runs last, once, with the base params. The report says how many runs have seen the holdout period, counting every backtest that reached into it, because every look weakens it.
 - Parameter stability is read from the sweep: the objective over the whole grid, the baseline's rank, and the mean objective of a point and its grid neighbors (a plateau scores close to its peak).
 - Out-of-sample metrics come from the walk-forward test segments stitched into one equity curve; each segment starts flat.
 - History before a backtest's start covers the strategies' warmup and, when volatility targeting is on, the volatility window on each symbol's finest stream, so the first weeks are sized like the rest. Paper and live sessions replay the same amount from the store.
-- Monte Carlo shuffles trade order (returns on equity at entry) to get the drawdown distribution. Shuffling leaves the compounded return unchanged, so return percentiles are only reported for bootstrap resampling.
-- Every run appends to `data/trials.jsonl`. The deflated Sharpe counts distinct parameter sets tried on the same sample (strategy, symbols, timeframe, period); re-running identical params is not a new trial.
+- Monte Carlo resamples the baseline's daily returns in blocks of `block_days` (default 20) to get the drawdown and return distribution. Daily returns include losses while trades are open, and blocks keep streaks of bad days together; shuffling closed trades hid both and understated drawdowns.
+- Every run appends to `data/trials.jsonl`, with a hash of its setup (risk, costs, rebalance, other strategies). The deflated Sharpe counts distinct trials on the same sample (strategy, symbols, timeframe, period): a trial is params and their result, so re-running a setup is not a new trial, while the same params under other risk settings are. Runs without a Sharpe count as trials.
 - The gate applies to the stitched out-of-sample result (Sharpe, drawdown, trades), the cost stress (still profitable), and the holdout (profitable). Sweeps run in parallel processes.
 
 ## 8. Tech Stack
@@ -299,7 +301,7 @@ A strategy is promoted to live only after passing every step:
 | Concurrency | asyncio |
 | Quality | ruff, mypy, pytest, git hooks (`.githooks/`) |
 | Alerts | Telegram Bot API |
-| Deployment | a Windows or Linux host under a supervisor that restarts on exit; a VPS in an allowed region later |
+| Deployment | a Windows or Linux host under a supervisor that restarts on exit (`scripts/install_task.ps1` and `scripts/run_bot.ps1` on Windows); a VPS in an allowed region later |
 
 ## 9. Repository Layout
 
@@ -308,6 +310,7 @@ Trading-Bot/
   pyproject.toml
   config/                # yaml configs
   docs/
+  scripts/               # git guard, Windows task and restart loop
   src/tbot/
     core/                # config, models, timeframes
     data/                # download, storage, quality checks
@@ -320,8 +323,8 @@ Trading-Bot/
     backtest/            # engine, cost models, reports
     research/            # sweep, walk-forward, Monte Carlo, trial log, validation
     monitoring/          # logging, alerts, heartbeat, dashboard
-    cli.py               # download check backtest validate paper live status resume
-                         # account dashboard notify
+    cli.py               # download check backtest validate paper live doctor status
+                         # compare resume account dashboard notify
   tests/
 ```
 
@@ -339,7 +342,7 @@ Trading-Bot/
 
 Perpetuals are deferred: they add a second API surface (USD-M futures), margin and liquidation handling, funding accrual, and shorting to every layer, which deserves its own design pass. The validation results say exposure control on spot was the more valuable step.
 
-No live trading before a strategy passes phase 3 validation. As of 2026-09-30 no configuration has passed the gate: the best candidate (Donchian with volatility targeting 0.4, used by the paper, testnet, and live configs) misses the out-of-sample drawdown limit by two points. Going live anyway is the owner's decision, with a small budget.
+No live trading before a strategy passes phase 3 validation. As of 2026-10-05 no configuration has passed the gate. With the corrected validation tools the best candidate (Donchian with volatility targeting 0.4, used by the paper, testnet, and live configs) reaches an out-of-sample Sharpe of 0.79 and a drawdown of -43.5%; the walk-forward result hinges on a near tie in the 2022 parameter choice, and plateau selection does not help. Further variants on the same data would only add trials. Going live anyway is the owner's decision, with a small budget.
 
 ## 11. Open Questions
 

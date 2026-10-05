@@ -127,3 +127,26 @@ def test_budget_ownership_leaves_the_owners_balances_alone(tmp_path: Path) -> No
     assert portfolio.position(BTC) == pytest.approx(0.004)
     assert portfolio.cash == pytest.approx(600.0)
     ledger.close()
+
+
+def test_budget_book_never_stays_negative(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 5000.0, "BTC": 0.3}, prices={BTC: 50000.0})
+    portfolio = Portfolio(1000.0)
+    portfolio.positions[BTC] = -0.01  # a sale booked twice
+    portfolio.cash = -20.0  # a buy that slipped past the budget
+    [adjustments], ledger, _ = run_reconcile(fake, portfolio, tmp_path, ownership="budget")
+    assert [(a.symbol, a.quantity, a.cash) for a in adjustments] == [
+        (BTC, pytest.approx(0.01), 0.0),
+        ("", 0.0, pytest.approx(20.0)),
+    ]
+    assert portfolio.position(BTC) == pytest.approx(0.0)
+    assert portfolio.cash == pytest.approx(0.0)
+    ledger.close()
+
+
+def test_the_owners_open_buy_order_does_not_shrink_the_book(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 400.0}, prices={BTC: 50000.0})
+    fake.locked["USDT"] = 4600.0  # the owner's limit order
+    [adjustments], ledger, _ = run_reconcile(fake, Portfolio(1000.0), tmp_path, ownership="budget")
+    assert adjustments == []
+    ledger.close()

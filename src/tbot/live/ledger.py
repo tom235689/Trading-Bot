@@ -1,7 +1,8 @@
 """SQLite ledger: the durable record of a paper or live session."""
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -101,6 +102,7 @@ class Ledger:
             )
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
+        self._atomic = False
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")  # every committed row survives power loss
         self.conn.executescript(SCHEMA)
@@ -111,6 +113,27 @@ class Ledger:
                     "ALTER TABLE orders ADD COLUMN client_id TEXT NOT NULL DEFAULT ''"
                 )
         self.conn.execute("CREATE INDEX IF NOT EXISTS orders_client ON orders (client_id)")
+
+    @contextmanager
+    def atomic(self) -> Iterator[None]:
+        """Writes inside commit together or not at all, so a crash cannot split them."""
+        if self._atomic:
+            yield
+            return
+        with self.conn:
+            self._atomic = True
+            try:
+                yield
+            finally:
+                self._atomic = False
+
+    @contextmanager
+    def _write(self) -> Iterator[None]:
+        if self._atomic:  # the enclosing atomic() commits
+            yield
+        else:
+            with self.conn:
+                yield
 
     def close(self) -> None:
         self.conn.close()
@@ -133,17 +156,17 @@ class Ledger:
         return None if row is None else str(row[0])
 
     def set_meta(self, key: str, value: str) -> None:
-        with self.conn:
+        with self._write():
             self.conn.execute("REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
     def delete_meta(self, key: str) -> None:
-        with self.conn:
+        with self._write():
             self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
 
     # fills and orders
 
     def add_fill(self, fill: Fill, reference_price: float) -> None:
-        with self.conn:
+        with self._write():
             self.conn.execute(
                 "INSERT INTO fills (time, symbol, quantity, price, fee, reference_price) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -179,7 +202,7 @@ class Ledger:
         note: str = "",
         client_id: str = "",
     ) -> None:
-        with self.conn:
+        with self._write():
             self.conn.execute(
                 "INSERT INTO orders (time, symbol, quantity, status, note, client_id) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -207,7 +230,7 @@ class Ledger:
     # adjustments: reconciliation deltas applied on top of fills
 
     def add_adjustment(self, adjustment: Adjustment) -> None:
-        with self.conn:
+        with self._write():
             self.conn.execute(
                 "INSERT INTO adjustments (time, symbol, quantity, cash, note) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -230,17 +253,23 @@ class Ledger:
 
     def add_signals(self, time: datetime, strategy: str, targets: Mapping[str, float]) -> None:
         rows = [(_iso(time), strategy, symbol, target) for symbol, target in targets.items()]
-        with self.conn:
+        with self._write():
             self.conn.executemany(
                 "INSERT INTO signals (time, strategy, symbol, target) VALUES (?, ?, ?, ?)", rows
             )
 
     def add_equity(self, point: EquityPoint) -> None:
-        with self.conn:
+        with self._write():
             self.conn.execute(
                 "INSERT INTO equity (time, equity, cash, exposure) VALUES (?, ?, ?, ?)",
                 (_iso(point.time), point.equity, point.cash, point.exposure),
             )
+
+    def equity_points(self) -> list[EquityPoint]:
+        rows = self.conn.execute(
+            "SELECT time, equity, cash, exposure FROM equity ORDER BY id"
+        ).fetchall()
+        return [EquityPoint(_parse(t), e, c, x) for t, e, c, x in rows]
 
     def latest_equity(self) -> EquityPoint | None:
         row = self.conn.execute(
@@ -260,7 +289,7 @@ class Ledger:
     # events
 
     def add_event(self, time: datetime, level: str, message: str) -> None:
-        with self.conn:
+        with self._write():
             self.conn.execute(
                 "INSERT INTO events (time, level, message) VALUES (?, ?, ?)",
                 (_iso(time), level, message),
