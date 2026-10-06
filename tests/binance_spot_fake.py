@@ -102,6 +102,8 @@ class FakeSpot:
         if self.fail_next:
             return self.fail_next.pop(0)
         path = request.url.path
+        if path == "/ping":  # a heartbeat monitor, as doctor pings it
+            return httpx.Response(200)
         params = dict(parse_qsl(request.url.query.decode()))
         if path == "/api/v3/time":
             return httpx.Response(200, json={"serverTime": int(time.time() * 1000)})

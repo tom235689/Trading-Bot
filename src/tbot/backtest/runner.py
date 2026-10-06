@@ -56,8 +56,8 @@ def run_period(
     guard: GuardConfig | None = None,
 ) -> BacktestResult:
     """Trade config's settings from the first bar close at or after start; end excludes bars
-    opening at or after it. Without an end, every stream stops at the earliest last close,
-    so none is valued at a stale price while the others move on."""
+    opening at or after it. Every stream stops at the earliest last close among them, so none
+    is valued at a stale price while the others move on (`data_ends` tells which)."""
     slots = build_slots(config.strategies)
 
     bars: dict[StreamKey, pl.DataFrame] = {}
@@ -66,12 +66,11 @@ def run_period(
         if frame.is_empty():
             raise ValueError(f"no stored bars for {symbol} {timeframe}; run `tbot download`")
         bars[(symbol, timeframe)] = frame
-    if end is None:
-        common = min(_last_close(key, frame) for key, frame in bars.items())
-        bars = {
-            key: frame.filter(pl.col("open_time") + key[1].delta <= common)
-            for key, frame in bars.items()
-        }
+    common = min(_last_close(key, frame) for key, frame in bars.items())
+    bars = {
+        key: frame.filter(pl.col("open_time") + key[1].delta <= common)
+        for key, frame in bars.items()
+    }
 
     engine = BacktestEngine(
         slots,
@@ -84,6 +83,16 @@ def run_period(
         guard=guard,
     )
     return engine.run()
+
+
+def data_ends(config: TradingConfig, store: BarStore) -> dict[StreamKey, datetime]:
+    """Close of the last stored bar of every stream the config trades."""
+    ends = {}
+    for key in history_bars(build_slots(config.strategies), config.risk):
+        last = store.last_open_time(*key)
+        if last is not None:
+            ends[key] = last + key[1].delta
+    return ends
 
 
 def _last_close(key: StreamKey, frame: pl.DataFrame) -> datetime:

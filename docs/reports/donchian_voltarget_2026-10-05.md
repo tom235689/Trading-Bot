@@ -7,7 +7,7 @@ Date: 2026-10-05. Config: `config/donchian_voltarget_validation.yaml` (unchanged
 An independent review of the research code found that the validation made results look better than they were. The defects, all fixed:
 
 - Monte Carlo compounded closed-trade returns only, so losses while a trade was open and streaks of bad days were invisible. It now resamples daily returns in 20-day blocks.
-- The trial log merged runs that differed only in risk settings, so the deflated Sharpe counted 30 trials where 115 had been run on this sample.
+- The trial log merged runs that differed only in risk settings, so the deflated Sharpe counted 30 trials. It now counts 115: the same 30 parameter sets under three risk setups, plus re-runs of one setup after engine fixes, which count again because their results changed. About 90 are distinct hypotheses; counting the re-runs is the conservative side (P = 99.56% instead of 99.58%).
 - The holdout counter only counted runs tagged `holdout`, not the full-period backtests (among them the six used to choose the 0.4 target) that also covered 2025-2026.
 - Paper and live run a risk guard that the backtest never simulated. The backtest now applies it when the config has one.
 
@@ -23,7 +23,7 @@ What still holds: the in-sample edge is significant after counting every trial (
 
 - **Kill switch.** The shipped configs halted at 15% drawdown. Run through the backtest with the guard, those settings halt on 2018-11-09 and stay flat for eight years (+2.0% in total against +655.4% without the guard). The configs now use 45%, beyond the 5th-percentile Monte Carlo drawdown, so the switch catches a broken strategy rather than a normal drawdown; at 30% or 45% it never trips on the history. The 3% daily loss limit changed nothing on this history.
 - **Plateau selection.** `donchian_voltarget_plateau_2026-10-05.md` compared its result with the 09-29 numbers, which came from the older engine. On the same engine both rules pick entry 20 / exit 40 for 2022; plateau selection reaches Sharpe 0.53 against 0.79, so it is still rejected.
-- **Holdout.** Runs over the holdout period: 19. It is in-sample data now.
+- **Holdout.** Runs over the holdout period: 19 when this validation ran, 24 after the kill-switch backtests below. It is in-sample data now.
 - **Going live** remains the owner's decision. Size `initial_cash` for a 45% loss.
 
 ## Report
@@ -84,3 +84,9 @@ In-sample 2018-01-01 -> 2025-01-01, holdout from 2025-01-01 to latest
 | 0.15 | +2.0% | 0.2% | 0.07 | -15.3% | 20 | 2018-11-09, flat from then on |
 | 0.30 | +655.4% | 26.0% | 1.12 | -24.9% | 244 | - |
 | 0.45 | +655.4% | 26.0% | 1.12 | -24.9% | 244 | - |
+
+## The full-exposure candidate, same tools (2026-10-06)
+
+`tbot validate config/donchian_validation.yaml` (the same strategy without volatility targeting): gate FAILED on drawdown only. Out-of-sample Sharpe 0.95, max drawdown -28.5%, 159 trades; in-sample Sharpe 1.03, max drawdown -40.1%; Monte Carlo max drawdown median -47.0%, 5th percentile -69.1%, P(beyond 25%) = 100%; deflated Sharpe P(true Sharpe > 0) = 96.8% over 115 trials; holdout +4.7% (seen 25 times).
+
+Its walk-forward picks a different 2022 set (entry 40, exit 10) and loses 4.8% there instead of 30.1%, which is the whole difference in the out-of-sample drawdown. On every in-sample and Monte Carlo measure it carries far more risk than the volatility-targeted candidate, so the configs keep volatility targeting.

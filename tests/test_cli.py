@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -5,9 +6,11 @@ import pytest
 
 from binance_fake import make_bars
 from tbot import __version__
-from tbot.cli import build_parser, main, parse_symbol
+from tbot.cli import EXIT_CONFIG, EXIT_ERROR, EXIT_LEDGER, build_parser, main, parse_symbol
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
+from tbot.live.ledger import Ledger
+from tbot.live.runner import instance_lock, stop_path, watch_stop_request
 
 
 def test_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -72,8 +75,66 @@ def test_notify_needs_telegram_settings(
     assert "TBOT_TELEGRAM_TOKEN" in capsys.readouterr().out
 
 
-def test_wrong_kind_of_config_is_explained() -> None:
-    with pytest.raises(SystemExit, match="a backtest config"):
-        main(["paper", "config/donchian_voltarget.yaml"])
-    with pytest.raises(SystemExit, match="only for mode: live"):
-        main(["live", "config/testnet.yaml", "--live"])
+def test_wrong_kind_of_config_is_explained(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["paper", "config/donchian_voltarget.yaml"]) == EXIT_CONFIG
+    assert "a backtest config" in capsys.readouterr().err
+    assert main(["live", "config/testnet.yaml", "--live"]) == EXIT_CONFIG
+    assert "only for mode: live" in capsys.readouterr().err
+
+
+def test_errors_end_in_one_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    empty = str(tmp_path / "empty")
+    assert main(["backtest", "config/donchian_voltarget.yaml", "--data-dir", empty]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert err.startswith("error: no stored bars for BTCUSDT 4h; run `tbot download`")
+    assert "Traceback" not in err
+
+    unknown = tmp_path / "unknown.yaml"
+    unknown.write_text(
+        "start: 2024-01-01\nstrategies:\n"
+        "  - {name: nope, symbols: [BTCUSDT], timeframe: 4h, allocation: 1.0}\n",
+        encoding="utf-8",
+    )
+    assert main(["backtest", str(unknown), "--data-dir", empty]) == EXIT_ERROR
+    assert "unknown strategy 'nope'" in capsys.readouterr().err
+
+    paper = tmp_path / "paper.yaml"
+    broken = tmp_path / "broken.sqlite"
+    broken.write_text("not a database", encoding="utf-8")
+    paper.write_text(
+        f"ledger: {broken.as_posix()}\nstrategies:\n"
+        "  - {name: donchian_trend, symbols: [BTCUSDT], timeframe: 4h, allocation: 1.0}\n",
+        encoding="utf-8",
+    )
+    assert main(["status", str(paper)]) == EXIT_LEDGER
+    assert "not a usable tbot ledger" in capsys.readouterr().err
+
+
+def test_env_that_is_not_utf8_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_bytes("TBOT_TELEGRAM_TOKEN=x\n".encode("utf-16"))
+    assert main(["notify"]) == EXIT_ERROR
+    assert "save .env and configs as UTF-8" in capsys.readouterr().err
+
+
+def test_stop_asks_a_running_session(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    ledger = tmp_path / "paper.sqlite"
+    Ledger(ledger).close()
+    config = tmp_path / "paper.yaml"
+    config.write_text(
+        f"ledger: {ledger.as_posix()}\nstrategies:\n"
+        "  - {name: donchian_trend, symbols: [BTCUSDT], timeframe: 4h, allocation: 1.0}\n",
+        encoding="utf-8",
+    )
+    assert main(["stop", str(config)]) == 0
+    assert "no session is running" in capsys.readouterr().out
+    with instance_lock(ledger):  # a session holds the ledger and does not react in time
+        assert main(["stop", str(config), "--timeout", "1"]) == EXIT_ERROR
+    assert stop_path(ledger).exists()
+
+    stop = asyncio.Event()
+    asyncio.run(watch_stop_request(stop_path(ledger), stop))
+    assert stop.is_set()
+    assert not stop_path(ledger).exists()

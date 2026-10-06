@@ -4,8 +4,8 @@ Registers a scheduled task that runs the bot at startup, whether anyone is logge
 
 .DESCRIPTION
 The task runs scripts/run_bot.ps1, which starts the bot again after a crash. Run this from an
-elevated PowerShell: tasks that start at boot need administrator rights. Check the config with
-`tbot doctor` first.
+elevated PowerShell: tasks that start at boot need administrator rights. It runs
+`tbot doctor` first and refuses to register while doctor reports a problem.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1 -Config config\paper.yaml
@@ -16,16 +16,28 @@ param(
     [Parameter(Mandatory = $true)] [string] $Config,
     [switch] $Live,
     [string] $Name = "",
+    [switch] $SkipDoctor,
     [switch] $DryRun
 )
 $ErrorActionPreference = "Stop"
 
 $repo = Split-Path -Parent $PSScriptRoot
-if (-not (Test-Path (Join-Path $repo $Config))) { throw "no config at $Config (relative to $repo)" }
+$path = if ([IO.Path]::IsPathRooted($Config)) { $Config } else { Join-Path $repo $Config }
+if (-not (Test-Path $path -PathType Leaf)) { throw "no config at $path" }
+$text = Get-Content -Raw $path
+$isLive = $text -match '(?m)^mode:\s*live\s*$'
+if ($isLive -and -not $Live) { throw "$Config trades real money: add -Live to confirm" }
+if ($Live -and -not $isLive) { throw "-Live is only for a config with mode: live" }
 if (-not $Name) { $Name = "tbot " + [IO.Path]::GetFileNameWithoutExtension($Config) }
 $uv = (Get-Command uv).Source  # the task may not see the same PATH
+
+if (-not $SkipDoctor) {
+    & $uv --directory $repo run --frozen python -m tbot doctor $path
+    if ($LASTEXITCODE -ne 0) { throw "doctor found problems: fix the FAIL lines, or pass -SkipDoctor" }
+}
+
 $runner = Join-Path $PSScriptRoot "run_bot.ps1"
-$arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runner`" -Config `"$Config`" -Uv `"$uv`""
+$arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runner`" -Config `"$path`" -Uv `"$uv`""
 if ($Live) { $arguments += " -Live" }
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments -WorkingDirectory $repo

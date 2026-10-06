@@ -49,7 +49,9 @@ def run_attribution(config: BacktestConfig, store: BarStore) -> Attribution:
 
 
 def _dated_returns(result: BacktestResult, name: str) -> pl.DataFrame:
-    daily = result.equity.group_by_dynamic("time", every="1d").agg(pl.col("equity").last())
+    # A close at 00:00 ends the previous day: shift by 1 ms so a 1d and a 4h run agree.
+    closes = result.equity.with_columns(pl.col("time") - pl.duration(milliseconds=1))
+    daily = closes.group_by_dynamic("time", every="1d").agg(pl.col("equity").last())
     previous = daily["equity"].shift(1).fill_null(result.initial_cash)
     return pl.DataFrame({"day": daily["time"].dt.date(), name: daily["equity"] / previous - 1})
 

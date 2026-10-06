@@ -1,16 +1,19 @@
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
 from binance_spot_fake import FakeSpot
+from factories import price_bars
 from tbot.core.config import StrategyConfig
 from tbot.core.timeframe import Timeframe
+from tbot.data.store import BarStore
 from tbot.live.config import LiveConfig, PaperConfig, Settings
-from tbot.live.doctor import Check, checks_text, run_checks
+from tbot.live.doctor import Check, checks_text, guard_check, run_checks
 from tbot.live.ledger import Ledger
 from tbot.live.runner import GUARD_META
-from tbot.risk.guard import GuardState
+from tbot.risk.guard import GuardConfig, GuardState
 
 STRATEGIES = [
     StrategyConfig(
@@ -21,6 +24,7 @@ STRATEGIES = [
         params={"entry": 55, "exit": 20},
     )
 ]
+T0 = datetime(2024, 1, 1, tzinfo=UTC)
 ALERTS = {"telegram_token": "t", "telegram_chat_id": "1", "heartbeat_url": "https://hc/ping"}
 KEYS = {"binance_api_key": "key", "binance_api_secret": "secret"}
 
@@ -68,6 +72,7 @@ def test_a_ready_live_setup_passes(tmp_path: Path) -> None:
     assert [c for c in checks if c.status != "ok"] == []
     names = [c.name for c in checks]
     assert names == [
+        "strategies",
         "ledger",
         "telegram",
         "heartbeat",
@@ -128,3 +133,53 @@ def test_paper_ledger_alerts_and_network(tmp_path: Path) -> None:
             return await run_checks(config, settings(), client)
 
     assert by_name(asyncio.run(offline()))["binance"][0][0] == "fail"
+
+
+def test_a_config_that_cannot_start_fails_first(tmp_path: Path) -> None:
+    typo = STRATEGIES[0].model_copy(update={"name": "donchian_trnd"})
+    config = PaperConfig(strategies=[typo], ledger=tmp_path / "paper.sqlite")
+    checks = check(config, settings(**ALERTS), fake())
+    assert checks[0].status == "fail"
+    assert "unknown strategy 'donchian_trnd'" in checks[0].detail
+    wrong = STRATEGIES[0].model_copy(update={"params": {"entry": 0}})
+    bad = by_name(check(PaperConfig(strategies=[wrong], ledger=config.ledger), settings(), fake()))
+    assert bad["strategies"][0][0] == "fail"
+
+
+def test_ledger_and_heartbeat_problems(tmp_path: Path) -> None:
+    folder = tmp_path / "ledger.sqlite"
+    folder.mkdir()
+    found = by_name(
+        check(
+            PaperConfig(strategies=STRATEGIES, ledger=folder),
+            settings(heartbeat_url="hc-ping.com/abc"),
+            fake(),
+        )
+    )
+    assert found["ledger"][0][0] == "fail"
+    assert found["heartbeat"] == [("fail", "TBOT_HEARTBEAT_URL must start with https://")]
+    broken = tmp_path / "broken.sqlite"
+    broken.write_text("not a database", encoding="utf-8")
+    found = by_name(check(PaperConfig(strategies=STRATEGIES, ledger=broken), settings(), fake()))
+    assert found["ledger"][0][0] == "fail"
+    assert "not a usable tbot ledger" in found["ledger"][0][1]
+
+
+def test_kill_switch_is_tried_on_the_stored_history(tmp_path: Path) -> None:
+    store = BarStore(tmp_path / "data")
+    closes = [100.0] * 700
+    closes += [closes[-1] * 1.02**i for i in range(1, 21)]  # a breakout
+    closes += [closes[-1] * 0.99**i for i in range(1, 200)]  # then a long slide
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        opens = [100.0, *closes[:-1]]
+        store.write(symbol, Timeframe.H4, price_bars(T0, Timeframe.H4, opens, closes))
+    holds = [STRATEGIES[0].model_copy(update={"params": {"entry": 5, "exit": 600}})]
+    tight = PaperConfig(
+        strategies=holds, ledger=tmp_path / "p.sqlite", guard=GuardConfig(max_drawdown=0.1)
+    )
+    result = guard_check(tight, store)
+    assert result.status == "warn"
+    assert "would have halted" in result.detail
+    loose = tight.model_copy(update={"guard": GuardConfig(max_drawdown=0.9)})
+    assert guard_check(loose, store).status == "ok"
+    assert "run `tbot download`" in guard_check(tight, BarStore(tmp_path / "none")).detail

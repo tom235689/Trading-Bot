@@ -159,6 +159,7 @@ class LiveExecutor:
         self.protective_stop_pct = protective_stop_pct
         self.label = label
         self.unprotected: set[str] = set()  # held symbols whose stop is missing
+        self.alerted: set[str] = set()  # stop failures already sent, until one works
 
     async def execute(
         self,
@@ -448,6 +449,7 @@ class LiveExecutor:
             position = portfolio.position(symbol)
             if position <= 0 or symbol not in marks:
                 self.unprotected.discard(symbol)
+                self.alerted.discard(symbol)
                 return
             balances = await self.spot.balances()
             free = balances[rules.base].free if rules.base in balances else 0.0
@@ -456,20 +458,25 @@ class LiveExecutor:
             limit = rules.round_price(stop * (1 - STOP_LIMIT_GAP))
             if quantity == 0 or not rules.acceptable(quantity, limit):
                 self.unprotected.discard(symbol)  # dust: nothing an exchange stop can hold
+                self.alerted.discard(symbol)
                 return
             client_id = f"{STOP_PREFIX}{symbol}{uuid4().hex[:12]}"
             self._set_stop_state(symbol, StopState(id=client_id, qty=0.0, quote=0.0))
             await self.spot.stop_loss_order(symbol, quantity, stop, limit, client_id)
             self.unprotected.discard(symbol)
+            if symbol in self.alerted:
+                self.alerted.discard(symbol)
+                await self.notifier.send(f"[{self.label}] protective stop for {symbol} placed")
             log.info("stop_placed", symbol=symbol, quantity=quantity, stop=stop)
         except Exception as exc:  # retried at every reconciliation until it works
             log.error("stop_failed", symbol=symbol, error=repr(exc))
-            if symbol not in self.unprotected:
-                await self.notifier.send(
-                    f"[{self.label}] protective stop failed for {symbol}: {exc}; "
-                    f"retrying at every reconciliation"
-                )
             self.unprotected.add(symbol)
+            if symbol not in self.alerted:
+                self.alerted.add(symbol)
+                await self.notifier.send(
+                    f"[{self.label}] protective stop failed for {symbol}: {exc}. The position "
+                    f"has no exchange stop; retrying at every reconciliation"
+                )
 
 
 class BinanceBookTicker:

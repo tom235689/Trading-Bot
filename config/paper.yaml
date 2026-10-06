@@ -1,6 +1,7 @@
-# Paper trading: simulated fills at live Binance prices. Trading settings are the validated
-# candidate (config/donchian_voltarget.yaml), and testnet.yaml and live.yaml use the same ones,
-# so two weeks of paper rehearse exactly what would go live.
+# Paper trading: simulated fills at live Binance prices. Trading settings are the configured
+# candidate (config/donchian_voltarget.yaml; it has not passed the validation gate, see the
+# README), and testnet.yaml and live.yaml use the same ones, so two weeks of paper rehearse what
+# would go live (live adds exchange-side protective stops).
 initial_cash: 10000
 costs:
   fee_rate: 0.001     # Binance spot taker, VIP 0

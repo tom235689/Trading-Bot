@@ -144,9 +144,15 @@ class BacktestEngine:
             return Mode.NORMAL
         decision = self.guard.check(now, self.portfolio.equity(self.marks), now)
         if decision.mode == Mode.HALT:
-            self.halted = self.halted or f"{now:%Y-%m-%d %H:%M}: {decision.reason}"
-            positions = self.portfolio.positions.items()
-            self.pending = [PendingOrder(now_ms, s, -q) for s, q in positions if q]
+            if not self.halted:  # orders still queued were the strategy's: drop them
+                self.halted = f"{now:%Y-%m-%d %H:%M}: {decision.reason}"
+                self.pending = []
+            queued = {order.symbol for order in self.pending}
+            self.pending += [
+                PendingOrder(now_ms, symbol, -quantity)
+                for symbol, quantity in self.portfolio.positions.items()
+                if quantity and symbol not in queued
+            ]
         return decision.mode
 
     def _fill_pending(self, revealed: set[StreamKey]) -> None:

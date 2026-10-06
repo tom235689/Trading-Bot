@@ -101,11 +101,14 @@ class Ledger:
                 "README explains."
             )
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
         self._atomic = False
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=FULL")  # every committed row survives power loss
-        self.conn.executescript(SCHEMA)
+        try:
+            self.conn = sqlite3.connect(path)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=FULL")  # committed rows survive power loss
+            self.conn.executescript(SCHEMA)
+        except sqlite3.DatabaseError as exc:
+            raise LedgerUnavailable(f"{path} is not a usable tbot ledger: {exc}") from None
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(orders)")}
         if "client_id" not in columns:  # ledgers from before client ids were stored
             with self.conn:
@@ -208,6 +211,13 @@ class Ledger:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (_iso(time), symbol, quantity, status, note, client_id),
             )
+
+    def stop_fill_keys(self) -> set[tuple[str, str]]:
+        """(time, symbol) of fills that came from this bot's protective stops."""
+        rows = self.conn.execute(
+            "SELECT time, symbol FROM orders WHERE status = 'filled' AND note = 'protective stop'"
+        ).fetchall()
+        return {(str(t), str(s)) for t, s in rows}
 
     def client_id_used(self, client_id: str) -> bool:
         row = self.conn.execute(

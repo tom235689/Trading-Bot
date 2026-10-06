@@ -1,13 +1,17 @@
 """Preflight checks: what would stop a session, endanger the account, or hide a failure."""
 
+import asyncio
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import httpx
+from pydantic import ValidationError
 
-from tbot.exchange.binance import PRODUCTION_URL, BinanceError, BinanceSpot
+from tbot.backtest.runner import run_period
+from tbot.data.store import BarStore
+from tbot.exchange.binance import PRODUCTION_URL, TESTNET_URL, BinanceError, BinanceSpot
 from tbot.live.config import LiveConfig, SessionConfig, Settings
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.runner import (
@@ -17,7 +21,9 @@ from tbot.live.runner import (
     make_spot,
     restore_portfolio,
     symbols_of,
+    valid_url,
 )
+from tbot.portfolio.allocation import build_slots
 
 MAX_CLOCK_OFFSET = 1.0  # seconds; the bot corrects for it, but a drifting clock needs a fix
 
@@ -32,9 +38,18 @@ class Check:
 
 
 async def run_checks(
-    config: SessionConfig, settings: Settings, client: httpx.AsyncClient
+    config: SessionConfig,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    store: BarStore | None = None,
 ) -> list[Check]:
-    checks = ledger_checks(config) + alert_checks(settings)
+    checks = strategy_checks(config) + ledger_checks(config) + alert_checks(settings)
+    if checks[0].status == "fail":
+        return checks  # nothing below means much for a config that cannot start
+    if settings.heartbeat_url and valid_url(settings.heartbeat_url):
+        checks.append(await heartbeat_check(settings.heartbeat_url, client))
+    if store is not None:
+        checks.append(await asyncio.to_thread(guard_check, config, store))
     live = config if isinstance(config, LiveConfig) else None
     public = BinanceSpot(client, "", "", base_url=PRODUCTION_URL)
     try:
@@ -59,7 +74,53 @@ async def run_checks(
     return checks
 
 
+def strategy_checks(config: SessionConfig) -> list[Check]:
+    try:
+        slots = build_slots(config.strategies)
+    except ValidationError as exc:
+        details = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+        return [Check("fail", "strategies", details)]
+    except ValueError as exc:
+        return [Check("fail", "strategies", str(exc))]
+    names = ", ".join(f"{s.strategy.name} {s.timeframe}" for s in slots)
+    return [Check("ok", "strategies", names)]
+
+
+def guard_check(config: SessionConfig, store: BarStore) -> Check:
+    """Would the kill switch have stopped this config on the stored history?"""
+    if not config.guard.max_drawdown:
+        return Check("warn", "kill switch", "off (guard.max_drawdown is 0)")
+    firsts = [store.first_open_time(s, c.timeframe) for c in config.strategies for s in c.symbols]
+    if any(first is None for first in firsts):
+        return Check("warn", "kill switch", "no stored history to test it on; run `tbot download`")
+    start = max(f for f in firsts if f is not None) + timedelta(days=90)  # after the warmup
+    try:
+        result = run_period(config, store, start, None, config.guard)
+    except ValueError as exc:
+        return Check("warn", "kill switch", f"could not test it on history: {exc}")
+    limit = f"{config.guard.max_drawdown:.0%}"
+    if result.halted:
+        return Check(
+            "warn",
+            "kill switch",
+            f"at {limit} it would have halted the backtest on {result.halted}; "
+            "a strategy's normal drawdowns should stay inside it",
+        )
+    return Check("ok", "kill switch", f"{limit} never tripped on history since {start:%Y-%m-%d}")
+
+
+async def heartbeat_check(url: str, client: httpx.AsyncClient) -> Check:
+    try:
+        response = await client.get(url, timeout=10.0)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        return Check("fail", "heartbeat", f"ping failed: {exc!r}")
+    return Check("ok", "heartbeat", f"ping answered {response.status_code}")
+
+
 def ledger_checks(config: SessionConfig) -> list[Check]:
+    if config.ledger.exists() and not config.ledger.is_file():
+        return [Check("fail", "ledger", f"{config.ledger} is not a file")]
     if not config.ledger.is_file():
         return [Check("ok", "ledger", f"none yet; the first start creates {config.ledger}")]
     try:
@@ -98,12 +159,15 @@ def alert_checks(settings: Settings) -> list[Check]:
         telegram = Check("fail", "telegram", "set both TBOT_TELEGRAM_TOKEN and _CHAT_ID")
     else:
         telegram = Check("warn", "telegram", "not configured: alerts only reach the log")
-    heartbeat = (
-        Check("ok", "heartbeat", "configured")
-        if settings.heartbeat_url
-        else Check("warn", "heartbeat", "not configured: nobody hears about a dead bot")
-    )
-    return [telegram, heartbeat]
+    url = settings.heartbeat_url
+    if not url:
+        return [
+            telegram,
+            Check("warn", "heartbeat", "not configured: nobody hears about a dead bot"),
+        ]
+    if not valid_url(url):
+        return [telegram, Check("fail", "heartbeat", "TBOT_HEARTBEAT_URL must start with https://")]
+    return [telegram]  # pinged once the network is known to work
 
 
 async def symbol_checks(config: SessionConfig, spot: BinanceSpot) -> list[Check]:
@@ -135,7 +199,9 @@ async def account_checks(
             config, settings, client, lambda: datetime.now(UTC) + timedelta(seconds=offset)
         )
     except ValueError as exc:
-        return [Check("fail", "api key", str(exc))]
+        url = TESTNET_URL if config.mode == "testnet" else PRODUCTION_URL
+        symbols = await symbol_checks(config, BinanceSpot(client, "", "", base_url=url))
+        return [*symbols, Check("fail", "api key", str(exc))]
     checks = await symbol_checks(config, spot)
     try:
         account = await spot.account()
@@ -203,5 +269,9 @@ def checks_text(checks: list[Check]) -> str:
     lines = [f"{c.status.upper():<5}{c.name}: {c.detail}" for c in checks]
     failed = sum(c.status == "fail" for c in checks)
     warned = sum(c.status == "warn" for c in checks)
-    lines.append(f"{failed} problems, {warned} warnings")
+    lines.append(f"{_count(failed, 'problem')}, {_count(warned, 'warning')}")
     return "\n".join(lines)
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}{'' if number == 1 else 's'}"

@@ -446,3 +446,31 @@ def test_an_order_lost_on_the_way_is_failed_only_after_a_second_look(
 
     run(fake, tmp_path, action, stop_pct=0.0)
     assert fake.orders == []
+
+
+def test_a_failed_stop_replacement_is_alerted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Collect:
+        portfolio = Portfolio(1000.0)
+        await executor.execute({BTC: 0.01}, T0, portfolio, MARKS)
+        await executor.after_event(portfolio, MARKS)  # the first stop is placed
+        place = executor.spot.stop_loss_order
+
+        async def rejected(*args: object) -> Order:
+            raise BinanceError(-2010, "Stop price would trigger immediately.", 400)
+
+        monkeypatch.setattr(executor.spot, "stop_loss_order", rejected)
+        await executor.after_event(portfolio, MARKS)  # the old stop is cancelled first
+        await executor.protect(portfolio, MARKS)
+        monkeypatch.setattr(executor.spot, "stop_loss_order", place)
+        await executor.protect(portfolio, MARKS)
+        return notifier
+
+    messages = run(fake, tmp_path, action).messages
+    failed = [m for m in messages if "protective stop failed" in m]
+    assert len(failed) == 1
+    assert "has no exchange stop" in failed[0]
+    assert messages[-1].endswith("protective stop for BTCUSDT placed")

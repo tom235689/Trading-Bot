@@ -247,3 +247,13 @@ def test_windows_do_not_drift_after_short_months() -> None:
         (date(2018, 4, 30), date(2018, 5, 31)),
     ]
     assert all(a[1] == b[0] for a, b in pairwise(tests))
+
+
+def test_validation_rejects_a_guard(tmp_path: Path) -> None:
+    path = write_validation(tmp_path)
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        base.read_text(encoding="utf-8") + "guard: {max_drawdown: 0.3}\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="without a guard"):
+        load_validation_config(path)

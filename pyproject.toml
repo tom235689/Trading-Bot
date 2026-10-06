@@ -1,6 +1,6 @@
 [project]
 name = "tbot"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-strategy crypto trading bot for Binance"
 readme = "README.md"
 requires-python = ">=3.12"

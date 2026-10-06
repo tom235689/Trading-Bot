@@ -1,11 +1,13 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+import polars as pl
 import pytest
 
 from factories import price_bars
-from tbot.backtest.attribution import format_attribution, run_attribution
+from tbot.backtest.attribution import _dated_returns, format_attribution, run_attribution
 from tbot.backtest.config import BacktestConfig
+from tbot.backtest.engine import BacktestResult
 from tbot.cli import main
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
@@ -93,3 +95,17 @@ def test_correlation_pairs_days_by_date(store: BarStore) -> None:
         }
     )
     assert run_attribution(config, store).correlation[0][1] > 0.9
+
+
+def test_a_midnight_close_ends_the_day_before() -> None:
+    times = [datetime(2024, 1, 1, 12, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC)]
+    result = BacktestResult(
+        initial_cash=100.0,
+        equity=pl.DataFrame({"time": times, "equity": [100.0, 110.0]}),
+        fills=pl.DataFrame(),
+        trades=pl.DataFrame(),
+        positions={},
+    )
+    daily = _dated_returns(result, "r")
+    assert daily["day"].to_list() == [date(2024, 1, 1)]
+    assert daily["r"].to_list() == pytest.approx([0.1])

@@ -7,6 +7,7 @@ import pytest
 from factories import price_bars
 from tbot.backtest.config import BacktestConfig, load_config
 from tbot.backtest.runner import run_backtest
+from tbot.cli import main
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 
@@ -90,3 +91,16 @@ def test_streams_stop_at_the_earliest_last_close(tmp_path: Path) -> None:
     text = CONFIG.replace("symbols: [btc/usdt]", "symbols: [btc/usdt, eth/usdt]")
     result = run_backtest(load_config(write_config(tmp_path, text)), store)
     assert result.equity["time"][-1] == T0 + H4.delta * 40
+
+
+def test_backtest_command_says_when_a_stream_ends_early(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = BarStore(tmp_path / "data")
+    flat = [100.0] * 60
+    store.write("BTCUSDT", H4, price_bars(T0, H4, flat, flat))
+    store.write("ETHUSDT", H4, price_bars(T0, H4, flat[:40], flat[:40]))
+    text = CONFIG.replace("symbols: [btc/usdt]", "symbols: [btc/usdt, eth/usdt]")
+    path = write_config(tmp_path, text)
+    assert main(["backtest", str(path), "--data-dir", str(tmp_path / "data")]) == 0
+    assert "Note: ETHUSDT 4h data ends 2024-01-07 16:00" in capsys.readouterr().out

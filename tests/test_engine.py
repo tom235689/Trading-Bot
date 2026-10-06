@@ -189,3 +189,31 @@ def test_daily_loss_limit_blocks_entries_only() -> None:
     result = engine.run()
     assert result.fills.height == 1  # the add was blocked
     assert result.halted == ""
+
+
+def test_halt_sells_a_symbol_on_a_slower_stream() -> None:
+    # Events come hourly (BTC 1h) while ETH trades on 4h bars: the flatten order must keep
+    # its decision time until ETH's next bar, or it would never fill.
+    flat = [100.0] * 24
+    eth = [100.0, 100.0, 60.0, 60.0, 60.0, 60.0]
+    bars = {
+        ("BTC", H1): price_bars(T0, H1, flat, flat),
+        ("ETH", H4): price_bars(T0, H4, [100.0, *eth[:-1]], eth),
+    }
+    engine = BacktestEngine(
+        [
+            StrategySlot(Scripted(["ETH"], {"script": {at(4): {"ETH": 1.0}}}), H4, 0.5),
+            StrategySlot(Scripted(["BTC"], {"script": {}}), H1, 0.5),
+        ],
+        bars,
+        start=T0,
+        initial_cash=1000.0,
+        costs=COSTS,
+        risk=RiskLimits(),
+        rules=RULES,
+        guard=GuardConfig(daily_loss_limit=0, max_drawdown=0.15, stale_seconds=0),
+    )
+    result = engine.run()
+    assert result.halted.startswith("2024-01-01 12:00")
+    assert result.positions.get("ETH", 0.0) == 0.0
+    assert result.fills.filter(pl.col("quantity") < 0)["time"].to_list() == [at(12)]

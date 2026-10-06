@@ -92,6 +92,10 @@ def load_validation_config(path: Path) -> tuple[ValidationConfig, BacktestConfig
     base = load_config(path.parent / config.backtest)
     if len(base.strategies) != 1:
         raise ValueError("validation targets exactly one strategy")
+    if base.guard is not None:
+        raise ValueError(
+            "validation measures the strategy without a guard; check a guard with `tbot backtest`"
+        )
     if config.holdout_start <= base.start:
         raise ValueError("holdout_start must be after the backtest start")
     if base.end is not None and config.holdout_start >= base.end:
@@ -245,8 +249,8 @@ def _plateau(
 
 
 def _deflated(returns: npt.NDArray[np.float64], annual_sharpes: list[float]) -> DeflatedSharpe:
-    # A trial without a Sharpe (no trades) still counts as an attempt, not in the spread.
-    trials = [daily_sharpe(s) for s in annual_sharpes if math.isfinite(s)]
+    # A trial without a Sharpe (no trades) is an attempt that found nothing: Sharpe 0.
+    trials = [daily_sharpe(s) if math.isfinite(s) else 0.0 for s in annual_sharpes]
     variance = float(np.var(trials, ddof=1)) if len(trials) > 1 else 0.0
     std = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
     sharpe = float(returns.mean()) / std if std > 0 else math.nan

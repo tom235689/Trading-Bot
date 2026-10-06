@@ -11,6 +11,7 @@ import pytest
 
 from binance_fake import Row, make_rows
 from tbot.core.timeframe import Timeframe, to_millis
+from tbot.data.binance_rest import fetch_klines
 from tbot.data.schema import from_rows
 from tbot.data.store import BarStore
 from tbot.live.feed import LiveFeed, StreamKey, close_time
@@ -340,3 +341,21 @@ def test_catch_up_queues_bars_in_close_order(tmp_path: Path) -> None:
         closes.append((close_time(key, bar), key[1]))
     assert closes == sorted(closes, key=lambda item: (item[0], item[1].millis))
     assert closes[3:5] == [(at(4), H1), (at(4), H4)]  # together, before the 5h close
+
+
+def test_a_failed_catch_up_loses_no_bar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    eth = ("ETHUSDT", H1)
+    feed, _, _ = make_feed(tmp_path, [BTC1, eth], now=at(5.5), rows={BTC1: make_rows(T0, 6, H1)})
+    feed.last = {BTC1: at(1), eth: at(1)}
+
+    def broken(client: httpx.Client, symbol: str, *args: object) -> pl.DataFrame:
+        if symbol == "ETHUSDT":
+            raise httpx.ConnectError("down")
+        return fetch_klines(client, symbol, *args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("tbot.live.feed.fetch_klines", broken)
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(feed.catch_up())
+    assert feed.last[BTC1] == at(1)  # nothing was taken in, so the retry gets it all
+    assert feed.queue.empty()
+    assert asyncio.run(feed.catch_up([BTC1])) == 3

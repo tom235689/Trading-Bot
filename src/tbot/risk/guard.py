@@ -14,7 +14,9 @@ class GuardConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     daily_loss_limit: float = Field(default=0.03, ge=0, lt=1)  # below day open: no new entries
-    max_drawdown: float = Field(default=0.15, ge=0, lt=1)  # below peak: flatten and halt
+    # Below the peak by this much: flatten and halt. Set it beyond the strategy's normal
+    # drawdowns (validation's Monte Carlo); 0.45 suits the shipped Donchian settings.
+    max_drawdown: float = Field(default=0.45, ge=0, lt=1)
     stale_seconds: float = Field(default=900, ge=0)  # bar older than this: skip the event
 
 
@@ -60,7 +62,7 @@ class RiskGuard:
             return Decision(Mode.HALT, state.halt_reason)
         if cfg.max_drawdown and equity < state.peak_equity * (1 - cfg.max_drawdown):
             drawdown = equity / state.peak_equity - 1
-            self.halt(f"drawdown {drawdown:.1%} beyond {cfg.max_drawdown:.0%} limit")
+            self.halt(f"drawdown {drawdown:.1%} beyond {_percent(cfg.max_drawdown)} limit")
             return Decision(Mode.HALT, state.halt_reason)
         if cfg.stale_seconds and (now - bar_time).total_seconds() > cfg.stale_seconds:
             age = (now - bar_time).total_seconds()
@@ -68,7 +70,7 @@ class RiskGuard:
         if cfg.daily_loss_limit and equity < state.day_open_equity * (1 - cfg.daily_loss_limit):
             loss = equity / state.day_open_equity - 1
             return Decision(
-                Mode.REDUCE_ONLY, f"day loss {loss:.1%} beyond {cfg.daily_loss_limit:.0%}"
+                Mode.REDUCE_ONLY, f"day loss {loss:.1%} beyond {_percent(cfg.daily_loss_limit)}"
             )
         return Decision(Mode.NORMAL)
 
@@ -110,3 +112,7 @@ class RiskGuard:
     @staticmethod
     def flatten_orders(positions: Mapping[str, float]) -> dict[str, float]:
         return {symbol: -quantity for symbol, quantity in positions.items() if quantity}
+
+
+def _percent(fraction: float) -> str:
+    return f"{fraction * 100:g}%"

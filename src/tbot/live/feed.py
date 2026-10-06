@@ -103,25 +103,33 @@ class LiveFeed:
     async def catch_up(self, keys: Sequence[StreamKey] | None = None) -> int:
         """Fetch bars closed since the last emitted one via REST.
 
-        They are queued only once every stream is fetched, in close order: a 1h bar queued
-        ahead of the 4h bar closing with it would release that event without it.
+        Every stream is fetched before any bar is stored or queued, so a failed fetch
+        leaves nothing half done. Then they are queued in close order with no await in
+        between: a 1h bar queued ahead of the 4h bar closing with it would release that
+        event without it.
         """
-        items: list[_Item] = []
+        fetched = []
         for key in keys or self.keys:
             symbol, timeframe = key
             last = self.last[key]
             end = timeframe.floor(self.clock())
             start = last + timeframe.delta if last is not None else end - timeframe.delta * 2
-            if start >= end:
-                continue
-            bars = await asyncio.to_thread(fetch_klines, self.client, symbol, timeframe, start, end)
-            accepted = self._accept(key, bars)
-            if accepted.height:
-                log.info("catch_up", symbol=symbol, timeframe=str(timeframe), bars=accepted.height)
-            items.extend(_item(key, row) for row in accepted.iter_slices(1))
-        items.sort(key=lambda item: (item[0], item[1][1].millis, item[1][0]))
-        for _, key, row in items:
-            self.queue.put_nowait((key, row))
+            if start < end:
+                bars = await asyncio.to_thread(
+                    fetch_klines, self.client, symbol, timeframe, start, end
+                )
+                fetched.append((key, bars))
+        items: list[_Item] = []
+        try:
+            for key, bars in fetched:
+                accepted = self._accept(key, bars)  # stored and marked seen: must be queued
+                if accepted.height:
+                    log.info("catch_up", symbol=key[0], timeframe=str(key[1]), bars=accepted.height)
+                items.extend(_item(key, row) for row in accepted.iter_slices(1))
+        finally:
+            items.sort(key=lambda item: (item[0], item[1][1].millis, item[1][0]))
+            for _, key, row in items:
+                self.queue.put_nowait((key, row))
         return len(items)
 
     # tasks

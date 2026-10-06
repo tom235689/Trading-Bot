@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from factories import price_bars
-from tbot.cli import main
+from tbot.cli import EXIT_CONFIG, main
 from tbot.core.config import StrategyConfig
 from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
@@ -15,7 +15,7 @@ from tbot.execution.sim_broker import CostModel, SimulatedBroker
 from tbot.live.compare import compare_session, comparison_text, match_fills
 from tbot.live.config import PaperConfig
 from tbot.live.executor import PaperExecutor
-from tbot.live.ledger import Ledger
+from tbot.live.ledger import Adjustment, Ledger
 from tbot.live.runner import SessionTrader, build_session, restore_portfolio
 from tbot.risk.guard import GuardConfig, RiskGuard
 
@@ -150,5 +150,35 @@ def test_compare_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     assert "verdict: tracks the backtest" in capsys.readouterr().out
     fresh = cfg.model_copy(update={"ledger": tmp_path / "never_ran.sqlite"})
     path.write_text(fresh.model_dump_json(), encoding="utf-8")
-    with pytest.raises(SystemExit, match="no ledger"):
-        main(["compare", str(path)])
+    assert main(["compare", str(path)]) == EXIT_CONFIG
+    assert "no ledger" in capsys.readouterr().err
+
+
+def test_money_moved_in_by_reconciliation_is_taken_out(tmp_path: Path) -> None:
+    cfg, store = run_session(tmp_path)
+    with Ledger(cfg.ledger) as ledger:
+        first = ledger.equity_points()[0].time
+        # An account holding 500 more than initial_cash: the startup reconcile books it.
+        ledger.add_adjustment(Adjustment(first - timedelta(minutes=1), "", 0.0, 500.0, "cash"))
+        ledger.conn.execute("UPDATE equity SET equity = equity + 500")
+        ledger.conn.commit()
+        comparison = compare_session(cfg, ledger, store)
+    assert comparison.flows == pytest.approx(500.0)
+    assert comparison.max_gap < 0.005
+    assert comparison.checks() == []
+    assert "moved +500.00" in comparison_text(comparison, "paper.sqlite")
+
+
+def test_a_protective_stop_fill_is_named_not_priced(tmp_path: Path) -> None:
+    cfg, store = run_session(tmp_path)
+    with Ledger(cfg.ledger) as ledger:
+        position = sum(f.quantity for f in ledger.fills())
+        when = ledger.equity_points()[5].time + timedelta(minutes=30)
+        stop = Fill(when, "BTCUSDT", -abs(position) or -0.01, 1.0, 0.0)
+        ledger.add_fill(stop, 1.0)
+        ledger.add_order(when, "BTCUSDT", stop.quantity, "filled", "protective stop", "tbs1")
+        comparison = compare_session(cfg, ledger, store)
+    assert comparison.stop_fills == 1
+    assert stop not in comparison.session_only
+    assert all(m.session != stop for m in comparison.matched)
+    assert "1 protective stop fills" in comparison_text(comparison, "paper.sqlite")

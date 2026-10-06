@@ -6,7 +6,7 @@ point at costs the backtest underestimates, downtime, or behaviour that differs 
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from tbot.backtest.engine import BacktestResult
 from tbot.backtest.runner import run_period
@@ -49,6 +49,8 @@ class Comparison:
     max_gap: float  # largest relative equity gap at shared bar closes
     adjustments: int
     slippage_bps: float
+    flows: float = 0.0  # money reconciliation moved into the book, taken out of its equity
+    stop_fills: int = 0  # protective stops that executed; the backtest has none
 
     @property
     def mean_extra_cost_bps(self) -> float | None:
@@ -58,6 +60,11 @@ class Comparison:
 
     def checks(self) -> list[str]:
         found = []
+        if self.stop_fills:
+            found.append(
+                f"{self.stop_fills} protective stop fills: the backtest has no exchange stop, "
+                "so the fills after them differ"
+            )
         if self.missed:
             found.append(
                 f"{len(self.missed)} bar events without a session snapshot, first "
@@ -76,8 +83,6 @@ class Comparison:
             )
         if self.max_gap > MAX_EQUITY_GAP:
             found.append(f"equity drifted up to {self.max_gap:.1%} from the backtest")
-        if self.adjustments:
-            found.append(f"{self.adjustments} reconciliation adjustments are in the session equity")
         return found
 
 
@@ -101,10 +106,22 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
             " or let the session run longer"
         )
 
+    # Deposits, withdrawals, and the startup reconcile of an account move money in or out;
+    # valued when they happened and taken out, the rest is what trading did.
+    flows = [
+        (a.time, a.cash + a.quantity * _price_at(config, store, a.symbol, a.time))
+        for a in ledger.adjustments()
+    ]
+
+    def traded(t: datetime) -> float:
+        return session_by_time[t].equity - sum(value for at, value in flows if at <= t)
+
     backtest_equity = dict(zip(result.equity["time"], result.equity["equity"], strict=True))
-    gaps = [abs(session_by_time[t].equity / backtest_equity[t] - 1) for t in shared]
+    gaps = [abs(traded(t) / backtest_equity[t] - 1) for t in shared]
     fills = ledger.fills()
-    session_fills = [f for f in fills if start <= f.time < end + step]
+    stops = ledger.stop_fill_keys()
+    in_period = [f for f in fills if start <= f.time < end + step]
+    session_fills = [f for f in in_period if (_iso(f.time), f.symbol) not in stops]
     matched, session_only, backtest_only = match_fills(
         session_fills, [f for f in _fills(result) if f.time <= end], step
     )
@@ -114,19 +131,38 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
         end=last,
         bar_events=len(backtest_times),
         missed=[t for t in backtest_times if t not in session_by_time],
-        session_equity=session_by_time[last].equity,
+        session_equity=traded(last),
         backtest_equity=backtest_equity[last],
         initial_cash=config.initial_cash,
         matched=matched,
         session_only=session_only,
         backtest_only=backtest_only,
         pending=sum(1 for f in fills if f.time >= end + step),
-        session_fees=sum(f.fee for f in session_fills),
+        session_fees=sum(f.fee for f in in_period),
         backtest_fees=sum(m.backtest.fee for m in matched) + sum(f.fee for f in backtest_only),
         max_gap=max(gaps),
-        adjustments=len(ledger.adjustments()),
+        adjustments=len(flows),
         slippage_bps=config.costs.slippage_bps,
+        flows=sum(value for at, value in flows if at <= last),
+        stop_fills=len(in_period) - len(session_fills),
     )
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(UTC).isoformat()
+
+
+def _price_at(config: SessionConfig, store: BarStore, symbol: str, moment: datetime) -> float:
+    """Close of the symbol's finest stream at or before moment (the next one if none)."""
+    if not symbol:
+        return 0.0  # a cash-only adjustment
+    timeframe = min(
+        (c.timeframe for c in config.strategies if symbol in c.symbols), key=lambda t: t.millis
+    )
+    bars = store.read(symbol, timeframe, moment - timeframe.delta * 50, moment + timeframe.delta)
+    closed = bars.filter(bars["open_time"] + timeframe.delta <= moment)
+    chosen = closed if not closed.is_empty() else bars
+    return float(chosen["close"][-1 if not closed.is_empty() else 0]) if chosen.height else 0.0
 
 
 def match_fills(
@@ -198,6 +234,11 @@ def comparison_text(c: Comparison, ledger_path: str) -> str:
             f"{worst:+.1f} bps (modeled slippage {c.slippage_bps:g} bps; positive is worse)"
         )
     lines.append(f"largest equity gap: {c.max_gap:.2%}")
+    if c.adjustments:
+        lines.append(
+            f"{c.adjustments} reconciliation adjustments moved {c.flows:+,.2f}; "
+            "taken out of the session's equity"
+        )
     if c.pending:
         lines.append(f"not compared yet: {c.pending} session fills after the last complete bar")
     for label, fills in (("session only", c.session_only), ("backtest only", c.backtest_only)):

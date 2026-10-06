@@ -1,6 +1,6 @@
 # Trading Bot Design
 
-Status: v1, phases 0-6 implemented (updated 2026-10-05)
+Status: v1, phases 0-6 implemented (updated 2026-10-06)
 
 ## 1. Goals and Non-Goals
 
@@ -161,9 +161,9 @@ Independent layer with veto power. Values below are the intended live defaults a
 | Rule | Default |
 |---|---|
 | Risk per trade | 0.5-1% of equity, sized from stop distance |
-| Max weight per symbol | 30% |
+| Max weight per symbol | 50% (two symbols share the allocation) |
 | Gross exposure | 100% spot; max 2x leverage on perpetuals |
-| Daily loss limit | -3%: block new entries until next UTC day |
+| Daily loss limit | -3% below the UTC day's opening equity: reduce-only while it lasts |
 | Max drawdown | -45%: flatten all and halt (kill switch); set beyond the strategy's 5th-percentile Monte Carlo drawdown so it trips on a failure, not a normal drawdown |
 | Order sanity | Reject prices far from mid, below min notional, or off tick/step size |
 | Stale data | Block trading if the latest bar is older than expected |
@@ -184,7 +184,7 @@ The kill switch state is persisted. A restart does not resume trading; a human m
 - **Order type**: market orders for now. Post-only limit with a market fallback is a later improvement.
 - **Protective stops**: after every event a `STOP_LOSS_LIMIT` sell sits on the exchange for each held position at `protective_stop_pct` below the last close (limit 0.5% under the stop; in a gap through the limit it may not fill). Stops are cancelled before a sell (they lock the balance) and re-placed afterwards. The stop in force is remembered in the ledger; whatever part of it executed, between events or while the bot was down, is booked as a fill (fee at the configured rate) before the next reconciliation.
 - **Ownership** (`ownership` in testnet and live configs): `budget` (default) means the bot owns `initial_cash` and what it buys with it; every other balance in the account, including coins of the traded symbols bought by hand, is the owner's and is never adopted or sold. `account` means the bot owns the whole spot account; use it only for a dedicated account.
-- **Reconciliation** (`tbot/live/reconcile.py`): on startup and every `reconcile_seconds`, after `settle`, base balances (free plus locked) are compared with booked positions and free quote with booked cash. Differences beyond the lot step or `reconcile_tolerance` (cash: at least one quote unit) move the book to the exchange, in `budget` mode only downward; they are written to the ledger's `adjustments` table and alerted. Restoring a book replays fills and adjustments in time order. Reconciliation and event handling share a lock, so the book is never compared with the exchange while an order is in flight. Testnet and live default to separate ledgers and log files (`data/<mode>.sqlite`, `logs/<mode>.jsonl`).
+- **Reconciliation** (`tbot/live/reconcile.py`): on startup and every `reconcile_seconds`, after `settle`, base balances (free plus locked) are compared with booked positions and quote (free plus locked, so an owner's open order is no loss) with booked cash. Differences beyond the lot step or `reconcile_tolerance` (cash: at least one quote unit) move the book to the exchange, in `budget` mode only downward; they are written to the ledger's `adjustments` table and alerted. Restoring a book replays fills and adjustments in time order. Reconciliation and event handling share a lock, so the book is never compared with the exchange while an order is in flight. Testnet and live default to separate ledgers and log files (`data/<mode>.sqlite`, `logs/<mode>.jsonl`).
 
 ### 5.7 Binance Adapter
 
@@ -201,7 +201,7 @@ The kill switch state is persisted. A restart does not resume trading; a human m
 
 Two tiers:
 
-1. **Research (vectorized)**: pandas or polars over full arrays. Screens many ideas quickly. Never used for final decisions.
+1. **Research (vectorized)**: polars over full arrays, to screen many ideas quickly; never used for final decisions. Not built yet: every result so far comes from the event-driven engine.
 2. **Validation (event-driven)**: reuses the live engine with a simulated broker.
 
 **Event loop** (validation tier): events are bar close times across all loaded streams. At each event the engine reveals bars closing now, fills pending orders, marks positions at the latest close and records equity, runs strategies whose bars closed, then combines targets, applies risk limits, and queues orders for the symbols whose execution stream (finest loaded timeframe) closed now; other symbols keep their pending orders, so a faster stream of another symbol never postpones a fill. Paper and live plan orders the same way. Before `start`, strategies run to build state but nothing trades. With a `guard` in the config the engine applies it after marking: reduce-only filters orders, a halt flattens at the next open and ends trading. Without an `end`, every stream stops at the earliest last close among them.
@@ -233,11 +233,12 @@ Two tiers:
 - Telegram alerts (`TBOT_TELEGRAM_TOKEN`, `TBOT_TELEGRAM_CHAT_ID`): start and stop, every fill, failed price lookups, stale streams, task crashes, and a daily summary at `summary_hour_utc`. Without a token, alerts go to the log. A failed send is logged and never stops trading. Also sent: kill switch, entries blocked, paused and resumed trading, reconciliation adjustments and failures, orders in doubt and their resolution, protective stops that executed, and a failed start. `tbot notify` sends a test message.
 - External heartbeat (`TBOT_HEARTBEAT_URL`): the bot pings an outside monitor every `heartbeat_seconds`. If pings stop, the monitor alerts. A dead bot cannot alert on its own, so this is the only way to learn about a hard kill; it means alive, not trading (a halted bot keeps pinging).
 - `tbot status <config>` prints the ledger: equity, positions, recent fills and events, and the last stored bar per stream.
-- `tbot doctor <config>` checks a session before it runs: ledger (kill switch, orders in doubt, a running process), Telegram and heartbeat settings, Binance reachability and clock offset, tradable symbols, and for testnet and live the API key, the account's trading permission, and in budget mode whether free USDT covers the bot's cash. On production it reads the key's restrictions and fails if the key can withdraw. Exit code 1 on any failure.
-- `tbot compare <config>` replays the session's period through the backtest engine with the same settings, guard included, and compares bar events, fills (matched by symbol, side, and time within one bar), prices against the backtest's, and equity (step 8 of the validation pipeline). Missed bars point at downtime; a mean price gap above the modeled slippage means the backtest underestimates costs. Exit code 1 when it does not track.
+- `tbot doctor <config>` checks a session before it runs: the strategies and their params (a config that cannot start fails first), the ledger (a damaged file, the kill switch, orders in doubt, a running process), Telegram and the heartbeat URL (pinged once), Binance reachability and clock offset, tradable symbols, whether the configured kill switch would have halted a backtest on the stored history, and for testnet and live the API key, the account's trading permission, and in budget mode whether free USDT covers the bot's cash. On production it reads the key's restrictions and fails if the key can withdraw. Exit code 1 on any failure.
+- `tbot stop <config>` leaves a request file next to the ledger; the running session finishes the event in progress and stops with exit code 0, which also ends the supervisor.
+- `tbot compare <config>` replays the session's period through the backtest engine with the same settings, guard included, and compares bar events, fills (matched by symbol, side, and time within one bar), prices against the backtest's, and equity (step 8 of the validation pipeline). Missed bars point at downtime; a mean price gap above the modeled slippage means the backtest underestimates costs. Protective stop fills are named, not priced, since the backtest has no exchange stop; reconciliation adjustments are valued when they happened and taken out of the session's equity. Exit code 1 when it does not track.
 - Dashboard (`tbot dashboard <config>`, `tbot backtest --html`; `tbot/monitoring/dashboard.py`): one self-contained HTML file with stat tiles, equity and drawdown charts (inline SVG, crosshair tooltip, light and dark mode, table view), open positions, recent fills and events. Static on purpose: nothing listens on the trading machine; generate it on demand or on a schedule. Per-strategy performance is the attribution report.
 
-**Paper session** (`tbot paper <config>`, `tbot/live/runner.py`): the session (`tbot/live/session.py`) runs the backtest's decision path one event at a time: append the bars that closed, mark, run the strategies whose bars closed, combine targets, apply risk limits, plan orders. Paper fills happen at once at the live book price (ask for buys, bid for sells) through the same simulated broker with fees and slippage. Every signal, order, fill, and equity snapshot goes to a SQLite ledger. On start the bot syncs the store, rebuilds the portfolio by replaying the ledger's fills and adjustments, rebuilds strategy state by replaying stored history and restoring the saved targets (ignored if the strategies changed), and warns if the trading config changed since the ledger was created. A start that fails is logged and alerted with exit code 1. On a graceful stop, an event in progress finishes its orders first (up to a minute). Fills are timestamped with the wall clock; equity snapshots with the bar close. A test proves the session reproduces the backtest engine bar for bar when fills use the next bar's open.
+**Paper session** (`tbot paper <config>`, `tbot/live/runner.py`): the session (`tbot/live/session.py`) runs the backtest's decision path one event at a time: append the bars that closed, mark, run the strategies whose bars closed, combine targets, apply risk limits, plan orders. Paper fills happen at once at the live book price (ask for buys, bid for sells) through the same simulated broker with fees and slippage. Every signal, order, fill, and equity snapshot goes to a SQLite ledger. On start the bot syncs the store, rebuilds the portfolio by replaying the ledger's fills and adjustments, rebuilds strategy state by replaying stored history and restoring the saved targets (ignored if the strategies changed), and warns if the trading config changed since the ledger was created. A start that fails is logged and alerted with exit code 1. Exit codes 3 (the ledger is in use, damaged, or SQLite cannot load) and 4 (a wrong config or command, including unknown strategies, checked before the start) tell the supervisor not to retry; every command prints one line for an error instead of a traceback (`TBOT_DEBUG=1` shows it). On a graceful stop, an event in progress finishes its orders first (up to a minute). Fills are timestamped with the wall clock; equity snapshots with the bar close. A test proves the session reproduces the backtest engine bar for bar when fills use the next bar's open.
 
 ### 5.11 Security and Configuration
 
@@ -314,17 +315,17 @@ Trading-Bot/
   src/tbot/
     core/                # config, models, timeframes
     data/                # download, storage, quality checks
-    live/                # feed, session, executor, guard, ledger, reconciliation
+    live/                # feed, session, executor, ledger, reconciliation, doctor, compare
     strategies/          # base, registry, plugins
     portfolio/           # positions, pnl, allocation
-    risk/                # exposure limits, volatility targeting
+    risk/                # exposure limits, volatility targeting, session guard
     execution/           # rebalance planning, sim broker
     exchange/            # binance adapter
-    backtest/            # engine, cost models, reports
+    backtest/            # engine, runner, metrics, attribution, reports
     research/            # sweep, walk-forward, Monte Carlo, trial log, validation
     monitoring/          # logging, alerts, heartbeat, dashboard
-    cli.py               # download check backtest validate paper live doctor status
-                         # compare resume account dashboard notify
+    cli.py               # download check backtest validate paper live doctor stop
+                         # status compare resume account dashboard notify
   tests/
 ```
 

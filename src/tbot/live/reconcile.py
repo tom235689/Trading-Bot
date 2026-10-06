@@ -8,7 +8,7 @@ Two ownership modes:
   both ways.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Literal
 
@@ -36,11 +36,13 @@ async def reconcile(
     ownership: Ownership = "account",
     label: str = "live",
     balances: Mapping[str, Balance] | None = None,
+    on_adjust: Callable[[list[Adjustment]], None] | None = None,
 ) -> list[Adjustment]:
     """Move the book to the exchange where they differ beyond tolerance; record why.
 
     In budget mode the book only moves down to the exchange, never below zero: a book
-    that went negative (a fill booked twice) is set back to zero.
+    that went negative (a fill booked twice) is set back to zero. on_adjust runs in the
+    same ledger transaction as the adjustments (the guard shift), so a crash splits neither.
     """
     if balances is None:
         balances = await spot.balances()
@@ -70,10 +72,16 @@ async def reconcile(
         note = f"cash: book {portfolio.cash:.2f}, exchange {cash:.2f}"
         adjustments.append(Adjustment(now, "", 0.0, target - portfolio.cash, note))
 
+    if not adjustments:
+        return adjustments
+    with ledger.atomic():
+        for adjustment in adjustments:
+            ledger.add_adjustment(adjustment)
+            ledger.add_event(now, "warning", f"reconciled {adjustment.note}")
+        if on_adjust is not None:
+            on_adjust(adjustments)
     for adjustment in adjustments:
         portfolio.adjust(adjustment.symbol, adjustment.quantity, adjustment.cash)
-        ledger.add_adjustment(adjustment)
-        ledger.add_event(now, "warning", f"reconciled {adjustment.note}")
         log.warning("reconciled", note=adjustment.note)
     if adjustments:
         lines = "\n".join(a.note for a in adjustments)

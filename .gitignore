@@ -20,8 +20,9 @@ htmlcov/
 .env.*
 !.env.example
 
-# Runtime data (root only; src/tbot/data is code)
-/data/
+# Runtime data (root only; src/tbot/data is code). The trial log is the research record.
+/data/*
+!/data/trials.jsonl
 /logs/
 /reports/
 *.db

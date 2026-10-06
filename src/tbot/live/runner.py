@@ -20,7 +20,7 @@ from tbot.core.config import TradingConfig
 from tbot.core.models import Fill
 from tbot.data.downloader import sync
 from tbot.data.store import BarStore
-from tbot.exchange.binance import PRODUCTION_URL, TESTNET_URL, BinanceError, BinanceSpot
+from tbot.exchange.binance import PRODUCTION_URL, TESTNET_URL, BinanceSpot
 from tbot.execution.sim_broker import SimulatedBroker
 from tbot.live.clock import ServerClock
 from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings
@@ -41,6 +41,7 @@ log = structlog.get_logger(__name__)
 CLOCK_RESYNC_SECONDS = 600
 SYNC_LOOKBACK_BARS = 400
 SHUTDOWN_GRACE_SECONDS = 60  # an event in progress may finish its orders before shutdown
+STOP_POLL_SECONDS = 2.0  # how often a session looks for a `tbot stop` request
 RECONCILE_ALERT_AFTER = 3  # consecutive failed reconciliations before trading pauses
 GUARD_META = "guard"
 BUDGET_META = "initial_cash"  # the budget the guard levels refer to
@@ -150,8 +151,16 @@ class SessionTrader:
             fills = await self.executor.execute(orders, now, session.portfolio, session.marks)
             await self.executor.after_event(session.portfolio, session.marks)
         if announce or fills:
-            left = sum(1 for quantity in session.portfolio.positions.values() if quantity)
-            rest = f", {left} left below the exchange minimum" if left else ""
+            dust = unsold = 0
+            for symbol, quantity in session.portfolio.positions.items():
+                value = abs(quantity) * session.marks.get(symbol, 0.0)
+                if quantity and value < session.config.rebalance.min_notional:
+                    dust += 1
+                elif quantity:
+                    unsold += 1
+            rest = f", {dust} left below the exchange minimum" if dust else ""
+            if unsold:
+                rest += f", {unsold} NOT SOLD (see the alerts above)"
             self.ledger.add_event(now, "error", f"kill switch: {reason}")
             await self.notifier.send(
                 f"[{self.label}] KILL SWITCH: {reason}. Positions flattened ({len(fills)} "
@@ -341,6 +350,29 @@ def install_stop_handlers(stop: asyncio.Event) -> None:
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
 
 
+def stop_path(ledger: Path) -> Path:
+    """`tbot stop` leaves this file: a graceful stop for a bot that has no console."""
+    return ledger.with_name(ledger.name + ".stop")
+
+
+def is_running(ledger: Path) -> bool:
+    try:
+        with instance_lock(ledger):
+            return False
+    except AlreadyRunning:
+        return True
+
+
+async def watch_stop_request(path: Path, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        if path.exists():
+            path.unlink(missing_ok=True)
+            log.info("stop_requested")
+            stop.set()
+            return
+        await asyncio.sleep(STOP_POLL_SECONDS)
+
+
 @contextmanager
 def instance_lock(ledger: Path) -> Iterator[None]:
     """One process per ledger: a second one would trade the same book twice.
@@ -411,6 +443,7 @@ async def run_session(
     """Run until stopped. Returns a process exit code."""
     new_ledger = not config.ledger.exists()
     with instance_lock(config.ledger):
+        stop_path(config.ledger).unlink(missing_ok=True)  # a request left from before
         ledger = Ledger(config.ledger)
         try:
             return await _run_session(
@@ -529,8 +562,11 @@ async def _run_session(
                     name="summary",
                 ),
                 *(asyncio.create_task(coro, name=f"extra{i}") for i, coro in enumerate(extra)),
+                asyncio.create_task(
+                    watch_stop_request(stop_path(config.ledger), stop), name="stop-request"
+                ),
             ]
-            if settings.heartbeat_url and _valid_url(settings.heartbeat_url):
+            if settings.heartbeat_url and valid_url(settings.heartbeat_url):
                 tasks.append(
                     asyncio.create_task(
                         heartbeat_loop(settings.heartbeat_url, config.heartbeat_seconds, aclient),
@@ -565,11 +601,13 @@ async def _run_session(
     return code
 
 
-def _valid_url(url: str) -> bool:
+def valid_url(url: str) -> bool:
     try:
-        httpx.URL(url)
+        parsed = httpx.URL(url)
     except httpx.InvalidURL:
-        log.warning("heartbeat_url_invalid", hint="check TBOT_HEARTBEAT_URL")
+        parsed = None
+    if parsed is None or parsed.scheme not in ("http", "https") or not parsed.host:
+        log.warning("heartbeat_url_invalid", hint="TBOT_HEARTBEAT_URL must be a full https:// URL")
         return False
     return True
 
@@ -649,6 +687,15 @@ async def run_live(
                 # not, and comparing them now could count it twice. Next round.
                 log.info("reconcile_deferred")
                 return
+
+            def shift_guard(adjustments: list[Adjustment]) -> None:
+                # Money moved from outside: not a profit or loss for the guard.
+                marks = ctx.session.marks
+                moved = sum(a.cash + a.quantity * marks.get(a.symbol, 0.0) for a in adjustments)
+                adopt_resume(ctx.guard, ctx.ledger)
+                ctx.guard.shift(moved)
+                ctx.ledger.set_meta(GUARD_META, ctx.guard.state.model_dump_json())
+
             adjustments = await reconcile(
                 spot,
                 portfolio,
@@ -660,15 +707,9 @@ async def run_live(
                 ownership=config.ownership,
                 label=label,
                 balances=balances,
+                on_adjust=shift_guard,
             )
             if adjustments:
-                # Money moved from outside: not a profit or loss for the guard.
-                moved = sum(
-                    a.cash + a.quantity * ctx.session.marks.get(a.symbol, 0.0) for a in adjustments
-                )
-                adopt_resume(ctx.guard, ctx.ledger)
-                ctx.guard.shift(moved)
-                ctx.ledger.set_meta(GUARD_META, ctx.guard.state.model_dump_json())
                 await executor.after_event(portfolio, ctx.session.marks)  # stops for what changed
             elif executor.unprotected:
                 await executor.protect(portfolio, ctx.session.marks)
@@ -684,7 +725,7 @@ async def run_live(
                 try:
                     async with ctx.lock:  # never while an order is in flight
                         await reconcile_once()
-                except (BinanceError, httpx.HTTPError) as exc:
+                except Exception as exc:  # any failure: count it, keep the loop alive
                     failures += 1
                     log.warning("reconcile_failed", failures=failures, error=repr(exc))
                     if failures == RECONCILE_ALERT_AFTER:
@@ -740,7 +781,7 @@ async def account_text(config: LiveConfig, settings: Settings) -> str:
         for symbol in symbols:
             for order in await spot.open_orders(symbol):
                 lines.append(
-                    f"open {symbol} {order.type} {order.side} {order.executed_qty:.6f} "
+                    f"open {symbol} {order.type} {order.side} {order.orig_qty:.6f} "
                     f"stop {order.stop_price} id {order.client_order_id}"
                 )
         return "\n".join(lines)
@@ -801,7 +842,9 @@ def status_text(config: SessionConfig, store: BarStore) -> str:
         for symbol, timeframe in stream_keys(config):
             last = store.last_open_time(symbol, timeframe)
             lines.append(
-                f"last stored bar {symbol}: {last:%Y-%m-%d %H:%M}" if last else f"no bars {symbol}"
+                f"last stored bar {symbol} {timeframe}: {last:%Y-%m-%d %H:%M}"
+                if last
+                else f"no bars {symbol} {timeframe}"
             )
         for fill in ledger.recent_fills(5):
             side = "BUY" if fill.quantity > 0 else "SELL"

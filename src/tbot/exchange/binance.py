@@ -105,6 +105,7 @@ class Order:
     quote_qty: float  # cumulative quote spent or received
     stop_price: float | None = None
     fills: tuple[TradeFill, ...] = ()  # only on a FULL order response
+    orig_qty: float = 0.0  # the size ordered
 
     @property
     def done(self) -> bool:
@@ -128,6 +129,7 @@ def parse_order(data: Mapping[str, Any]) -> Order:
         quote_qty=float(data.get("cummulativeQuoteQty", 0)),
         stop_price=stop or None,
         fills=fills,
+        orig_qty=float(data.get("origQty", 0)),
     )
 
 

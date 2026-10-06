@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from factories import Scripted, price_bars
-from tbot.cli import load_session_config, main
+from tbot.cli import EXIT_CONFIG, load_session_config, main
 from tbot.core.config import StrategyConfig
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
@@ -168,7 +168,7 @@ def test_summary_and_status_text(tmp_path: Path) -> None:
     status = status_text(paper_config(tmp_path), store)
     assert "fills 1, round trips 0, adjustments 0" in status
     assert "position BTC 5.000000" in status
-    assert "last stored bar BTC: 2024-01-01 02:00" in status
+    assert "last stored bar BTC 1h: 2024-01-01 02:00" in status
     assert "HALTED" not in status
 
 
@@ -272,8 +272,9 @@ def test_status_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
         f"ledger: {(tmp_path / 'paper.sqlite').as_posix()}\n",
         encoding="utf-8",
     )
-    with pytest.raises(SystemExit, match="no ledger"):  # reading must not create one
-        main(["status", str(config_path), "--data-dir", str(tmp_path / "data")])
+    code = main(["status", str(config_path), "--data-dir", str(tmp_path / "data")])
+    assert code == EXIT_CONFIG  # reading must not create a ledger
+    assert "no ledger" in capsys.readouterr().err
     Ledger(tmp_path / "paper.sqlite").close()
     assert main(["status", str(config_path), "--data-dir", str(tmp_path / "data")]) == 0
     out = capsys.readouterr().out
@@ -290,8 +291,7 @@ def test_live_command_needs_the_flag_for_real_money(tmp_path: Path) -> None:
         "  - {name: donchian_trend, symbols: [BTCUSDT], timeframe: 4h, allocation: 1.0}\n",
         encoding="utf-8",
     )
-    with pytest.raises(SystemExit, match="--live"):
-        main(["live", str(config_path), "--data-dir", str(tmp_path / "data")])
+    assert main(["live", str(config_path), "--data-dir", str(tmp_path / "data")]) == EXIT_CONFIG
 
 
 def test_restart_continues_the_strategy_state(tmp_path: Path) -> None:

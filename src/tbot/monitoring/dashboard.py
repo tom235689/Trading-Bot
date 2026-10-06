@@ -359,10 +359,11 @@ def from_ledger(config: SessionConfig, store: BarStore, title: str) -> Dashboard
         rows = ledger.conn.execute("SELECT time, equity FROM equity ORDER BY id").fetchall()
         times = [datetime.fromisoformat(t) for t, _ in rows]
         equity = [float(v) for _, v in rows]
-        marks = {}
-        for symbol, timeframe in stream_keys(config):
+        marks: dict[str, float] = {}
+        for symbol, timeframe in stream_keys(config):  # finest first, like the session's marks
             bars = store.read(symbol, timeframe)
-            marks[symbol] = float(bars["close"][-1]) if not bars.is_empty() else None
+            if symbol not in marks and not bars.is_empty():
+                marks[symbol] = float(bars["close"][-1])
         positions = [
             (symbol, qty, marks.get(symbol)) for symbol, qty in sorted(portfolio.positions.items())
         ]
