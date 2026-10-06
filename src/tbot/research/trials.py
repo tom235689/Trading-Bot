@@ -80,7 +80,7 @@ class TrialLog:
         if not records:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as file:
+        with self.path.open("a", encoding="utf-8", newline="\n") as file:  # LF on every OS
             for record in records:
                 file.write(record.model_dump_json() + "\n")
 

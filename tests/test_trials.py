@@ -76,3 +76,9 @@ def test_every_run_over_the_holdout_is_a_look(tmp_path: Path) -> None:
     )
     like = log.read()[-1]
     assert log.holdout_looks(like, date(2025, 1, 1)) == 2
+
+
+def test_log_lines_end_in_lf(tmp_path: Path) -> None:
+    log = TrialLog(tmp_path / "trials.jsonl")
+    log.append([make_record(CONFIG, metrics(1.0), "sweep")])
+    assert b"\r\n" not in log.path.read_bytes()
