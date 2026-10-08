@@ -39,6 +39,16 @@ def get_bytes(
     raise ValueError("retries must be positive")
 
 
+def retry_after(exc: BaseException) -> float | None:
+    """Seconds a rate-limited client must wait, or None if this is no rate limit."""
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code not in (418, 429):
+        return None
+    try:
+        return float(exc.response.headers.get("Retry-After", 60))
+    except ValueError:
+        return 60.0
+
+
 def describe_error(exc: httpx.HTTPError) -> str:
     """Error text without the request URL, which may carry a token."""
     if isinstance(exc, httpx.HTTPStatusError):

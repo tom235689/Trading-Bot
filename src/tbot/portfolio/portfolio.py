@@ -1,7 +1,7 @@
 """Cash, positions, and round-trip trade tracking."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from tbot.core.models import Fill, Trade
@@ -28,6 +28,7 @@ class Portfolio:
         self.fills: list[Fill] = []
         self.trades: list[Trade] = []
         self._open: dict[str, _OpenTrade] = {}
+        self._left: dict[str, int] = {}  # symbol -> the closed trade that left a remainder
 
     def position(self, symbol: str) -> float:
         return self.positions.get(symbol, 0.0)
@@ -54,6 +55,7 @@ class Portfolio:
             if abs(after) < EPSILON:
                 self.positions.pop(symbol, None)
                 self._open.pop(symbol, None)
+                self._left.pop(symbol, None)
             else:
                 self.positions[symbol] = after
 
@@ -71,7 +73,24 @@ class Portfolio:
             and abs(after) * fill.price < self.dust_notional
         )
 
-        if before and (after == 0 or (after > 0) != (before > 0)):
+        left = self._left.pop(fill.symbol, None)
+        if (
+            left is not None
+            and fill.symbol not in self._open
+            and (fill.quantity > 0) != (before > 0)
+            and (after == 0 or (after > 0) == (before > 0))
+        ):
+            # Sells the remainder an earlier round trip left: it is part of that trade.
+            trade = self.trades[left]
+            self.trades[left] = replace(
+                trade,
+                exit_time=fill.time,
+                pnl=trade.pnl - fill.quantity * fill.price - fill.fee,
+                fees=trade.fees + fill.fee,
+            )
+            if after:
+                self._left[fill.symbol] = left
+        elif before and (after == 0 or (after > 0) != (before > 0)):
             # Closes the position, maybe flipping it: split the fill at zero.
             share = -before / fill.quantity
             self._track(fill, -before, fill.fee * share, _sign(before))
@@ -82,6 +101,7 @@ class Portfolio:
             # Sold down to an untradable remainder: the round trip is over, the dust stays.
             self._track(fill, fill.quantity, fill.fee, _sign(before))
             self._close(fill.symbol, fill.time)
+            self._left[fill.symbol] = len(self.trades) - 1
         else:
             self._track(fill, fill.quantity, fill.fee, _sign(after))
 

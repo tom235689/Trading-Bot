@@ -14,10 +14,20 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.binance_rest import fetch_klines, first_open_time
 from tbot.data.binance_vision import fetch_month
 from tbot.data.quality import aligned
+from tbot.data.schema import empty_bars
 from tbot.data.store import BarStore
 
 log = structlog.get_logger(__name__)
-INVALID_SYMBOL = 400  # what the REST API answers for a symbol it no longer lists
+INVALID_SYMBOL = -1121  # the REST API's code for a symbol it does not list (any more)
+
+
+def not_listed(exc: httpx.HTTPStatusError) -> bool:
+    if exc.response.status_code != 400:
+        return False
+    try:
+        return bool(exc.response.json().get("code") == INVALID_SYMBOL)
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -38,6 +48,25 @@ def iter_months(first: date, stop: date) -> Iterator[tuple[int, int]]:
     while (year, month) < (stop.year, stop.month):
         yield year, month
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+
+
+def _archived(
+    client: httpx.Client,
+    symbol: str,
+    timeframe: Timeframe,
+    start: datetime,
+    end: datetime,
+    tried: set[tuple[int, int]],
+) -> pl.DataFrame:
+    """Bars in [start, end) from monthly archives not fetched yet, such as a partial month."""
+    last = end - timeframe.delta  # open of the last bar wanted
+    following = _month_span((last.year, last.month))[1]
+    months = [m for m in iter_months(start.date(), following.date()) if m not in tried]
+    frames = [f for m in months if (f := fetch_month(client, symbol, timeframe, *m)) is not None]
+    tried.update(months)
+    if not frames:
+        return empty_bars()
+    return pl.concat(frames).filter(pl.col("open_time") >= start, pl.col("open_time") < end)
 
 
 def _month_span(year_month: tuple[int, int]) -> tuple[datetime, datetime]:
@@ -86,7 +115,7 @@ def sync(
         try:
             earliest = first_open_time(client, symbol, timeframe, start, first)
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code != INVALID_SYMBOL:
+            if not not_listed(exc):
                 raise
             earliest = start  # delisted: only the archives can say what there was
         if earliest is not None:
@@ -144,6 +173,8 @@ def _download(
         return
     held: list[pl.DataFrame] = []
     holding = hold
+    # A month missing after stored bars is a hole; before the first one, the listing.
+    seen = hold or store.last_open_time(symbol, timeframe) is not None
 
     def keep(bars: pl.DataFrame) -> tuple[int, int]:
         if not holding:
@@ -166,9 +197,10 @@ def _download(
             for month, frame in zip(wanted, pool.map(fetch, wanted), strict=True):
                 if frame is None:
                     unpublished.append(month)
-                    holding = True  # nothing after this hole is stored before it is filled
+                    holding = holding or seen  # nothing after a hole is stored before it is filled
                 else:
                     frames.append(frame)
+                    seen = True
             if not frames:
                 continue
             bars = pl.concat(frames).filter(pl.col("open_time") >= begin, pl.col("open_time") < end)
@@ -189,20 +221,26 @@ def _download(
     ]
     if covered < end:
         ranges.append((covered, end))
+    listed = True
+    tried = set(iter_months(begin.date(), end.date()))
     for range_start, range_end in ranges:
-        try:
-            bars = fetch_klines(client, symbol, timeframe, range_start, range_end)
-        except httpx.HTTPStatusError as exc:
-            archived = counts[0] or store.last_open_time(symbol, timeframe) is not None
-            if exc.response.status_code != INVALID_SYMBOL or not archived:
-                raise  # a symbol that never existed is a mistake to report
-            # Archived, but no longer listed: the archives are all there is.
-            log.warning("symbol_not_listed", symbol=symbol, after=range_start.isoformat())
-            progress(f"{symbol} {timeframe}: not listed any more; archives only")
-            break
+        if listed:
+            try:
+                bars = fetch_klines(client, symbol, timeframe, range_start, range_end)
+            except httpx.HTTPStatusError as exc:
+                if not not_listed(exc):
+                    raise
+                listed = False
+                log.warning("symbol_not_listed", symbol=symbol, after=range_start.isoformat())
+                progress(f"{symbol} {timeframe}: not listed any more; archives only")
+        if not listed:  # the archives of the months around the range, if published
+            bars = _archived(client, symbol, timeframe, range_start, range_end, tried)
         written, skipped = keep(bars)
-        counts[1] += written
+        counts[1 if listed else 0] += written
         counts[2] += skipped
-        progress(f"{symbol} {timeframe}: {written} bars from REST")
+        if listed:
+            progress(f"{symbol} {timeframe}: {written} bars from REST")
+    if not listed and not counts[0] + counts[1] and store.last_open_time(symbol, timeframe) is None:
+        raise LookupError(f"{symbol}: Binance does not list it and has no archives of it")
     if held:
         store.write(symbol, timeframe, pl.concat(held), newest_first=hold)

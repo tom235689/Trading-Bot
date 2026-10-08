@@ -13,7 +13,14 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from tbot.backtest.config import BacktestConfig, load_config
-from tbot.backtest.metrics import DAYS_PER_YEAR, Metrics, compute_metrics, daily_returns
+from tbot.backtest.engine import BacktestResult
+from tbot.backtest.metrics import (
+    DAYS_PER_YEAR,
+    Metrics,
+    bar_returns,
+    compute_metrics,
+    daily_returns,
+)
 from tbot.research.montecarlo import MonteCarloSummary, simulate
 from tbot.research.statistics import daily_sharpe, deflated_sharpe, expected_max_sharpe, moments
 from tbot.research.sweep import (
@@ -198,7 +205,8 @@ def run_validation(
     progress("Monte Carlo and deflated Sharpe")
     mc = config.monte_carlo
 
-    def resample(returns: npt.NDArray[np.float64]) -> MonteCarloSummary:
+    def resample(result: BacktestResult) -> MonteCarloSummary:
+        returns, per_day = bar_returns(result)  # every bar, as the guard checks it
         return simulate(
             returns,
             runs=mc.runs,
@@ -206,12 +214,13 @@ def run_validation(
             block_days=mc.block_days,
             drawdown_limit=config.gate.max_drawdown,
             kill_switch=mc.kill_switch,
+            per_day=per_day,
         )
 
     # The in-sample run carries the edge its params were chosen for; the stitched
     # out-of-sample segments are what the strategy did on data it had not seen.
-    monte_carlo = resample(daily_returns(baseline_result))
-    monte_carlo_oos = resample(daily_returns(walk.stitched))
+    monte_carlo = resample(baseline_result)
+    monte_carlo_oos = resample(walk.stitched)
     deflated = _deflated(daily_returns(baseline_result), log.selection_sharpes(baseline_record))
 
     progress("holdout")

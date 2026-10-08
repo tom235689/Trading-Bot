@@ -7,7 +7,7 @@ after being written to the bar store. The store is the memory of what was seen.
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import polars as pl
@@ -16,6 +16,7 @@ import structlog
 from tbot.core.timeframe import Timeframe
 from tbot.data import binance_ws
 from tbot.data.binance_rest import fetch_klines
+from tbot.data.http import retry_after
 from tbot.data.quality import aligned
 from tbot.data.store import BarStore
 from tbot.live.clock import CLOSE_GRACE
@@ -68,6 +69,7 @@ class LiveFeed:
         self.queue: asyncio.Queue[tuple[StreamKey, pl.DataFrame]] = asyncio.Queue()
         self.reconnects = 0
         self._stale_reported: set[StreamKey] = set()
+        self.rest_paused_until: datetime | None = None  # a rate limit: calling now risks a ban
 
     # emission
 
@@ -110,6 +112,8 @@ class LiveFeed:
         between: a 1h bar queued ahead of the 4h bar closing with it would release that
         event without it.
         """
+        if self.rest_paused_until is not None and self.clock() < self.rest_paused_until:
+            return 0  # the watchdog asks again; stale streams are still reported
         fetched = []
         for key in keys or self.keys:
             symbol, timeframe = key
@@ -117,9 +121,16 @@ class LiveFeed:
             end = timeframe.floor(self.clock() - CLOSE_GRACE)
             start = last + timeframe.delta if last is not None else end - timeframe.delta * 2
             if start < end:
-                bars = await asyncio.to_thread(
-                    fetch_klines, self.client, symbol, timeframe, start, end
-                )
+                try:
+                    bars = await asyncio.to_thread(
+                        fetch_klines, self.client, symbol, timeframe, start, end
+                    )
+                except httpx.HTTPError as exc:
+                    wait = retry_after(exc)
+                    if wait is not None:
+                        self.rest_paused_until = self.clock() + timedelta(seconds=wait)
+                        log.warning("rest_rate_limited", seconds=wait)
+                    raise
                 fetched.append((key, bars))
         items: list[_Item] = []
         try:

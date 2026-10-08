@@ -146,13 +146,16 @@ class Ledger:
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = target.with_name(target.name + ".partial")
         partial.unlink(missing_ok=True)
-        copy = sqlite3.connect(partial)
         try:
-            self.conn.backup(copy)
-            copy.execute("PRAGMA journal_mode=DELETE")  # one self-contained file
+            copy = sqlite3.connect(partial)
+            try:
+                self.conn.backup(copy)
+                copy.execute("PRAGMA journal_mode=DELETE")  # one self-contained file
+            finally:
+                copy.close()
+            partial.replace(target)
         finally:
-            copy.close()
-        partial.replace(target)
+            partial.unlink(missing_ok=True)  # left only when something failed
 
     def __enter__(self) -> Self:
         return self

@@ -19,6 +19,7 @@ import structlog
 from tbot.backtest.runner import WARMUP_MARGIN, history_bars
 from tbot.core.config import TradingConfig
 from tbot.core.models import Fill
+from tbot.core.timeframe import to_millis
 from tbot.data.downloader import sync
 from tbot.data.store import BarStore
 from tbot.exchange.binance import PRODUCTION_URL, TESTNET_URL, BinanceSpot
@@ -94,6 +95,7 @@ class SessionTrader:
         self.lock = lock or asyncio.Lock()  # one writer to the book at a time
         self.health = health or Health()
         self._paused = False  # a blocked bar was announced; later ones are only logged
+        self._handled: tuple[datetime | None, set[StreamKey]] = (None, set())
 
     async def handle(self, batch: Batch) -> list[Fill]:
         async with self.lock:
@@ -135,7 +137,8 @@ class SessionTrader:
             fills = await self.executor.execute(allowed, now, session.portfolio, session.marks)
             await self.executor.after_event(session.portfolio, session.marks)
         self.ledger.add_equity(session.snapshot(now))
-        self.save_checkpoint(now)  # last: a crash before it hands this bar over again
+        if self._event_done(batch, now):  # last: a crash before it hands this bar over again
+            self.save_checkpoint(now)
         log.info(
             "bar_event",
             time=now.isoformat(),
@@ -176,6 +179,18 @@ class SessionTrader:
                 f"fills{rest}). Trading stays halted until `tbot resume`."
             )
         return fills
+
+    def _event_done(self, batch: Batch, now: datetime) -> bool:
+        """Every stream closing at now has been handled, maybe over two events (a late one).
+
+        Until then the checkpoint stays at the event before, so a restart hands every bar
+        of this close over again instead of replaying the ones that never got their event.
+        """
+        if self._handled[0] != now:
+            self._handled = (now, set())
+        self._handled[1].update(batch)
+        due = {key for key in self.session.keys if to_millis(now) % key[1].millis == 0}
+        return due <= self._handled[1]
 
     def save_guard(self) -> None:
         self.ledger.set_meta(GUARD_META, self.guard.state.model_dump_json())
@@ -878,6 +893,38 @@ async def reconcile_round(
         await executor.protect(portfolio, marks)
 
 
+async def reconcile_loop(
+    round_: Callable[[], Awaitable[None]],
+    interval: float,
+    lock: asyncio.Lock,
+    health: Health,
+    ledger: Ledger,
+    notifier: Notifier,
+    label: str,
+) -> None:
+    """Reconcile every interval; after three failures in a row new orders wait."""
+    failures = 0
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            async with lock:  # never while an order is in flight
+                await round_()
+        except Exception as exc:  # any failure: count it, keep the loop alive
+            failures += 1
+            log.warning("reconcile_failed", failures=failures, error=repr(exc))
+            if failures == RECONCILE_ALERT_AFTER:
+                reason = f"reconciliation failing ({exc})"
+                health.blocked = reason
+                ledger.add_event(utc_now(), "error", reason)
+                await notifier.send(f"[{label}] {reason}; new orders wait until it works again")
+            continue
+        if failures >= RECONCILE_ALERT_AFTER:
+            health.blocked = ""
+            ledger.add_event(utc_now(), "info", "reconciliation works again")
+            await notifier.send(f"[{label}] reconciliation works again")
+        failures = 0
+
+
 async def run_live(
     config: LiveConfig,
     settings: Settings,
@@ -924,31 +971,16 @@ async def run_live(
             await reconcile_once()
             await executor.after_event(portfolio, ctx.session.marks)  # stops for held positions
 
-        async def reconcile_loop() -> None:
-            failures = 0
-            while True:
-                await asyncio.sleep(config.reconcile_seconds)
-                try:
-                    async with ctx.lock:  # never while an order is in flight
-                        await reconcile_once()
-                except Exception as exc:  # any failure: count it, keep the loop alive
-                    failures += 1
-                    log.warning("reconcile_failed", failures=failures, error=repr(exc))
-                    if failures == RECONCILE_ALERT_AFTER:
-                        reason = f"reconciliation failing ({exc})"
-                        ctx.health.blocked = reason
-                        ctx.ledger.add_event(utc_now(), "error", reason)
-                        await ctx.notifier.send(
-                            f"[{label}] {reason}; new orders wait until it works again"
-                        )
-                    continue
-                if failures >= RECONCILE_ALERT_AFTER:
-                    ctx.health.blocked = ""
-                    ctx.ledger.add_event(utc_now(), "info", "reconciliation works again")
-                    await ctx.notifier.send(f"[{label}] reconciliation works again")
-                failures = 0
-
-        return executor, [reconcile_loop()]
+        loop = reconcile_loop(
+            reconcile_once,
+            config.reconcile_seconds,
+            ctx.lock,
+            ctx.health,
+            ctx.ledger,
+            ctx.notifier,
+            label,
+        )
+        return executor, [loop]
 
     return await run_session(config, settings, data_dir, label=label, setup=setup, stop=stop)
 

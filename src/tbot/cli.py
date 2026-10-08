@@ -22,7 +22,7 @@ from tbot.backtest.report import format_metrics
 from tbot.backtest.runner import data_ends, run_backtest
 from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
-from tbot.data.http import describe_error
+from tbot.data.http import describe_error, retry_after
 from tbot.data.quality import QualityReport, check_bars
 from tbot.data.store import BarStore
 from tbot.live.backup import backup_dir
@@ -205,13 +205,13 @@ def build_parser() -> argparse.ArgumentParser:
     paper = commands.add_parser("paper", help="paper trade on live Binance data until stopped")
     paper.add_argument("config", type=Path)
     paper.add_argument("--data-dir", type=Path, default=Path("data"))
-    paper.add_argument("--log-file", type=Path, default=Path("logs/paper.jsonl"))
+    paper.add_argument("--log-file", type=Path, help="default: logs/<config name>.jsonl")
 
     live = commands.add_parser("live", help="trade on Binance testnet or live until stopped")
     live.add_argument("config", type=Path)
     live.add_argument("--live", action="store_true", help="required when the config mode is live")
     live.add_argument("--data-dir", type=Path, default=Path("data"))
-    live.add_argument("--log-file", type=Path, help="default: logs/<mode>.jsonl")
+    live.add_argument("--log-file", type=Path, help="default: logs/<config name>.jsonl")
 
     status = commands.add_parser("status", help="show a session ledger")
     status.add_argument("config", type=Path)
@@ -222,12 +222,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument("config", type=Path)
     doctor.add_argument("--data-dir", type=Path, default=Path("data"))
+    doctor.add_argument(
+        "--offline",
+        action="store_true",
+        help="skip the network checks (Binance, keys, heartbeat ping); the bot retries those",
+    )
 
     stop_cmd = commands.add_parser(
         "stop", help="ask a running session to stop after the event in progress"
     )
     stop_cmd.add_argument("config", type=Path)
     stop_cmd.add_argument("--timeout", type=float, default=90.0, help="seconds to wait")
+    stop_cmd.add_argument(
+        "--cancel", action="store_true", help="withdraw a request no session has taken yet"
+    )
 
     compare = commands.add_parser(
         "compare", help="compare a session with a backtest of the same settings and period"
@@ -269,6 +277,10 @@ def run_download(args: argparse.Namespace) -> int:
                     result = sync(store, client, symbol, timeframe, args.start, now, progress=print)
                 except (httpx.HTTPError, LookupError, ValueError, OSError) as exc:
                     print(f"{symbol} {timeframe}: FAILED, {brief(exc)}", file=sys.stderr)
+                    wait = retry_after(exc)
+                    if wait is not None:  # more requests now could get the IP banned
+                        print(f"rate limited: run it again in {wait:.0f} s", file=sys.stderr)
+                        return EXIT_ERROR
                     failed += 1
                     continue  # the other streams still download
                 print(
@@ -399,7 +411,7 @@ def run_paper_command(args: argparse.Namespace) -> int:
     if not isinstance(config, PaperConfig):
         raise ConfigError("this is a live config; use `tbot live`")
     check_strategies(args.config, config)
-    configure_logging(args.log_file)
+    configure_logging(args.log_file or log_path(args.config))
     return asyncio.run(run_paper(config, Settings(), args.data_dir))
 
 
@@ -410,8 +422,13 @@ def run_live_command(args: argparse.Namespace) -> int:
     if config.mode != "live" and args.live:
         raise ConfigError("--live is only for mode: live; this config trades on the testnet")
     check_strategies(args.config, config)
-    configure_logging(args.log_file or Path("logs") / f"{config.mode}.jsonl")
+    configure_logging(args.log_file or log_path(args.config))
     return asyncio.run(run_live(config, Settings(), args.data_dir, confirmed=args.live))
+
+
+def log_path(config: Path) -> Path:
+    """One log per config, so two sessions never rotate the same file."""
+    return Path("logs") / f"{config.stem}.jsonl"
 
 
 def run_status_command(args: argparse.Namespace) -> int:
@@ -424,7 +441,8 @@ def run_doctor_command(args: argparse.Namespace) -> int:
 
     async def check() -> list[Check]:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            return await run_checks(config, Settings(), client, BarStore(args.data_dir))
+            store = BarStore(args.data_dir)
+            return await run_checks(config, Settings(), client, store, offline=args.offline)
 
     checks = asyncio.run(check())
     print(checks_text(checks))
@@ -432,6 +450,11 @@ def run_doctor_command(args: argparse.Namespace) -> int:
 
 
 def run_stop_command(args: argparse.Namespace) -> int:
+    if args.cancel:
+        request = stop_path(load_session_config(args.config).ledger)
+        print("stop request withdrawn" if request.exists() else "no stop request")
+        request.unlink(missing_ok=True)
+        return 0
     config = existing_ledger(load_session_config(args.config))
     request = stop_path(config.ledger)
     request.write_text("stop\n", encoding="utf-8")  # also stops a restart by the supervisor
@@ -470,8 +493,10 @@ def run_compare_command(args: argparse.Namespace) -> int:
 
 def run_backup_command(args: argparse.Namespace) -> int:
     config = existing_ledger(load_session_config(args.config))
-    stamp = f"{datetime.now(UTC):%Y%m%d-%H%M%S}"
-    out = args.out or backup_dir(config.ledger) / f"{config.ledger.stem}-{stamp}.sqlite"
+    name = f"{config.ledger.stem}-{datetime.now(UTC):%Y%m%d-%H%M%S}.sqlite"
+    out = args.out or backup_dir(config.ledger) / name
+    if out.is_dir():  # a folder, such as a synced one
+        out = out / name
     with Ledger(config.ledger) as ledger:
         ledger.backup(out)
     print(f"wrote {out}")

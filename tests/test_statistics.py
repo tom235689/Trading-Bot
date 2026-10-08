@@ -43,3 +43,21 @@ def test_deflated_sharpe_falls_with_more_trials() -> None:
 
 def test_daily_sharpe() -> None:
     assert daily_sharpe(math.sqrt(365)) == pytest.approx(1.0)
+
+
+def test_expected_max_sharpe_matches_the_known_maximum_of_normals() -> None:
+    # The expected maximum of 100 standard normals is about 2.508; the paper's
+    # approximation gives 2.531.
+    assert expected_max_sharpe(1.0, 100) == pytest.approx(2.5306029, rel=1e-6)
+    assert expected_max_sharpe(1.0, 100) == pytest.approx(2.508, abs=0.05)
+
+
+def test_deflated_sharpe_counts_every_trial() -> None:
+    from tbot.research.validate import _deflated
+
+    returns = np.random.default_rng(7).normal(0.001, 0.02, 1000)
+    trials = [1.0, 0.5, math.nan, 1.5, 0.2, -0.3, 0.8, 1.1, 0.0, 0.6]  # NaN: found nothing
+    result = _deflated(returns, trials)
+    assert result.trials == 10
+    assert result.probability == pytest.approx(0.0128119, rel=1e-4)
+    assert result.expected_max_sharpe == pytest.approx(0.8975057, rel=1e-6)

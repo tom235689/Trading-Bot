@@ -169,7 +169,15 @@ class LiveExecutor:
         marks: Mapping[str, float],
     ) -> list[Fill]:
         fills = []
+        doubtful = await self._settle_doubts(set(orders), portfolio)
         for symbol, quantity in _sorted(orders):
+            if symbol in doubtful:
+                # Its book was stale when this order was planned; the next bar decides again.
+                self.ledger.add_order(now, symbol, quantity, "skipped", "an earlier order in doubt")
+                await self.notifier.send(
+                    f"[{self.label}] {symbol}: an earlier order was in doubt; no order this bar"
+                )
+                continue
             client_id = self._new_id(now, symbol, quantity)
             try:
                 fill = await self._execute_one(symbol, quantity, now, portfolio, client_id)
@@ -198,6 +206,27 @@ class LiveExecutor:
                 fills.append(fill)
                 await self.notifier.send(_fill_text(self.label, fill, portfolio.equity(marks)))
         return fills
+
+    async def _settle_doubts(self, symbols: set[str], portfolio: Portfolio) -> set[str]:
+        """Look up orders in doubt for these symbols; return the symbols that had one.
+
+        An order that turns out executed changes the book the new order was planned on,
+        and one still unknown leaves the book unknown, so either way the symbol waits; one
+        that never executed changed nothing.
+        """
+        doubtful = set()
+        for record in self.ledger.unresolved_orders():
+            if record.symbol not in symbols or record.symbol not in self.spot.rules:
+                continue
+            try:
+                booked = await self._resolve(record, portfolio)
+            except Exception as exc:  # asked again before the next reconciliation
+                log.warning("order_lookup_failed", symbol=record.symbol, error=repr(exc))
+                booked = 0
+            still = any(r.client_id == record.client_id for r in self.ledger.unresolved_orders())
+            if booked or still:
+                doubtful.add(record.symbol)
+        return doubtful
 
     def _new_id(self, now: datetime, symbol: str, quantity: float) -> str:
         """A second decision at the same close (a late stream) must not reuse an id."""
@@ -453,6 +482,13 @@ class LiveExecutor:
             self.unprotected.discard(symbol)
             return
         rules = self.spot.rules[symbol]
+        state = self._stop_state(symbol)
+        if state is not None and state["qty"] > 0:
+            return  # triggered and partly filled: the rest is still working; leave it
+        if any(r.symbol == symbol and r.quantity < 0 for r in self.ledger.unresolved_orders()):
+            # A sell in doubt may have sold the book's coins: free coins can be the owner's.
+            self.unprotected.add(symbol)  # placed once reconciliation settles it
+            return
         try:
             await self.cancel_stops(symbol, portfolio)
             position = portfolio.position(symbol)

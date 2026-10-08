@@ -176,3 +176,50 @@ def test_notify_finds_the_chat_id(
     out = capsys.readouterr().out
     assert "chat 12345 Tom" in out
     assert "TBOT_TELEGRAM_CHAT_ID" in out
+
+
+def test_a_stop_request_can_be_withdrawn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ledger = tmp_path / "paper.sqlite"
+    config = tmp_path / "paper.yaml"
+    config.write_text(
+        f"ledger: {ledger.as_posix()}\nstrategies:\n"
+        "  - {name: donchian_trend, symbols: [BTCUSDT], timeframe: 4h, allocation: 1.0}\n",
+        encoding="utf-8",
+    )
+    assert main(["stop", str(config), "--cancel"]) == 0
+    assert "no stop request" in capsys.readouterr().out
+    stop_path(ledger).write_text("stop\n", encoding="utf-8")
+    assert main(["stop", str(config), "--cancel"]) == 0
+    assert "withdrawn" in capsys.readouterr().out
+    assert not stop_path(ledger).exists()
+
+
+def test_each_config_logs_to_its_own_file() -> None:
+    from tbot.cli import log_path
+
+    assert log_path(Path("config/paper.yaml")) == Path("logs/paper.jsonl")
+    assert log_path(Path("config/paper-eth.yaml")) == Path("logs/paper-eth.jsonl")
+
+
+def test_download_stops_at_a_rate_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import httpx
+
+    calls: list[str] = []
+    request = httpx.Request("GET", "https://data-api.binance.vision/api/v3/klines")
+
+    def limited(
+        store: object, client: object, symbol: str, *args: object, **kwargs: object
+    ) -> None:
+        calls.append(symbol)
+        response = httpx.Response(429, headers={"Retry-After": "90"}, request=request)
+        raise httpx.HTTPStatusError("429", request=request, response=response)
+
+    monkeypatch.setattr("tbot.cli.sync", limited)
+    monkeypatch.setattr("tbot.cli.ServerClock.sync", lambda self: 0.0)
+    assert main(["download", "--data-dir", str(tmp_path)]) == EXIT_ERROR
+    assert calls == ["BTCUSDT"]  # no more requests: they could get the IP banned
+    assert "run it again in 90 s" in capsys.readouterr().err

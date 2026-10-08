@@ -79,3 +79,16 @@ def test_selling_an_adopted_position_is_a_long_round_trip() -> None:
     p.apply(fill(0, -1.0, 100.0, 0.1))
     [trade] = p.trades
     assert trade.direction == 1
+
+
+def test_a_leftover_sold_later_belongs_to_its_round_trip() -> None:
+    p = Portfolio(1000.0, dust_notional=10.0)
+    p.apply(fill(0, 1.0, 100.0, 0.0))
+    p.apply(fill(1, -0.95, 90.0, 0.0))  # 0.05 left, worth 4.50: the round trip ends
+    assert [t.pnl for t in p.trades] == [pytest.approx(-100 + 85.5)]
+    p.apply(fill(2, -0.05, 90.0, 0.1))  # the kill switch sells the leftover
+    [trade] = p.trades  # one losing trade, not a loser and a winner
+    assert trade.pnl == pytest.approx(-100 + 85.5 + 4.5 - 0.1)
+    assert trade.exit_time == T0 + timedelta(hours=2)
+    assert trade.fees == pytest.approx(0.1)
+    assert p.positions == {}

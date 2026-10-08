@@ -86,3 +86,19 @@ def test_backups_copy_the_ledger_and_keep_the_newest_days(tmp_path: Path) -> Non
     assert not list((tmp_path / "backups").glob("*.partial"))
     with Ledger(target) as copy:
         assert [e.message for e in copy.recent_events(5)] == ["started"]
+
+
+def test_atomic_writes_all_or_nothing(tmp_path: Path) -> None:
+    import pytest
+
+    def crash_between_the_writes(ledger: Ledger) -> None:
+        with ledger.atomic():
+            ledger.set_meta("a", "1")
+            ledger.add_order(T0, "BTCUSDT", 1.0, "pending", "", "x")
+            raise RuntimeError("crash")
+
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        with pytest.raises(RuntimeError):
+            crash_between_the_writes(ledger)
+        assert ledger.get_meta("a") is None
+        assert ledger.unresolved_orders() == []

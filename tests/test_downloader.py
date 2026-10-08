@@ -226,3 +226,54 @@ def test_a_delisted_symbol_keeps_its_archives(tmp_path: Path) -> None:
             result = sync(store, client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
     assert result.rest_bars == 0
     assert result.last == datetime(2023, 7, 19, 20, tzinfo=UTC)  # the last archived bar
+
+
+class Delisted(FakeBinance):
+    def _klines(self, params: object) -> httpx.Response:
+        return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+
+
+def test_a_delisted_symbol_backfills_a_partial_month_from_its_archive(tmp_path: Path) -> None:
+    fake = Delisted("BTCUSDT", H4, make_rows(datetime(2023, 1, 1, tzinfo=UTC), 6 * 200, H4))
+    store = BarStore(tmp_path)
+    with fake.client() as client:
+        sync(store, client, "BTCUSDT", H4, datetime(2023, 3, 15, tzinfo=UTC), LATER)
+        sync(store, client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
+    assert store.read("BTCUSDT", H4).height == 6 * 200  # March 1-14 too
+    assert _gaps(store, H4) == 0
+
+
+def test_a_symbol_that_never_existed_is_an_error(tmp_path: Path) -> None:
+    fake = Delisted("BTCUSDT", H4, [])
+    with fake.client() as client, pytest.raises(LookupError, match="does not list it"):
+        sync(BarStore(tmp_path), client, "BTCUSDT", H4, datetime(2024, 1, 1, tzinfo=UTC), LATER)
+
+
+def test_another_rejection_is_not_taken_for_a_delisting(tmp_path: Path) -> None:
+    class Rejecting(FakeBinance):
+        def _klines(self, params: object) -> httpx.Response:
+            return httpx.Response(400, json={"code": -1100, "msg": "Illegal characters."})
+
+    fake = Rejecting("BTCUSDT", H4, make_rows(datetime(2023, 1, 1, tzinfo=UTC), 6 * 200, H4))
+    with fake.client() as client, pytest.raises(httpx.HTTPStatusError):
+        sync(BarStore(tmp_path), client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
+
+
+def test_months_before_the_listing_do_not_hold_back_the_archives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listed = datetime(2023, 3, 10, tzinfo=UTC)
+    fake = FakeBinance("BTCUSDT", H4, make_rows(listed, 6 * 700, H4))
+    store = BarStore(tmp_path)
+    real = binance_rest.fetch_klines
+
+    def tail_fails(client: httpx.Client, *args: object) -> object:
+        if args[2] >= datetime(2025, 1, 1, tzinfo=UTC):  # type: ignore[operator]
+            raise httpx.ConnectError("blip")
+        return real(client, *args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(downloader, "fetch_klines", tail_fails)
+    with fake.client() as client, pytest.raises(httpx.ConnectError):
+        sync(store, client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
+    assert store.read("BTCUSDT", H4).height > 4000  # the archives were stored as they came
+    assert _gaps(store, H4) == 0

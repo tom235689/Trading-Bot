@@ -1,2 +1,4 @@
 # Normalize line endings; hooks must stay LF to run.
 * text=auto eol=lf
+# Every run appends one line: keep both sides when an update and a local run both added some.
+data/trials.jsonl merge=union

@@ -26,7 +26,12 @@ if (-not $task) {
 if ($task.State -eq "Running") {
     $uv = (Get-Command uv -ErrorAction Stop).Source
     & $uv run --frozen python -m tbot stop $Config
-    if ($LASTEXITCODE -ne 0) { throw "the bot did not stop; the task is kept" }
+    if ($LASTEXITCODE -ne 0) {
+        & $uv run --frozen python -m tbot stop $Config --cancel | Out-Null  # it keeps running
+        throw "the bot did not stop in time; the task and the bot are left as they were"
+    }
+    # The bot is gone; a supervisor still waiting to restart it is ended with the task.
+    Stop-ScheduledTask -TaskName $Name
 }
 Unregister-ScheduledTask -TaskName $Name -Confirm:$false
 Write-Output "removed '$Name'; the ledger, data, and logs are kept"

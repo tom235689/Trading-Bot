@@ -46,14 +46,19 @@ async def run_checks(
     settings: Settings,
     client: httpx.AsyncClient,
     store: BarStore | None = None,
+    *,
+    offline: bool = False,
 ) -> list[Check]:
+    """Offline leaves out what depends on the network, which a running bot retries."""
     checks = strategy_checks(config) + ledger_checks(config) + alert_checks(settings)
     if checks[0].status == "fail":
         return checks  # nothing below means much for a config that cannot start
-    if settings.heartbeat_url and valid_url(settings.heartbeat_url):
+    if settings.heartbeat_url and valid_url(settings.heartbeat_url) and not offline:
         checks.append(await heartbeat_check(settings.heartbeat_url, client))
     if store is not None:
         checks.append(await asyncio.to_thread(guard_check, config, store))
+    if offline:
+        return checks
     live = config if isinstance(config, LiveConfig) else None
     public = BinanceSpot(client, "", "", base_url=PRODUCTION_URL)
     try:

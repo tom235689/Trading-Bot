@@ -397,3 +397,30 @@ def test_server_clock_keeps_its_offset_when_every_sample_is_slow(
     assert clock.sync() == pytest.approx(5.0, abs=0.1)
     step[0] = 0.1
     assert clock.sync() == pytest.approx(9.0, abs=0.1)
+
+
+def test_a_rate_limit_keeps_the_feed_away_from_rest(tmp_path: Path) -> None:
+    calls = [0]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls[0] += 1
+        return httpx.Response(429, headers={"Retry-After": "120"})
+
+    store = BarStore(tmp_path / "data")
+    now = [at(5.5)]
+    feed = LiveFeed(
+        [BTC1],
+        store,
+        httpx.Client(transport=httpx.MockTransport(handle)),
+        clock=lambda: now[0],
+        last={BTC1: at(2)},
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(feed.catch_up())
+    assert calls == [1]
+    assert asyncio.run(feed.catch_up()) == 0  # within the wait: no request at all
+    assert calls == [1]
+    now[0] += timedelta(seconds=121)
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(feed.catch_up())
+    assert calls == [2]

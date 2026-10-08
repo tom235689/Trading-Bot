@@ -204,3 +204,13 @@ def test_ledger_backups_are_checked(tmp_path: Path) -> None:
     os.utime(daily_backups(config.ledger)[-1], (old, old))
     assert "5 days older" in backup_check(config).detail
     assert backup_check(config.model_copy(update={"backup_days": 0})).detail.startswith("off")
+
+
+def test_offline_doctor_skips_what_the_bot_retries(tmp_path: Path) -> None:
+    async def run() -> list[Check]:
+        async with fake().client() as client:
+            return await run_checks(live(tmp_path), settings(**ALERTS), client, offline=True)
+
+    names = set(by_name(asyncio.run(run())))
+    assert {"strategies", "ledger", "telegram"} <= names
+    assert not names & {"heartbeat", "binance", "clock", "symbols", "api key"}  # no network

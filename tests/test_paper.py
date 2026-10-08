@@ -298,6 +298,11 @@ def test_status_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert f"wrote {out_file}" in capsys.readouterr().out
     with Ledger(out_file) as copy, Ledger(tmp_path / "paper.sqlite") as original:
         assert copy.counts() == original.counts()
+    synced = tmp_path / "synced"  # a folder: the copy goes inside it
+    synced.mkdir()
+    assert main(["backup", str(config_path), "--out", str(synced)]) == 0
+    capsys.readouterr()
+    assert [p.suffix for p in synced.iterdir()] == [".sqlite"]
 
 
 def test_live_command_needs_the_flag_for_real_money(tmp_path: Path) -> None:
@@ -458,4 +463,76 @@ def test_telegram_status_and_fills_answers(tmp_path: Path) -> None:
     assert status.endswith("PAUSED: x")
     assert "BUY 5.000000 BTC @ 100.00" in answer("/fills")
     assert answer("/nope") == HELP
+    ledger.close()
+
+
+def saved_at(config: PaperConfig, ledger: Ledger) -> datetime | None:
+    checkpoint = load_checkpoint(config, ledger)
+    return checkpoint.time if checkpoint else None
+
+
+def test_a_close_split_over_two_events_is_done_only_when_every_stream_is_in(
+    tmp_path: Path,
+) -> None:
+    config = paper_config(tmp_path)
+    eth = ("ETH", H4)
+    session = TradingSession(
+        config,
+        [
+            StrategySlot(Scripted(["BTC"], {"script": {}}), H1, 0.5),
+            StrategySlot(Scripted(["ETH"], {"script": {}}), H4, 0.5),
+        ],
+        {BTC: BarHistory(H1), eth: BarHistory(H4)},
+        Portfolio(config.initial_cash),
+    )
+    ledger = Ledger(config.ledger)
+    notifier = Collect()
+    executor = PaperExecutor(
+        SimulatedBroker(config.costs),
+        FakePrices({"BTC": 100.0, "ETH": 100.0}),
+        ledger,
+        notifier,
+        lambda: at(9),
+    )
+    trader = SessionTrader(session, ledger, executor, notifier, RiskGuard(NO_GUARD), lambda: at(4))
+    btc = price_bars(T0, H1, [100.0] * 4, [100.0] * 4)
+    asyncio.run(trader.handle({BTC: btc.slice(0, 1)}))  # 01:00: only 1h is due
+    assert load_checkpoint(config, ledger) is not None
+    for i in (1, 2):
+        asyncio.run(trader.handle({BTC: btc.slice(i, 1)}))
+    assert saved_at(config, ledger) == at(3)
+    asyncio.run(trader.handle({BTC: btc.slice(3, 1)}))  # 04:00: the 4h bar is late
+    assert saved_at(config, ledger) == at(3)  # a restart now hands 04:00 over again
+    eth_bar = price_bars(T0, H4, [100.0], [100.0])
+    asyncio.run(trader.handle({eth: eth_bar}))  # the late 4h bar, same close
+    assert saved_at(config, ledger) == at(4)
+    ledger.close()
+
+
+def test_a_ledger_from_0_2_books_a_changed_budget_once(tmp_path: Path) -> None:
+    config = paper_config(tmp_path)  # initial_cash 1000
+    with Ledger(config.ledger) as ledger:
+        ledger.set_meta("initial_cash", "1000.0")  # 0.2.0 kept only the budget
+        smaller = config.model_copy(update={"initial_cash": 400.0})
+        check_budget(smaller, ledger, load_guard(smaller, ledger), at(1))
+        assert restore_portfolio(smaller, ledger).cash == pytest.approx(400.0)
+
+
+def test_the_checkpoint_waits_for_the_event_to_finish(tmp_path: Path) -> None:
+    trader, ledger, _ = make_trader(tmp_path, {at(1): {"BTC": 0.5}}, FakePrices({"BTC": 100.0}))
+    asyncio.run(trader.handle({BTC: BARS.slice(0, 1)}))
+    before = load_checkpoint(trader.session.config, ledger)  # type: ignore[arg-type]
+
+    class Broken:
+        async def execute(self, *args: object) -> list[object]:
+            raise RuntimeError("crash in the middle of the orders")
+
+        async def after_event(self, *args: object) -> None:
+            return None
+
+    trader.executor = Broken()  # type: ignore[assignment]
+    with pytest.raises(RuntimeError):
+        asyncio.run(trader.handle({BTC: BARS.slice(1, 1)}))
+    after = load_checkpoint(trader.session.config, ledger)  # type: ignore[arg-type]
+    assert after == before  # a restart hands the 02:00 bar over again
     ledger.close()

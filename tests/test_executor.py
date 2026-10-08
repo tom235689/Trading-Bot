@@ -8,14 +8,15 @@ import pytest
 
 from binance_spot_fake import FakeSpot
 from tbot.core.config import StrategyConfig
+from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.exchange.binance import NOTHING_TO_CANCEL, TESTNET_URL, BinanceError, BinanceSpot, Order
 from tbot.live.config import LiveConfig
 from tbot.live.executor import LiveExecutor, order_id
 from tbot.live.ledger import Ledger
-from tbot.live.runner import reconcile_round
+from tbot.live.runner import GUARD_META, reconcile_round
 from tbot.portfolio.portfolio import Portfolio
-from tbot.risk.guard import GuardConfig, RiskGuard
+from tbot.risk.guard import GuardConfig, GuardState, Mode, RiskGuard
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
 BTC = "BTCUSDT"
@@ -518,3 +519,165 @@ def test_an_order_booked_between_bars_gets_its_stop(
     assert portfolio.position(BTC) == pytest.approx(0.00999)
     stops = [o for o in fake.orders if o["type"] == "STOP_LOSS_LIMIT" and o["status"] == "NEW"]
     assert [float(o["origQty"]) for o in stops] == [pytest.approx(0.00999)]
+
+
+def _live_config(tmp_path: Path) -> LiveConfig:
+    return LiveConfig(
+        mode="testnet",
+        initial_cash=1000.0,
+        strategies=[
+            StrategyConfig(
+                name="donchian_trend", symbols=[BTC], timeframe=Timeframe.H4, allocation=1.0
+            )
+        ],
+        ledger=tmp_path / "unused.sqlite",
+    )
+
+
+def test_an_exit_sells_what_the_exchange_holds_when_the_book_says_more(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 500.0, "BTC": 0.008}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[Fill]:
+        portfolio = Portfolio(500.0)
+        portfolio.positions[BTC] = 0.01  # a commission in BTC the book missed, say
+        return await executor.execute({BTC: -0.01}, T0, portfolio, MARKS)
+
+    [fill] = run(fake, tmp_path, action, stop_pct=0.0)
+    assert fill.quantity == pytest.approx(-0.008)  # not refused for the full 0.01
+
+
+def test_a_buy_spends_no_more_than_the_account_holds(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 300.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> None:
+        await executor.execute({BTC: 0.01}, T0, Portfolio(1000.0), MARKS)
+
+    run(fake, tmp_path, action, stop_pct=0.0)
+    [order] = [o for o in fake.orders if o["type"] == "MARKET"]
+    # Free USDT over the ask with the fee and the safety margin, rounded down to the step.
+    assert float(order["origQty"]) == pytest.approx(0.00598)
+
+
+def test_money_taken_out_moves_the_guard_and_keeps_a_resume(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 600.0}, prices={BTC: 50000.0})  # 400 withdrawn
+    config = _live_config(tmp_path)
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> RiskGuard:
+        portfolio = Portfolio(1000.0)
+        guard = RiskGuard(GuardConfig(max_drawdown=0.3))
+        guard.check(T0, 1000.0, T0)  # peak 1000
+        guard.halt("an earlier halt")
+        resumed = GuardState.model_validate_json(guard.state.model_dump_json())
+        resumed.halted, resumed.halt_reason, resumed.peak_equity = False, "", 1000.0
+        ledger.set_meta(GUARD_META, resumed.model_dump_json())  # `tbot resume` meanwhile
+        await reconcile_round(
+            executor, portfolio, MARKS, ledger, notifier, guard, config, lambda: T0
+        )
+        assert portfolio.cash == pytest.approx(600.0)
+        return guard
+
+    guard = run(fake, tmp_path, action, stop_pct=0.0)
+    assert not guard.state.halted  # the resume survived the shift
+    assert guard.state.peak_equity == pytest.approx(600.0)  # a transfer, not a 40% loss
+    assert guard.check(T0, 600.0, T0).mode == Mode.NORMAL
+
+
+def test_an_order_in_doubt_blocks_the_next_order_for_its_symbol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 1.01}, prices={BTC: 50000.0})  # owner: 1 BTC
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> None:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))  # the bot's 0.01 BTC
+        fake.error_after_next_order = httpx.Response(503)  # it executes; the answer is lost
+        lookup = executor.spot.get_order
+
+        async def unreachable(symbol: str, client_id: str) -> Order | None:
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(executor.spot, "get_order", unreachable)
+        await executor.execute({BTC: -0.01}, T0, portfolio, MARKS)  # the exit, in doubt
+        monkeypatch.setattr(executor.spot, "get_order", lookup)
+        # The next bar comes before any reconciliation and plans the same exit again.
+        assert await executor.execute({BTC: -0.01}, T0, portfolio, MARKS) == []
+        assert portfolio.position(BTC) == pytest.approx(0.0)  # booked from the lookup
+        assert "no order this bar" in notifier.messages[-1]
+
+    run(fake, tmp_path, action, stop_pct=0.0)
+    assert fake.order_count("MARKET") == 1
+    assert fake.balances["BTC"] == pytest.approx(1.0)  # the owner's coin is untouched
+
+
+def test_no_stop_is_sized_while_a_sell_is_in_doubt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 1.01}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> set[str]:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        fake.error_after_next_order = httpx.Response(503)
+
+        async def unreachable(symbol: str, client_id: str) -> Order | None:
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(executor.spot, "get_order", unreachable)
+        await executor.execute({BTC: -0.01}, T0, portfolio, MARKS)
+        await executor.after_event(portfolio, MARKS)  # the book still says 0.01
+        return executor.unprotected
+
+    assert run(fake, tmp_path, action) == {BTC}  # placed after reconciliation settles it
+    assert fake.order_count("STOP_LOSS_LIMIT") == 0  # not on the owner's coins
+
+
+def test_a_partly_filled_stop_keeps_working(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.1}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.1, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)  # stop 40000 for 0.1 BTC
+        stop = next(o for o in fake.orders if o["type"] == "STOP_LOSS_LIMIT")
+        # A gap through the stop: 0.03 filled at the limit, 0.07 still rests there.
+        stop.update(executedQty="0.03000000", cummulativeQuoteQty=f"{0.03 * 39800:.8f}")
+        fake.locked["BTC"] -= 0.03
+        fake.balances["USDT"] = 0.03 * 39800
+        fake.prices[BTC] = 39500.0
+        assert await executor.settle(portfolio) == 1
+        await executor.after_event(portfolio, MARKS)  # what reconciliation does after a fill
+        assert stop["status"] == "NEW"  # not cancelled for a stop above the market
+        return portfolio
+
+    portfolio = run(fake, tmp_path, action)
+    assert portfolio.position(BTC) == pytest.approx(0.07)
+    assert fake.order_count("STOP_LOSS_LIMIT") == 1
+
+
+def test_a_fill_while_balances_are_read_waits_for_the_next_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+    compared: list[int] = []
+
+    async def no_reconcile(*args: object, **kwargs: object) -> list[object]:
+        compared.append(1)
+        return []
+
+    monkeypatch.setattr("tbot.live.runner.reconcile", no_reconcile)
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> None:
+        settled = iter([0, 1])  # a stop executes while the balances are being read
+
+        async def settle(portfolio: Portfolio) -> int:
+            return next(settled)
+
+        monkeypatch.setattr(executor, "settle", settle)
+        guard = RiskGuard(GuardConfig())
+        config = _live_config(tmp_path)
+        await reconcile_round(
+            executor, Portfolio(1000.0), MARKS, ledger, notifier, guard, config, lambda: T0
+        )
+
+    run(fake, tmp_path, action)
+    assert compared == []  # balances that may or may not show the fill are not compared

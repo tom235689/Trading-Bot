@@ -30,3 +30,12 @@ def test_empty_series() -> None:
     empty = simulate(np.zeros(0), runs=100)
     assert empty.days == 0
     assert math.isnan(empty.drawdown_p50)
+
+
+def test_bars_within_a_day_count() -> None:
+    # A 4h dip that recovers by the close: daily closes never see it, the guard does.
+    bars = np.array([0.0, -0.3, 0.0, 0.0, 0.0, 0.3 / 0.7] * 10)
+    summary = simulate(bars, runs=200, seed=1, block_days=2, kill_switch=0.25, per_day=6)
+    assert summary.days == 10
+    assert summary.block_days == 2
+    assert summary.prob_kill == 1.0

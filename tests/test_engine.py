@@ -217,3 +217,77 @@ def test_halt_sells_a_symbol_on_a_slower_stream() -> None:
     assert result.halted.startswith("2024-01-01 12:00")
     assert result.positions.get("ETH", 0.0) == 0.0
     assert result.fills.filter(pl.col("quantity") < 0)["time"].to_list() == [at(12)]
+
+
+def test_volatility_scale_uses_only_closed_bars() -> None:
+    from tbot.risk.volatility import volatility_scale
+
+    # Calm for 40 bars, wild afterwards: a scale that saw later bars would be smaller.
+    closes = [100.0]
+    for i in range(1, 60):
+        step = 1.01 if i < 41 else 1.10
+        closes.append(closes[-1] * (step if i % 2 else 1 / step))
+    bars = price_bars(T0, H1, [closes[0], *closes[:-1]], closes)
+    engine = BacktestEngine(
+        [StrategySlot(Scripted(["BTC"], {"script": {at(40): {"BTC": 1.0}}}), H1, 1.0)],
+        {("BTC", H1): bars},
+        start=T0,
+        initial_cash=1000.0,
+        costs=CostModel(fee_rate=0.0, slippage_bps=0.0),
+        risk=RiskLimits(target_volatility=0.5, volatility_lookback_days=1),
+        rules=RebalanceRules(min_notional=0, rebalance_threshold=0.0),
+    )
+    first = engine.run().fills.row(0, named=True)
+    scale = volatility_scale(closes[:40], H1, 0.5, 1)
+    assert scale < 1
+    assert first["quantity"] * first["price"] == pytest.approx(scale * 1000.0, rel=1e-6)
+
+
+def test_a_halt_fills_a_slower_stream_after_the_decision() -> None:
+    btc = [100.0] * 12 + [40.0] * 12  # the 12:00 bar crashes: the halt is decided at 13:00
+    eth = [100.0] * 6
+    engine = BacktestEngine(
+        [
+            StrategySlot(Scripted(["ETH"], {"script": {at(4): {"ETH": 1.0}}}), H4, 0.5),
+            StrategySlot(Scripted(["BTC"], {"script": {at(1): {"BTC": 1.0}}}), H1, 0.5),
+        ],
+        {
+            ("BTC", H1): price_bars(T0, H1, [100.0, *btc[:-1]], btc),
+            ("ETH", H4): price_bars(T0, H4, eth, eth),
+        },
+        start=T0,
+        initial_cash=1000.0,
+        costs=CostModel(fee_rate=0.0, slippage_bps=0.0),
+        risk=RiskLimits(),
+        rules=RebalanceRules(min_notional=0, rebalance_threshold=0.0),
+        guard=GuardConfig(daily_loss_limit=0, max_drawdown=0.15, stale_seconds=0),
+    )
+    result = engine.run()
+    assert result.halted.startswith("2024-01-01 13:00")
+    sells = result.fills.filter(pl.col("symbol") == "ETH", pl.col("quantity") < 0)
+    assert sells["time"].to_list() == [at(16)]  # the next 4h open, not the 12:00 one
+
+
+def test_a_halt_drops_orders_the_strategies_had_queued() -> None:
+    btc = [100.0] * 12 + [40.0] * 12  # the halt is decided at 13:00
+    eth = [100.0] * 6
+    engine = BacktestEngine(
+        [
+            # Decided at the 12:00 close, it would fill at the 12:00 open, seen at 16:00.
+            StrategySlot(Scripted(["ETH"], {"script": {at(12): {"ETH": 1.0}}}), H4, 0.5),
+            StrategySlot(Scripted(["BTC"], {"script": {at(1): {"BTC": 1.0}}}), H1, 0.5),
+        ],
+        {
+            ("BTC", H1): price_bars(T0, H1, [100.0, *btc[:-1]], btc),
+            ("ETH", H4): price_bars(T0, H4, eth, eth),
+        },
+        start=T0,
+        initial_cash=1000.0,
+        costs=CostModel(fee_rate=0.0, slippage_bps=0.0),
+        risk=RiskLimits(),
+        rules=RebalanceRules(min_notional=0, rebalance_threshold=0.0),
+        guard=GuardConfig(daily_loss_limit=0, max_drawdown=0.15, stale_seconds=0),
+    )
+    result = engine.run()
+    assert result.halted.startswith("2024-01-01 13:00")
+    assert result.fills.filter(pl.col("symbol") == "ETH").is_empty()  # never bought

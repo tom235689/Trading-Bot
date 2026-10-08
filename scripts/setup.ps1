@@ -46,6 +46,15 @@ if (-not $uvCommand) {
 $uv = $uvCommand.Source
 Write-Output (& $uv --version)
 
+$venv = (Join-Path $repo ".venv").ToLowerInvariant()
+$busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -and $_.Path.ToLowerInvariant().StartsWith($venv)
+})
+if ($busy) {  # rebuilding or syncing the environment under a running bot breaks it
+    throw "a bot or tool runs from .venv (process $($busy[0].Id)): stop it first " +
+        "(tbot stop <config>, or scripts\update.ps1 to update a scheduled bot)"
+}
+
 Step "Python"
 $smartAppControl = 0
 try {

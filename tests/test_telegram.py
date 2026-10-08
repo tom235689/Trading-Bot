@@ -3,6 +3,7 @@ import json
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 
 from tbot.live.commands import command_loop
 from tbot.monitoring.telegram import LogNotifier, QueuedNotifier, Telegram
@@ -90,11 +91,66 @@ def test_commands_are_answered_only_for_the_owner() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
             telegram = Telegram("token", "42", client)
             task = asyncio.create_task(command_loop(telegram, lambda c: f"answer {c}", started))
-            while len(sent) < 2 or len(offsets) < 2:
-                await asyncio.sleep(0.01)
+            async with asyncio.timeout(5):  # a regression fails instead of hanging
+                while len(sent) < 2 or len(offsets) < 2:
+                    await asyncio.sleep(0.01)
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(run())
     assert sent == ["answer /status", "answer hello"]  # not the stranger, not the old message
     assert offsets == [None, "5"]  # every update is confirmed
+
+
+def test_an_odd_reply_from_telegram_never_ends_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2024, 1, 1, tzinfo=UTC)
+    polls: list[int] = []
+    sent: list[str] = []
+    replies = [
+        httpx.Response(200, text="<html>blocked</html>"),  # a proxy page
+        httpx.Response(200, json=["not", "a", "dict"]),
+        httpx.Response(200, json={"ok": True, "result": [{"no": "update_id"}]}),
+        httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "result": [
+                    {
+                        "update_id": 5,
+                        "message": {
+                            "chat": {"id": 42},
+                            "date": int(started.timestamp()) + 9,
+                            "text": "/status",
+                        },
+                    }
+                ],
+            },
+        ),
+    ]
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getUpdates"):
+            polls.append(1)
+            if len(polls) > len(replies):
+                await asyncio.sleep(10)
+            return replies[min(len(polls), len(replies)) - 1]
+        sent.append(json.loads(request.content)["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr("tbot.live.commands.RETRY_SECONDS", 0)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            telegram = Telegram("token", "42", client)
+            task = asyncio.create_task(command_loop(telegram, lambda c: f"answer {c}", started))
+            async with asyncio.timeout(5):
+                while not sent:
+                    await asyncio.sleep(0.01)
+            assert not task.done()  # still polling after three bad replies
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert sent == ["answer /status"]

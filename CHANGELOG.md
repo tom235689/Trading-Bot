@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.1 (2026-10-08)
+
+Fixes from four independent reviews of 0.3.0 (live path, research, operations, and a mutation test of the suite). Upgrade notes: a paper session now logs to `logs\<config name>.jsonl`, like live (`paper.jsonl` for `config\paper.yaml`, as before); `.gitattributes` merges the trial log by union.
+
+**Live trading safety**
+- An order whose result is in doubt now holds its symbol back: the next event looks it up first and, if it executed or is still unknown, plans that symbol again at the next bar instead of ordering twice on a stale book. In budget mode that second order could sell the owner's coins or spend the owner's USDT.
+- No protective stop is sized while a sell is in doubt (its free coins may be the owner's; 0.3.0 still did this until the next reconciliation), and a stop that triggered and partly filled is left to finish instead of being replaced above the market.
+- An odd reply from Telegram (a proxy page, a malformed update) no longer ends the session; the command poller pauses and tries again.
+- A close whose streams arrive in two events (a late 4h bar after the 1h one) is checkpointed only when every stream is in, so a restart in between still trades the late bar.
+
+**Operations**
+- `scripts\update.ps1` keeps local edits in every failure case (0.3.0 lost them when `uv sync` failed after the pull), restarts every task it stopped whatever happens, ends a supervisor waiting to restart, clears leftover stop requests, refuses to run with a leftover stash or a bot started by hand, checks configs with the new `tbot doctor --offline`, and exits with 1 when the update was not applied.
+- `scripts\setup.ps1` refuses while a bot runs from `.venv`; `scripts\remove_task.ps1` ends a waiting supervisor and leaves everything as it was when the bot does not stop.
+- `tbot stop --cancel` withdraws a stop request; `tbot backup --out` accepts a folder and never leaves a partial file; every session logs to its own file.
+
+**Data and research**
+- The Monte Carlo resamples every bar instead of daily closes, as the kill switch checks every bar. For the configured candidate out of sample: median drawdown -34%, 5th percentile -55%, 17% of four-year paths beyond 45% (0.3.0 said -33%, -54%, 16%).
+- Delisted symbols are filled from their archives, partial months included; a 400 that is not "invalid symbol" stays an error; a first download of a symbol listed after `--start` stores its archives as they come.
+- After a rate limit the live feed stays away from REST until the exchange allows it, and `tbot download` stops instead of hammering on.
+- A leftover sold on its own belongs to the round trip that left it, so it is no longer a separate winning trade.
+
+**Tests**
+- 32 new tests (341 in all), among them a whole paper session from start to stop with the network replaced, the reconciliation pause and recovery, the guard shift through a reconciliation round, atomic ledger writes, the exchange-side order caps, volatility sizing without look-ahead, and kill-switch timing in the backtest. Each was checked to fail without the code it guards. Tests no longer depend on the folder pytest starts in.
+
 ## 0.3.0 (2026-10-08)
 
 Product round after three more independent reviews (live path, research, operations). Upgrade notes: the supervisor's logs are per config now (`logs\<config>.supervisor.log`, `logs\<config>.console.txt`); a wrong command line or a `.env` that is not UTF-8 exits with 4 instead of 2 or 1; a changed `initial_cash` is booked as an adjustment at the next start.

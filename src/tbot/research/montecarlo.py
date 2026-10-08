@@ -36,13 +36,20 @@ def simulate(
     block_days: int = 20,
     drawdown_limit: float = 0.25,
     kill_switch: float = math.nan,
+    per_day: int = 1,
 ) -> MonteCarloSummary:
-    """Compound paths of daily returns drawn as random blocks of consecutive days."""
+    """Compound paths of returns drawn as random blocks of consecutive days.
+
+    `per_day` returns make a day: bar returns see the drawdowns the guard sees, which
+    daily closes miss within a day.
+    """
     n = len(returns)
-    block = max(1, min(block_days, n))
+    block = max(1, min(block_days * per_day, n))
     if n == 0:
         nan = float("nan")
-        return MonteCarloSummary(runs, 0, block, nan, nan, nan, nan, nan, nan, nan, drawdown_limit)
+        return MonteCarloSummary(
+            runs, 0, block_days, nan, nan, nan, nan, nan, nan, nan, drawdown_limit
+        )
     rng = np.random.default_rng(seed)
     count = -(-n // block)
     starts = rng.integers(0, n - block + 1, size=(runs, count))
@@ -55,8 +62,8 @@ def simulate(
     r_p5, r_p50, r_p95 = np.percentile(finals, [5, 50, 95])
     return MonteCarloSummary(
         runs=runs,
-        days=n,
-        block_days=block,
+        days=round(n / per_day),
+        block_days=block // per_day,
         drawdown_p5=float(dd_p5),
         drawdown_p50=float(dd_p50),
         drawdown_p95=float(dd_p95),

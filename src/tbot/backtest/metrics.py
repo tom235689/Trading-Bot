@@ -53,6 +53,15 @@ def daily_returns(result: BacktestResult) -> npt.NDArray[np.float64]:
     return np.asarray(np.diff(closes) / closes[:-1], dtype=np.float64)
 
 
+def bar_returns(result: BacktestResult) -> tuple[npt.NDArray[np.float64], int]:
+    """Returns between consecutive equity records (every bar event) and records per day."""
+    values = np.concatenate([[result.initial_cash], result.equity["equity"].to_numpy()])
+    returns = np.asarray(np.diff(values) / values[:-1], dtype=np.float64)
+    times = result.equity["time"]
+    days = (times[-1] - times[0]).total_seconds() / 86400 if len(times) > 1 else 0.0
+    return returns, max(1, round(len(returns) / days)) if days > 0 else 1
+
+
 def compute_metrics(result: BacktestResult) -> Metrics:
     equity = result.equity
     if equity.is_empty():
