@@ -67,3 +67,12 @@ def test_error_description_never_carries_the_url() -> None:
     status = httpx.HTTPStatusError("boom", request=request, response=response)
     assert describe_error(status) == 'HTTP 401: {"ok":false}'
     assert describe_error(httpx.ConnectError("x", request=request)) == "ConnectError"
+
+
+def test_a_long_retry_after_fails_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("tbot.data.http.time.sleep", waits.append)
+    client, calls = client_for([httpx.Response(418, headers={"Retry-After": "7200"})])
+    with pytest.raises(httpx.HTTPStatusError):
+        get_bytes(client, URL)
+    assert (calls, waits) == ([1], [])  # banned for two hours: say so now, do not sleep

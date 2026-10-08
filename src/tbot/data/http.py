@@ -6,6 +6,7 @@ from collections.abc import Mapping
 import httpx
 
 RETRY_STATUS = frozenset({418, 429, 500, 502, 503, 504})
+MAX_RETRY_WAIT = 30.0  # seconds; a longer Retry-After (an IP ban) fails at once
 
 
 def get_bytes(
@@ -29,8 +30,9 @@ def get_bytes(
             continue
         if response.status_code == 404:
             return None
-        if response.status_code in RETRY_STATUS and not last:
-            time.sleep(float(response.headers.get("Retry-After", delay)))
+        wait = float(response.headers.get("Retry-After", delay))
+        if response.status_code in RETRY_STATUS and not last and wait <= MAX_RETRY_WAIT:
+            time.sleep(wait)  # waiting longer would stall the live feed without a word
             continue
         response.raise_for_status()
         return response.content

@@ -22,14 +22,17 @@ from tbot.backtest.report import format_metrics
 from tbot.backtest.runner import data_ends, run_backtest
 from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
+from tbot.data.http import describe_error
 from tbot.data.quality import QualityReport, check_bars
 from tbot.data.store import BarStore
-from tbot.live.clock import ServerClock
+from tbot.live.backup import backup_dir
+from tbot.live.clock import CLOSE_GRACE, ServerClock
 from tbot.live.compare import compare_session, comparison_text
 from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings
 from tbot.live.doctor import Check, checks_text, run_checks
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.runner import (
+    STOP_REQUEST_SECONDS,
     AlreadyRunning,
     account_text,
     is_running,
@@ -232,6 +235,12 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("config", type=Path)
     compare.add_argument("--data-dir", type=Path, default=Path("data"))
 
+    backup = commands.add_parser("backup", help="copy a session ledger, also while it runs")
+    backup.add_argument("config", type=Path)
+    backup.add_argument(
+        "--out", type=Path, default=None, help="default: backups/<name>-<time>.sqlite by the ledger"
+    )
+
     resume_cmd = commands.add_parser("resume", help="clear the kill switch of a session")
     resume_cmd.add_argument("config", type=Path)
 
@@ -252,17 +261,23 @@ def run_download(args: argparse.Namespace) -> int:
     with httpx.Client(timeout=30.0) as client:
         clock = ServerClock(client)  # a fast local clock would store a bar still open
         clock.sync()
-        now = clock.now()
+        now = clock.now() - CLOSE_GRACE  # the clock may still run a little ahead
+        failed = 0
         for symbol in args.symbols:
             for timeframe in args.timeframes:
-                result = sync(store, client, symbol, timeframe, args.start, now, progress=print)
+                try:
+                    result = sync(store, client, symbol, timeframe, args.start, now, progress=print)
+                except (httpx.HTTPError, LookupError, ValueError, OSError) as exc:
+                    print(f"{symbol} {timeframe}: FAILED, {brief(exc)}", file=sys.stderr)
+                    failed += 1
+                    continue  # the other streams still download
                 print(
                     f"{symbol} {timeframe}: {result.total_bars} bars stored, "
                     f"{fmt(result.first)} -> {fmt(result.last)}"
                 )
                 if result.dropped:
                     print(f"  dropped {result.dropped} misaligned bars")
-    return 0
+    return EXIT_ERROR if failed else 0
 
 
 def print_report(symbol: str, timeframe: Timeframe, report: QualityReport) -> None:
@@ -359,7 +374,8 @@ def write_dashboard(data: DashboardData, out: Path) -> None:
 def run_dashboard_command(args: argparse.Namespace) -> int:
     config = existing_ledger(load_session_config(args.config))
     out = args.out or Path("reports") / f"{args.config.stem}.html"
-    title = f"{'Live' if isinstance(config, LiveConfig) else 'Paper'} session {args.config.stem}"
+    kind = config.mode.capitalize() if isinstance(config, LiveConfig) else "Paper"
+    title = f"{kind} session {args.config.stem}"
     write_dashboard(from_ledger(config, BarStore(args.data_dir), title), out)
     return 0
 
@@ -417,16 +433,24 @@ def run_doctor_command(args: argparse.Namespace) -> int:
 
 def run_stop_command(args: argparse.Namespace) -> int:
     config = existing_ledger(load_session_config(args.config))
+    request = stop_path(config.ledger)
+    request.write_text("stop\n", encoding="utf-8")  # also stops a restart by the supervisor
+    later = (
+        f"a session that starts in the next {STOP_REQUEST_SECONDS // 60} minutes "
+        "(a supervisor's restart) stops at once"
+    )
     if not is_running(config.ledger):
-        print(f"no session is running on {config.ledger}")
+        print(f"no session is running on {config.ledger}; {later}")
         return 0
-    stop_path(config.ledger).write_text("stop\n", encoding="utf-8")
     print(f"asked the session on {config.ledger} to stop; it finishes the event in progress")
     deadline = monotonic() + args.timeout
     while monotonic() < deadline:
         sleep(1.0)
         if not is_running(config.ledger):
-            print("stopped")
+            if request.exists():  # it ended some other way, such as a crash
+                print(f"the session ended without taking the request; {later}")
+            else:
+                print("stopped")
             return 0
     print("still running: see logs/ for what it is doing", file=sys.stderr)
     return EXIT_ERROR
@@ -442,6 +466,16 @@ def run_compare_command(args: argparse.Namespace) -> int:
             return EXIT_ERROR
     print(comparison_text(comparison, str(config.ledger)))
     return 0 if not comparison.checks() else 1
+
+
+def run_backup_command(args: argparse.Namespace) -> int:
+    config = existing_ledger(load_session_config(args.config))
+    stamp = f"{datetime.now(UTC):%Y%m%d-%H%M%S}"
+    out = args.out or backup_dir(config.ledger) / f"{config.ledger.stem}-{stamp}.sqlite"
+    with Ledger(config.ledger) as ledger:
+        ledger.backup(out)
+    print(f"wrote {out}")
+    return 0
 
 
 def run_resume_command(args: argparse.Namespace) -> int:
@@ -463,10 +497,12 @@ def run_account_command(args: argparse.Namespace) -> int:
 
 def run_notify_command(args: argparse.Namespace) -> int:
     settings = Settings()
-    if not settings.telegram_token or not settings.telegram_chat_id:
-        print("set TBOT_TELEGRAM_TOKEN and TBOT_TELEGRAM_CHAT_ID in .env first")
-        return 1
     token, chat_id = settings.telegram_token, settings.telegram_chat_id
+    if not token:
+        print("set TBOT_TELEGRAM_TOKEN (from @BotFather) in .env first")
+        return 1
+    if not chat_id:
+        return _find_chat(token)
 
     async def send() -> bool:
         async with httpx.AsyncClient() as client:
@@ -477,6 +513,33 @@ def run_notify_command(args: argparse.Namespace) -> int:
         return 0
     print("failed: see the log line above; check the token and the chat id")
     return 1
+
+
+def _find_chat(token: str) -> int:
+    """Print the chats that wrote to the bot, so the owner can copy the id into .env."""
+
+    async def read() -> list[dict[str, Any]]:
+        async with httpx.AsyncClient() as client:
+            return await Telegram(token, "", client).updates(None, 0)
+
+    try:
+        updates = asyncio.run(read())
+    except httpx.HTTPError as exc:
+        print(f"cannot read the bot's messages ({describe_error(exc)}); check the token")
+        return EXIT_ERROR
+    chats: dict[str, str] = {}
+    for update in updates:
+        chat = (update.get("message") or {}).get("chat") or {}
+        if "id" in chat:
+            name = chat.get("title") or chat.get("first_name") or chat.get("username") or ""
+            chats[str(chat["id"])] = str(name)
+    if not chats:
+        print("TBOT_TELEGRAM_CHAT_ID is not set: send your bot any message, then run this again")
+        return EXIT_ERROR
+    for chat, name in chats.items():
+        print(f"chat {chat} {name}".rstrip())
+    print("put the id in TBOT_TELEGRAM_CHAT_ID in .env, then run `tbot notify` again")
+    return EXIT_ERROR
 
 
 COMMANDS = {
@@ -490,6 +553,7 @@ COMMANDS = {
     "compare": run_compare_command,
     "doctor": run_doctor_command,
     "stop": run_stop_command,
+    "backup": run_backup_command,
     "resume": run_resume_command,
     "account": run_account_command,
     "dashboard": run_dashboard_command,
@@ -499,7 +563,10 @@ COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:  # argparse: 0 after --help, 2 for a wrong command line
+        return EXIT_CONFIG if exc.code == 2 else int(exc.code or 0)
     if args.command not in COMMANDS:
         parser.print_help()
         return 0
@@ -510,6 +577,8 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(str(exc.code), EXIT_CONFIG, alert=session)
     except (LedgerUnavailable, AlreadyRunning) as exc:
         return _fail(str(exc), EXIT_LEDGER, alert=session and isinstance(exc, LedgerUnavailable))
+    except UnicodeDecodeError as exc:  # .env or a config saved as UTF-16: fix the file
+        return _fail(f"error: {brief(exc)}", EXIT_CONFIG, alert=False)
     except Exception as exc:  # one line; TBOT_DEBUG=1 shows the traceback
         if os.environ.get("TBOT_DEBUG"):
             raise

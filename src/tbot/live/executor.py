@@ -341,6 +341,11 @@ class LiveExecutor:
                 "not on exchange",
                 record.client_id,
             )
+            log.warning("order_resolved", symbol=record.symbol, outcome="never executed")
+            await self.notifier.send(
+                f"[{self.label}] the {record.symbol} order in doubt never reached the exchange; "
+                "nothing was traded"
+            )
             return 0
         if not order.done:
             return 0  # still working; asked again next time
@@ -351,6 +356,10 @@ class LiveExecutor:
         )
         log.warning("order_resolved", symbol=record.symbol, client_order_id=record.client_id)
         if fill is None:
+            await self.notifier.send(
+                f"[{self.label}] the {record.symbol} order in doubt ended unfilled "
+                f"({order.status}); nothing was traded"
+            )
             return 0
         await self.notifier.send(
             f"[{self.label}] booked an order whose result was not recorded: {_fill_summary(fill)}"

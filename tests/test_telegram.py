@@ -1,8 +1,11 @@
 import asyncio
+import json
+from datetime import UTC, datetime
 
 import httpx
 
-from tbot.monitoring.telegram import LogNotifier, Telegram
+from tbot.live.commands import command_loop
+from tbot.monitoring.telegram import LogNotifier, QueuedNotifier, Telegram
 
 
 def test_send_posts_to_bot_api() -> None:
@@ -32,3 +35,66 @@ def test_send_failure_is_swallowed() -> None:
 
 def test_log_notifier() -> None:
     assert asyncio.run(LogNotifier().send("x")) is True
+
+
+def test_queued_alerts_keep_their_order_and_never_wait() -> None:
+    class Slow:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send(self, text: str) -> bool:
+            await asyncio.sleep(0.05)
+            self.sent.append(text)
+            return True
+
+    async def run() -> tuple[float, list[str]]:
+        slow = Slow()
+        queued = QueuedNotifier(slow)
+        sender = asyncio.create_task(queued.run())
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        for text in ("a", "b", "c"):
+            assert await queued.send(text)
+        waited = loop.time() - began
+        await queued.flush(5.0)
+        sender.cancel()
+        return waited, slow.sent
+
+    waited, sent = asyncio.run(run())
+    assert waited < 0.01  # an order is never held up by Telegram
+    assert sent == ["a", "b", "c"]
+
+
+def test_commands_are_answered_only_for_the_owner() -> None:
+    started = datetime(2024, 1, 1, tzinfo=UTC)
+    stamp = int(started.timestamp())
+    offsets: list[str | None] = []
+    sent: list[str] = []
+    updates = [
+        {"update_id": 1, "message": {"chat": {"id": 42}, "date": stamp + 9, "text": "/Status@bot"}},
+        {"update_id": 2, "message": {"chat": {"id": 7}, "date": stamp + 9, "text": "/status"}},
+        {"update_id": 3, "message": {"chat": {"id": 42}, "date": stamp - 9, "text": "/fills"}},
+        {"update_id": 4, "message": {"chat": {"id": 42}, "date": stamp + 9, "text": "hello"}},
+    ]
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getUpdates"):
+            offsets.append(request.url.params.get("offset"))
+            if len(offsets) > 1:
+                await asyncio.sleep(10)  # a long poll with nothing new
+            return httpx.Response(200, json={"ok": True, "result": updates})
+        sent.append(json.loads(request.content)["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            telegram = Telegram("token", "42", client)
+            task = asyncio.create_task(command_loop(telegram, lambda c: f"answer {c}", started))
+            while len(sent) < 2 or len(offsets) < 2:
+                await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert sent == ["answer /status", "answer hello"]  # not the stranger, not the old message
+    assert offsets == [None, "5"]  # every update is confirmed

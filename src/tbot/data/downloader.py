@@ -8,12 +8,16 @@ from itertools import groupby
 
 import httpx
 import polars as pl
+import structlog
 
 from tbot.core.timeframe import Timeframe
 from tbot.data.binance_rest import fetch_klines, first_open_time
 from tbot.data.binance_vision import fetch_month
 from tbot.data.quality import aligned
 from tbot.data.store import BarStore
+
+log = structlog.get_logger(__name__)
+INVALID_SYMBOL = 400  # what the REST API answers for a symbol it no longer lists
 
 
 @dataclass(frozen=True)
@@ -79,7 +83,12 @@ def sync(
     last = store.last_open_time(symbol, timeframe)
     if first is not None and start < first:
         # One probe first, so a start before the listing costs a request, not a download.
-        earliest = first_open_time(client, symbol, timeframe, start, first)
+        try:
+            earliest = first_open_time(client, symbol, timeframe, start, first)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != INVALID_SYMBOL:
+                raise
+            earliest = start  # delisted: only the archives can say what there was
         if earliest is not None:
             _download(
                 store,
@@ -127,14 +136,17 @@ def _download(
     """Store bars with open_time in [begin, end): archives for complete months, then REST.
 
     With hold, nothing is written until everything is fetched: a backfill that fails
-    halfway would otherwise leave a hole the next sync cannot see.
+    halfway would otherwise leave a hole the next sync cannot see. A forward sync holds
+    from the first month missing from the archives until REST has filled it, for the
+    same reason.
     """
     if begin >= end:
         return
     held: list[pl.DataFrame] = []
+    holding = hold
 
     def keep(bars: pl.DataFrame) -> tuple[int, int]:
-        if not hold:
+        if not holding:
             return store_aligned(store, symbol, timeframe, bars)
         kept = bars.filter(aligned(timeframe))
         held.append(kept)
@@ -154,6 +166,7 @@ def _download(
             for month, frame in zip(wanted, pool.map(fetch, wanted), strict=True):
                 if frame is None:
                     unpublished.append(month)
+                    holding = True  # nothing after this hole is stored before it is filled
                 else:
                     frames.append(frame)
             if not frames:
@@ -177,10 +190,19 @@ def _download(
     if covered < end:
         ranges.append((covered, end))
     for range_start, range_end in ranges:
-        bars = fetch_klines(client, symbol, timeframe, range_start, range_end)
+        try:
+            bars = fetch_klines(client, symbol, timeframe, range_start, range_end)
+        except httpx.HTTPStatusError as exc:
+            archived = counts[0] or store.last_open_time(symbol, timeframe) is not None
+            if exc.response.status_code != INVALID_SYMBOL or not archived:
+                raise  # a symbol that never existed is a mistake to report
+            # Archived, but no longer listed: the archives are all there is.
+            log.warning("symbol_not_listed", symbol=symbol, after=range_start.isoformat())
+            progress(f"{symbol} {timeframe}: not listed any more; archives only")
+            break
         written, skipped = keep(bars)
         counts[1] += written
         counts[2] += skipped
         progress(f"{symbol} {timeframe}: {written} bars from REST")
     if held:
-        store.write(symbol, timeframe, pl.concat(held))
+        store.write(symbol, timeframe, pl.concat(held), newest_first=hold)

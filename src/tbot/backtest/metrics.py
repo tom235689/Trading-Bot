@@ -77,6 +77,7 @@ def compute_metrics(result: BacktestResult) -> Metrics:
 
     pnl = result.trades["pnl"].to_numpy()
     trade_returns = result.trades["return"].to_numpy()
+    trade_returns = trade_returns[~np.isnan(trade_returns)]  # a leftover sold on its own
     notional = float((result.fills["quantity"].abs() * result.fills["price"]).sum())
 
     return Metrics(
@@ -97,5 +98,5 @@ def compute_metrics(result: BacktestResult) -> Metrics:
         trades=len(pnl),
         win_rate=float((pnl > 0).mean()) if len(pnl) else math.nan,
         profit_factor=_profit_factor(float(pnl[pnl > 0].sum()), float(-pnl[pnl < 0].sum())),
-        avg_trade_return=float(trade_returns.mean()) if len(pnl) else math.nan,
+        avg_trade_return=float(trade_returns.mean()) if len(trade_returns) else math.nan,
     )

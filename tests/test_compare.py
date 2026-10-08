@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -182,3 +183,12 @@ def test_a_protective_stop_fill_is_named_not_priced(tmp_path: Path) -> None:
     assert stop not in comparison.session_only
     assert all(m.session != stop for m in comparison.matched)
     assert "1 protective stop fills" in comparison_text(comparison, "paper.sqlite")
+
+
+def test_a_budget_change_is_named(tmp_path: Path) -> None:
+    cfg, store = run_session(tmp_path)
+    with Ledger(cfg.ledger) as ledger:
+        comparison = compare_session(cfg, ledger, store)
+    assert comparison.budget_change is None
+    moved = replace(comparison, budget_change=T0 + H4.delta * 250)
+    assert moved.checks()[0].startswith("initial_cash changed on 2024-02-11 16:00")

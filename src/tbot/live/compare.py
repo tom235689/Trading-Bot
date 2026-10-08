@@ -14,6 +14,7 @@ from tbot.core.models import Fill
 from tbot.data.store import BarStore
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Ledger
+from tbot.live.runner import BUDGET_NOTE, base_cash
 
 MAX_EQUITY_GAP = 0.02  # larger gaps between session and backtest equity need a look
 SHOWN_FILLS = 10
@@ -51,6 +52,7 @@ class Comparison:
     slippage_bps: float
     flows: float = 0.0  # money reconciliation moved into the book, taken out of its equity
     stop_fills: int = 0  # protective stops that executed; the backtest has none
+    budget_change: datetime | None = None  # first initial_cash change in the period
 
     @property
     def mean_extra_cost_bps(self) -> float | None:
@@ -60,6 +62,11 @@ class Comparison:
 
     def checks(self) -> list[str]:
         found = []
+        if self.budget_change:
+            found.append(
+                f"initial_cash changed on {self.budget_change:%Y-%m-%d %H:%M}: the backtest keeps "
+                "the starting budget, so sizes differ from then on"
+            )
         if self.stop_fills:
             found.append(
                 f"{self.stop_fills} protective stop fills: the backtest has no exchange stop, "
@@ -91,7 +98,10 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
     if not points:
         raise ValueError("the ledger has no bar events yet")
     start = points[0].time
-    result = run_period(config, store, start, None, config.guard)
+    base = base_cash(config, ledger)  # the backtest starts with what the session started with
+    result = run_period(
+        config.model_copy(update={"initial_cash": base}), store, start, None, config.guard
+    )
 
     # The backtest fills a decision at the next bar's open, so decisions at the last stored
     # close have no fill yet; compare up to the last decision both sides could execute.
@@ -108,10 +118,12 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
 
     # Deposits, withdrawals, and the startup reconcile of an account move money in or out;
     # valued when they happened and taken out, the rest is what trading did.
+    adjustments = ledger.adjustments()
     flows = [
-        (a.time, a.cash + a.quantity * _price_at(config, store, a.symbol, a.time))
-        for a in ledger.adjustments()
+        (a.time, a.cash + a.quantity * price_at(config, store, a.symbol, a.time))
+        for a in adjustments
     ]
+    budget = [a.time for a in adjustments if a.note.startswith(BUDGET_NOTE) and a.time <= end]
 
     def traded(t: datetime) -> float:
         return session_by_time[t].equity - sum(value for at, value in flows if at <= t)
@@ -133,18 +145,19 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
         missed=[t for t in backtest_times if t not in session_by_time],
         session_equity=traded(last),
         backtest_equity=backtest_equity[last],
-        initial_cash=config.initial_cash,
+        initial_cash=base,
         matched=matched,
         session_only=session_only,
         backtest_only=backtest_only,
         pending=sum(1 for f in fills if f.time >= end + step),
-        session_fees=sum(f.fee for f in in_period),
+        session_fees=sum(f.fee for f in session_fills),  # as counted in the fills column
         backtest_fees=sum(m.backtest.fee for m in matched) + sum(f.fee for f in backtest_only),
         max_gap=max(gaps),
         adjustments=len(flows),
         slippage_bps=config.costs.slippage_bps,
         flows=sum(value for at, value in flows if at <= last),
         stop_fills=len(in_period) - len(session_fills),
+        budget_change=budget[0] if budget else None,
     )
 
 
@@ -152,7 +165,7 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat()
 
 
-def _price_at(config: SessionConfig, store: BarStore, symbol: str, moment: datetime) -> float:
+def price_at(config: SessionConfig, store: BarStore, symbol: str, moment: datetime) -> float:
     """Close of the symbol's finest stream at or before moment (the next one if none)."""
     if not symbol:
         return 0.0  # a cash-only adjustment

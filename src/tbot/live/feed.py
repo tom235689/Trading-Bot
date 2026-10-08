@@ -18,6 +18,7 @@ from tbot.data import binance_ws
 from tbot.data.binance_rest import fetch_klines
 from tbot.data.quality import aligned
 from tbot.data.store import BarStore
+from tbot.live.clock import CLOSE_GRACE
 
 StreamKey = tuple[str, Timeframe]
 Connector = Callable[[str], AbstractAsyncContextManager[AsyncIterator[str | bytes]]]
@@ -88,7 +89,8 @@ class LiveFeed:
         timeframe = key[1]
         bars = bars.filter(aligned(timeframe))
         if not exchange_closed:
-            bars = bars.filter(pl.col("open_time") < timeframe.floor(self.clock()))
+            closed_by = timeframe.floor(self.clock() - CLOSE_GRACE)
+            bars = bars.filter(pl.col("open_time") < closed_by)
         last = self.last[key]
         if last is not None:
             bars = bars.filter(pl.col("open_time") > last)
@@ -112,7 +114,7 @@ class LiveFeed:
         for key in keys or self.keys:
             symbol, timeframe = key
             last = self.last[key]
-            end = timeframe.floor(self.clock())
+            end = timeframe.floor(self.clock() - CLOSE_GRACE)
             start = last + timeframe.delta if last is not None else end - timeframe.delta * 2
             if start < end:
                 bars = await asyncio.to_thread(
@@ -197,6 +199,7 @@ class LiveFeed:
         """
         timeframe = key[1]
         last = self.last[key]
+        now -= CLOSE_GRACE  # what catch_up can fetch
         due = timeframe.floor(now) if last is None else last + 2 * timeframe.delta
         return max(0.0, (now - due).total_seconds())
 

@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from tbot.backtest.runner import run_period
 from tbot.data.store import BarStore
 from tbot.exchange.binance import PRODUCTION_URL, TESTNET_URL, BinanceError, BinanceSpot
+from tbot.live.backup import daily_backups
 from tbot.live.config import LiveConfig, SessionConfig, Settings
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.runner import (
@@ -21,11 +22,14 @@ from tbot.live.runner import (
     make_spot,
     restore_portfolio,
     symbols_of,
+    unbooked_budget,
     valid_url,
 )
 from tbot.portfolio.allocation import build_slots
 
 MAX_CLOCK_OFFSET = 1.0  # seconds; the bot corrects for it, but a drifting clock needs a fix
+MIN_GUARD_DAYS = 365  # history the kill switch check needs to say anything
+BACKUP_BEHIND_DAYS = 2  # a running session copies the ledger every 6 hours
 
 Status = Literal["ok", "warn", "fail"]
 
@@ -94,6 +98,15 @@ def guard_check(config: SessionConfig, store: BarStore) -> Check:
     if any(first is None for first in firsts):
         return Check("warn", "kill switch", "no stored history to test it on; run `tbot download`")
     start = max(f for f in firsts if f is not None) + timedelta(days=90)  # after the warmup
+    lasts = [store.last_open_time(s, c.timeframe) for c in config.strategies for s in c.symbols]
+    days = (min(last for last in lasts if last is not None) - start).days
+    if days < MIN_GUARD_DAYS:
+        return Check(
+            "warn",
+            "kill switch",
+            f"too little stored history to test it ({max(days, 0)} days after the warmup); "
+            "run `tbot download` for the full history",
+        )
     try:
         result = run_period(config, store, start, None, config.guard)
     except ValueError as exc:
@@ -118,11 +131,29 @@ async def heartbeat_check(url: str, client: httpx.AsyncClient) -> Check:
     return Check("ok", "heartbeat", f"ping answered {response.status_code}")
 
 
+def backup_check(config: SessionConfig) -> Check:
+    """Run before the ledger is opened: opening it touches its files."""
+    if not config.backup_days:
+        return Check("warn", "backup", "off (backup_days is 0)")
+    backups = daily_backups(config.ledger)
+    if not backups:
+        return Check("warn", "backup", "none yet; a running session copies the ledger every 6 h")
+    files = [config.ledger, config.ledger.with_name(config.ledger.name + "-wal")]
+    changed = max(p.stat().st_mtime for p in files if p.exists())
+    behind = (changed - backups[-1].stat().st_mtime) / 86400
+    if behind > BACKUP_BEHIND_DAYS:
+        return Check(
+            "warn", "backup", f"{backups[-1]} is {behind:.0f} days older than the ledger's changes"
+        )
+    return Check("ok", "backup", f"{len(backups)} daily copies, newest {backups[-1]}")
+
+
 def ledger_checks(config: SessionConfig) -> list[Check]:
     if config.ledger.exists() and not config.ledger.is_file():
         return [Check("fail", "ledger", f"{config.ledger} is not a file")]
     if not config.ledger.is_file():
         return [Check("ok", "ledger", f"none yet; the first start creates {config.ledger}")]
+    backup = backup_check(config)
     try:
         ledger = Ledger(config.ledger)
     except LedgerUnavailable as exc:
@@ -148,7 +179,7 @@ def ledger_checks(config: SessionConfig) -> list[Check]:
             pass
     except AlreadyRunning:
         checks.append(Check("warn", "process", "a session is running on this ledger now"))
-    return checks
+    return [*checks, backup]
 
 
 def alert_checks(settings: Settings) -> list[Check]:
@@ -254,8 +285,8 @@ def budget_check(config: LiveConfig, account: dict[str, Any], quote: str) -> Che
         )
     needed = config.initial_cash
     if config.ledger.is_file():
-        with Ledger(config.ledger) as ledger:
-            needed = restore_portfolio(config, ledger).cash
+        with Ledger(config.ledger) as ledger:  # plus a budget change the next start books
+            needed = restore_portfolio(config, ledger).cash + unbooked_budget(config, ledger)
     if free + 1e-9 < needed:
         return Check(
             "fail",

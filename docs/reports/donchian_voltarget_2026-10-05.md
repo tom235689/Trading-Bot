@@ -90,3 +90,18 @@ In-sample 2018-01-01 -> 2025-01-01, holdout from 2025-01-01 to latest
 `tbot validate config/donchian_validation.yaml` (the same strategy without volatility targeting): gate FAILED on drawdown only. Out-of-sample Sharpe 0.95, max drawdown -28.5%, 159 trades; in-sample Sharpe 1.03, max drawdown -40.1%; Monte Carlo max drawdown median -47.0%, 5th percentile -69.1%, P(beyond 25%) = 100%; deflated Sharpe P(true Sharpe > 0) = 96.8% over 115 trials; holdout +4.7% (seen 25 times).
 
 Its walk-forward picks a different 2022 set (entry 40, exit 10) and loses 4.8% there instead of 30.1%, which is the whole difference in the out-of-sample drawdown. On every in-sample and Monte Carlo measure it carries far more risk than the volatility-targeted candidate, so the configs keep volatility targeting.
+
+## Addendum 2026-10-08: Monte Carlo on the out-of-sample returns
+
+A review found that step 5 resampled the in-sample baseline only: the returns of the params chosen on that same period, with the edge they were chosen for. The validation now also resamples the stitched walk-forward test segments, which no parameter choice saw. Same settings (2000 runs, seed 1, 20-day blocks); library calls, so the trial log and the holdout count are unchanged:
+
+| Candidate | Returns | Days | Max drawdown median | 5th percentile | P(beyond 25%) | P(beyond 45%) | P(beyond 55%) |
+|---|---|---|---|---|---|---|---|
+| volatility targeting 0.4 | in-sample | 2558 | -28.4% | -44.1% | 70.2% | 4.6% | 0.6% |
+| volatility targeting 0.4 | out-of-sample | 1462 | -32.9% | -54.1% | 82.6% | 16.0% | 4.5% |
+| full exposure | in-sample | 2558 | -47.0% | -69.1% | 100% | 59.3% | 25.9% |
+| full exposure | out-of-sample | 1462 | -39.8% | -62.0% | 95.2% | 32.2% | 12.3% |
+
+The out-of-sample paths are four years long against seven, and still draw down further. Corrections to the text above: the expected pain is a worst drawdown around 33% over four years and beyond 50% in a bad stretch, not 28% and 44%; and the 45% kill switch is not beyond the 5th percentile out of sample: it trips in 16% of four-year paths of what the strategy did on unseen data. The configs keep 45% as the owner's trade-off between stopping a broken strategy early and halting an ordinary bad stretch; 55% would trip in 4.5% of those paths and lose ten more points before it stops a broken one. The full-exposure candidate stays the riskier one on both measures.
+
+The 3% daily loss rule of the paper, testnet, and live configs was checked on its own as well: with it, the 2018-2026 backtest makes exactly the same 841 fills as without it.

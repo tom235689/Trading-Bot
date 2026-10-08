@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0 (2026-10-08)
+
+Product round after three more independent reviews (live path, research, operations). Upgrade notes: the supervisor's logs are per config now (`logs\<config>.supervisor.log`, `logs\<config>.console.txt`); a wrong command line or a `.env` that is not UTF-8 exits with 4 instead of 2 or 1; a changed `initial_cash` is booked as an adjustment at the next start.
+
+**Use it as a product**
+- `scripts\setup.ps1`: one command from clone to doctor, including a Python signed by the Python Software Foundation when Smart App Control is on.
+- `scripts\update.ps1`: stops the scheduled sessions gracefully, pulls, syncs, runs doctor, starts them again; local edits are kept, or the update is undone when it collides with them. `scripts\remove_task.ps1` removes a task after a graceful stop.
+- Ledger backups every 6 hours, 14 days kept (`backup_days`), `tbot backup` on demand, a tested restore; doctor warns when backups fall behind.
+- Telegram: `/status` and `/fills` from the chat (`telegram_commands`, read only); `tbot notify` finds the chat id; the daily summary adds drawdown from the peak, fills, the last bar event, and any halt, pause, or position without a stop. Alerts are sent in the background, so a slow Telegram never delays an order.
+- `tbot status` says whether a session is running; the dashboard shows when it was made and spaces points by time, so downtime shows.
+
+**Live trading safety**
+- An order in doubt, or a stop, that reconciliation books between bars now gets its protective stop at once instead of up to 4 hours later; an in-doubt sell no longer leaves a stop on the owner's coins.
+- A restart no longer skips the bar that closed while the bot was down: bars within the guard's stale window are traded, and a crash in the middle of an event hands that bar over again.
+- `tbot stop` also stops a bot the supervisor is about to restart, and no longer reports "stopped" for one that crashed.
+- REST bars count as closed only 5 seconds after the close, and a slow clock resync keeps the previous offset, so a fast clock cannot store a bar that is still open.
+- Orders in doubt that turn out never executed or unfilled are alerted.
+- A changed `initial_cash` is a transfer everywhere: the dashboard's drawdown and `tbot compare` no longer read it as a loss.
+
+**Data and research**
+- The validation's Monte Carlo also resamples the out-of-sample returns and reports the chance of passing the kill switch. For the configured candidate: median drawdown -33% and 5th percentile -54% over four years, 16% of paths beyond 45% (report addendum).
+- Syncs leave no hole when they fail part way (backfills write newest first; nothing after a month missing from the archives is stored before REST fills it); delisted symbols keep their archives; writers to one stream take turns; a long `Retry-After` fails at once instead of stalling the feed for hours; one failed stream no longer stops `tbot download`.
+- A trade with no opening cost no longer breaks the backtest result.
+
+**Operations**
+- The supervisor keeps retrying with a clear log line when uv is missing, rotates its log, and keeps sessions' logs apart; the installer reads `mode: live` with quotes or a comment and asks for administrator rights up front.
+- doctor no longer passes the kill switch on less than a year of history.
+
 ## 0.2.0 (2026-10-06)
 
 Release hardening after three independent reviews. Upgrade note: exit codes changed (3 and 4 are new; the old 2 for a ledger in use is now 3), and the kill switch default is 45%.

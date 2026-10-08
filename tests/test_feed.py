@@ -14,6 +14,7 @@ from tbot.core.timeframe import Timeframe, to_millis
 from tbot.data.binance_rest import fetch_klines
 from tbot.data.schema import from_rows
 from tbot.data.store import BarStore
+from tbot.live.clock import CLOSE_GRACE
 from tbot.live.feed import LiveFeed, StreamKey, close_time
 
 H1, H4 = Timeframe.H1, Timeframe.H4
@@ -252,11 +253,12 @@ def test_watchdog_survives_a_rest_failure(tmp_path: Path) -> None:
 
 def test_overdue_seconds(tmp_path: Path) -> None:
     feed, _, _ = make_feed(tmp_path, [BTC1], now=at(5.25))
-    assert feed._overdue_seconds(BTC1, at(5.25)) == pytest.approx(15 * 60)  # nothing seen yet
+    grace = CLOSE_GRACE.total_seconds()  # a bar counts as closed only after it
+    assert feed._overdue_seconds(BTC1, at(5.25)) == pytest.approx(15 * 60 - grace)
     feed.last[BTC1] = at(4)
     assert feed._overdue_seconds(BTC1, at(5.25)) == 0.0
     feed.last[BTC1] = at(2)  # the 3h bar was due at 4h
-    assert feed._overdue_seconds(BTC1, at(5.25)) == pytest.approx(75 * 60)
+    assert feed._overdue_seconds(BTC1, at(5.25)) == pytest.approx(75 * 60 - grace)
 
 
 def test_watchdog_polls_rest_and_reports_stale_once(tmp_path: Path) -> None:
@@ -359,3 +361,39 @@ def test_a_failed_catch_up_loses_no_bar(tmp_path: Path, monkeypatch: pytest.Monk
     assert feed.last[BTC1] == at(1)  # nothing was taken in, so the retry gets it all
     assert feed.queue.empty()
     assert asyncio.run(feed.catch_up([BTC1])) == 3
+
+
+def test_a_bar_just_closed_by_the_clock_waits_for_the_grace(tmp_path: Path) -> None:
+    rows = {BTC1: make_rows(at(0), 6, H1)}  # opens 0h..5h; the clock may run a little fast
+    feed, store, _ = make_feed(tmp_path, [BTC1], now=at(5) + timedelta(seconds=2), rows=rows)
+    feed.last[BTC1] = at(2)
+    # The 4h bar closed 2 s ago by a clock that may run ahead: only the 3h bar is taken.
+    assert asyncio.run(feed.catch_up()) == 1
+    assert store.last_open_time(*BTC1) == at(3)
+
+
+def test_server_clock_keeps_its_offset_when_every_sample_is_slow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from tbot.live.clock import ServerClock
+
+    now = [1000.0]
+    step = [0.1]  # seconds each request takes
+    skew = [5.0]
+
+    def fake_time() -> float:
+        now[0] += step[0] / 2  # called once before and once after each request
+        return now[0]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"serverTime": int((now[0] + skew[0]) * 1000)})
+
+    monkeypatch.setattr("tbot.live.clock.time", SimpleNamespace(time=fake_time, sleep=lambda s: 0))
+    clock = ServerClock(httpx.Client(transport=httpx.MockTransport(handle)))
+    assert clock.sync() == pytest.approx(5.0, abs=0.1)
+    step[0], skew[0] = 6.0, 9.0  # a congested network: no sample is worth trusting
+    assert clock.sync() == pytest.approx(5.0, abs=0.1)
+    step[0] = 0.1
+    assert clock.sync() == pytest.approx(9.0, abs=0.1)

@@ -4,6 +4,7 @@ Daily returns are resampled in blocks (a moving block bootstrap). Losses while a
 still open count, and so do streaks of bad days, which shuffling closed trades would hide.
 """
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -23,6 +24,8 @@ class MonteCarloSummary:
     return_p95: float
     prob_drawdown_beyond: float  # share of runs with a drawdown worse than the limit
     drawdown_limit: float
+    kill_switch: float = math.nan  # the session guard's max_drawdown
+    prob_kill: float = math.nan  # share of runs that would have tripped it
 
 
 def simulate(
@@ -32,6 +35,7 @@ def simulate(
     seed: int = 1,
     block_days: int = 20,
     drawdown_limit: float = 0.25,
+    kill_switch: float = math.nan,
 ) -> MonteCarloSummary:
     """Compound paths of daily returns drawn as random blocks of consecutive days."""
     n = len(returns)
@@ -61,4 +65,6 @@ def simulate(
         return_p95=float(r_p95),
         prob_drawdown_beyond=float(np.mean(drawdowns < -drawdown_limit)),
         drawdown_limit=drawdown_limit,
+        kill_switch=kill_switch,
+        prob_kill=float(np.mean(drawdowns < -kill_switch)) if kill_switch > 0 else math.nan,
     )

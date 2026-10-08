@@ -7,10 +7,15 @@ import httpx
 import pytest
 
 from binance_spot_fake import FakeSpot
+from tbot.core.config import StrategyConfig
+from tbot.core.timeframe import Timeframe
 from tbot.exchange.binance import NOTHING_TO_CANCEL, TESTNET_URL, BinanceError, BinanceSpot, Order
+from tbot.live.config import LiveConfig
 from tbot.live.executor import LiveExecutor, order_id
 from tbot.live.ledger import Ledger
+from tbot.live.runner import reconcile_round
 from tbot.portfolio.portfolio import Portfolio
+from tbot.risk.guard import GuardConfig, RiskGuard
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
 BTC = "BTCUSDT"
@@ -474,3 +479,42 @@ def test_a_failed_stop_replacement_is_alerted(
     assert len(failed) == 1
     assert "has no exchange stop" in failed[0]
     assert messages[-1].endswith("protective stop for BTCUSDT placed")
+
+
+def test_an_order_booked_between_bars_gets_its_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+    fake.error_after_next_order = httpx.Response(503)  # filled, but the answer is lost
+    config = LiveConfig(
+        mode="testnet",
+        initial_cash=1000.0,
+        strategies=[
+            StrategyConfig(
+                name="donchian_trend", symbols=[BTC], timeframe=Timeframe.H4, allocation=1.0
+            )
+        ],
+        ledger=tmp_path / "unused.sqlite",
+    )
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        portfolio = Portfolio(1000.0)
+        lookup = executor.spot.get_order
+
+        async def unreachable(symbol: str, client_id: str) -> Order | None:
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(executor.spot, "get_order", unreachable)
+        await executor.execute({BTC: 0.01}, T0, portfolio, MARKS)
+        await executor.after_event(portfolio, MARKS)  # the book holds nothing yet: no stop
+        monkeypatch.setattr(executor.spot, "get_order", lookup)
+        guard = RiskGuard(GuardConfig())
+        await reconcile_round(
+            executor, portfolio, MARKS, ledger, notifier, guard, config, lambda: T0
+        )
+        return portfolio
+
+    portfolio = run(fake, tmp_path, action)
+    assert portfolio.position(BTC) == pytest.approx(0.00999)
+    stops = [o for o in fake.orders if o["type"] == "STOP_LOSS_LIMIT" and o["status"] == "NEW"]
+    assert [float(o["origQty"]) for o in stops] == [pytest.approx(0.00999)]

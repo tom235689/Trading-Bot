@@ -1,4 +1,6 @@
 import asyncio
+import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,14 +12,22 @@ from tbot.cli import EXIT_CONFIG, EXIT_ERROR, EXIT_LEDGER, build_parser, main, p
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.live.ledger import Ledger
-from tbot.live.runner import instance_lock, stop_path, watch_stop_request
+from tbot.live.runner import (
+    STOP_REQUEST_SECONDS,
+    instance_lock,
+    stop_path,
+    take_stop_request,
+    watch_stop_request,
+)
 
 
 def test_version(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as exc:
-        main(["--version"])
-    assert exc.value.code == 0
+    assert main(["--version"]) == 0
     assert __version__ in capsys.readouterr().out
+
+
+def test_a_wrong_command_line_is_a_config_error() -> None:
+    assert main(["status", "config/paper.yaml", "--bogus"]) == EXIT_CONFIG
 
 
 def test_no_args() -> None:
@@ -115,7 +125,7 @@ def test_env_that_is_not_utf8_is_named(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_bytes("TBOT_TELEGRAM_TOKEN=x\n".encode("utf-16"))
-    assert main(["notify"]) == EXIT_ERROR
+    assert main(["notify"]) == EXIT_CONFIG  # retrying cannot fix the file
     assert "save .env and configs as UTF-8" in capsys.readouterr().err
 
 
@@ -130,6 +140,13 @@ def test_stop_asks_a_running_session(tmp_path: Path, capsys: pytest.CaptureFixtu
     )
     assert main(["stop", str(config)]) == 0
     assert "no session is running" in capsys.readouterr().out
+    assert take_stop_request(ledger)  # a supervisor's restart would stop at once
+    assert not stop_path(ledger).exists()
+    stop_path(ledger).write_text("stop", encoding="utf-8")
+    old = time.time() - STOP_REQUEST_SECONDS - 60
+    os.utime(stop_path(ledger), (old, old))
+    assert not take_stop_request(ledger)  # left from long ago: dropped, not obeyed
+    assert not stop_path(ledger).exists()
     with instance_lock(ledger):  # a session holds the ledger and does not react in time
         assert main(["stop", str(config), "--timeout", "1"]) == EXIT_ERROR
     assert stop_path(ledger).exists()
@@ -138,3 +155,24 @@ def test_stop_asks_a_running_session(tmp_path: Path, capsys: pytest.CaptureFixtu
     asyncio.run(watch_stop_request(stop_path(ledger), stop))
     assert stop.is_set()
     assert not stop_path(ledger).exists()
+
+
+def test_notify_finds_the_chat_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TBOT_TELEGRAM_TOKEN", "token")
+    monkeypatch.delenv("TBOT_TELEGRAM_CHAT_ID", raising=False)
+    result: list[dict[str, object]] = []
+
+    async def updates(self: object, offset: int | None, timeout: int) -> list[dict[str, object]]:
+        return result
+
+    monkeypatch.setattr("tbot.cli.Telegram.updates", updates)
+    assert main(["notify"]) == EXIT_ERROR
+    assert "send your bot any message" in capsys.readouterr().out
+    result.append({"update_id": 1, "message": {"chat": {"id": 12345, "first_name": "Tom"}}})
+    assert main(["notify"]) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "chat 12345 Tom" in out
+    assert "TBOT_TELEGRAM_CHAT_ID" in out

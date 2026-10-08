@@ -18,6 +18,9 @@ class SessionConfig(TradingConfig):
     stale_after_seconds: int = Field(default=600, ge=60)  # bar overdue by this much: alert
     batch_wait_seconds: float = Field(default=5.0, ge=0)  # wait for streams closing together
     summary_hour_utc: int = Field(default=0, ge=0, le=23)
+    backup_days: int = Field(default=14, ge=0)  # daily ledger copies kept; 0 turns them off
+    # Answer /status and /fills from the Telegram chat. One session per bot token may poll.
+    telegram_commands: bool = False
 
 
 class PaperConfig(SessionConfig):

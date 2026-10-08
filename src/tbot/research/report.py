@@ -1,6 +1,7 @@
 """Plain-text validation report."""
 
 from tbot.backtest.metrics import Metrics
+from tbot.research.montecarlo import MonteCarloSummary
 from tbot.research.sweep import sweep_table
 from tbot.research.validate import ValidationReport
 
@@ -62,11 +63,9 @@ def format_report(r: ValidationReport) -> str:
     mc = r.monte_carlo
     lines.extend(
         [
-            f"5. Monte Carlo: {mc.runs} runs over {mc.days} days in {mc.block_days}-day blocks",
-            f"   max drawdown p5 {mc.drawdown_p5:.1%}  p50 {mc.drawdown_p50:.1%}  "
-            f"p95 {mc.drawdown_p95:.1%}; P(drawdown beyond {mc.drawdown_limit:.0%}) = "
-            f"{mc.prob_drawdown_beyond:.1%}",
-            *_return_lines(r),
+            f"5. Monte Carlo: {mc.runs} runs in {mc.block_days}-day blocks of daily returns",
+            *_monte_carlo_lines("in-sample", mc),
+            *_monte_carlo_lines("out-of-sample", r.monte_carlo_oos),
             "",
             f"6. Deflated Sharpe: {r.deflated.trials} logged trials; luck alone would reach "
             f"Sharpe {r.deflated.expected_max_sharpe:.2f}; P(true Sharpe > 0) = "
@@ -86,11 +85,13 @@ def format_report(r: ValidationReport) -> str:
     return "\n".join(lines)
 
 
-def _return_lines(r: ValidationReport) -> list[str]:
-    mc = r.monte_carlo
+def _monte_carlo_lines(label: str, mc: MonteCarloSummary) -> list[str]:
     return [
-        f"   final return p5 {mc.return_p5:+.1%}  p50 {mc.return_p50:+.1%}  "
-        f"p95 {mc.return_p95:+.1%}"
+        f"   {label} ({mc.days} days): max drawdown p5 {mc.drawdown_p5:.1%}  "
+        f"p50 {mc.drawdown_p50:.1%}  p95 {mc.drawdown_p95:.1%}",
+        f"      P(drawdown beyond {mc.drawdown_limit:.0%}) = {mc.prob_drawdown_beyond:.1%}, "
+        f"beyond the {mc.kill_switch:.0%} kill switch = {mc.prob_kill:.1%}; final return "
+        f"p5 {mc.return_p5:+.1%}  p50 {mc.return_p50:+.1%}  p95 {mc.return_p95:+.1%}",
     ]
 
 

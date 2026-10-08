@@ -1,5 +1,6 @@
 """Records shared by portfolio, execution, and backtest."""
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -31,4 +32,4 @@ class Trade:
 
     @property
     def return_on_cost(self) -> float:
-        return self.pnl / self.cost
+        return self.pnl / self.cost if self.cost else math.nan  # a leftover sold on its own

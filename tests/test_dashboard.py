@@ -23,6 +23,7 @@ from tbot.monitoring.dashboard import (
     from_ledger,
     nice_ticks,
     render,
+    without_flows,
 )
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -172,3 +173,21 @@ def test_axes_survive_degenerate_values() -> None:
     flat = _line_chart("drawdown", times, [0.0, 0.0], percent=True)
     assert "100%" not in flat  # no drawdown yet: a small axis, not 0% to 100%
     assert "no data" in _line_chart("equity", times, [math.nan, math.nan], percent=False)
+
+
+def test_money_moved_in_or_out_is_neither_a_return_nor_a_drawdown() -> None:
+    times = [T0 + timedelta(hours=4 * i) for i in range(4)]
+    equity = [1000.0, 1010.0, 510.0, 520.0]  # 500 taken out before the third snapshot
+    flows = [(times[2] - timedelta(hours=1), -500.0)]
+    assert without_flows(times, equity, flows) == [1000.0, 1010.0, 1010.0, 1020.0]
+    page = render(DashboardData("t", "s", times, equity, 1000.0, [], flows=flows))
+    assert "+2.0%" in page  # total return of the trading alone
+    assert "-49" not in page  # no drawdown from the withdrawal
+
+
+def test_downtime_shows_on_the_time_axis() -> None:
+    times = [T0, T0 + timedelta(hours=4), T0 + timedelta(hours=40)]
+    chart = _line_chart("equity", times, [1.0, 2.0, 3.0], percent=False)
+    path = chart.split('class="line" d="M')[1].split('"')[0]
+    xs = [float(pair.split(",")[0]) for pair in path.split(" L")]
+    assert xs[1] - xs[0] < (xs[2] - xs[1]) / 5  # 4 hours, then 36 hours

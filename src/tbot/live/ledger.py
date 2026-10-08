@@ -141,6 +141,19 @@ class Ledger:
     def close(self) -> None:
         self.conn.close()
 
+    def backup(self, target: Path) -> None:
+        """A consistent copy of what is committed; the target is replaced only when complete."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(target.name + ".partial")
+        partial.unlink(missing_ok=True)
+        copy = sqlite3.connect(partial)
+        try:
+            self.conn.backup(copy)
+            copy.execute("PRAGMA journal_mode=DELETE")  # one self-contained file
+        finally:
+            copy.close()
+        partial.replace(target)
+
     def __enter__(self) -> Self:
         return self
 
@@ -195,6 +208,10 @@ class Ledger:
             (limit,),
         ).fetchall()
         return [Fill(_parse(t), s, q, p, f) for t, s, q, p, f in reversed(rows)]
+
+    def fill_count(self, since: datetime) -> int:
+        row = self.conn.execute("SELECT COUNT(*) FROM fills WHERE time >= ?", (_iso(since),))
+        return int(row.fetchone()[0])
 
     def add_order(
         self,

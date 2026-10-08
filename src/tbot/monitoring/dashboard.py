@@ -3,19 +3,21 @@
 One self-contained file, no external assets, light and dark mode, hover crosshair.
 """
 
+import bisect
 import html
 import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 from tbot.backtest.engine import BacktestResult
 from tbot.core.models import Fill
 from tbot.data.store import BarStore
+from tbot.live.compare import price_at
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Event, Ledger
-from tbot.live.runner import load_guard, restore_portfolio, stream_keys
+from tbot.live.runner import base_cash, load_guard, restore_portfolio, stream_keys
 
 MAX_POINTS = 1500  # downsample longer series; the tooltip reads the drawn points
 WIDTH, HEIGHT = 880, 260
@@ -33,6 +35,22 @@ class DashboardData:
     fills: list[Fill] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Money moved into (+) or out of the book from outside: not a return or a drawdown.
+    flows: list[tuple[datetime, float]] = field(default_factory=list)
+
+
+def without_flows(
+    times: Sequence[datetime], equity: Sequence[float], flows: Sequence[tuple[datetime, float]]
+) -> list[float]:
+    """Equity minus every flow up to each time: what trading alone made of the start."""
+    ordered = sorted(flows)
+    out, moved, k = [], 0.0, 0
+    for moment, value in zip(times, equity, strict=True):
+        while k < len(ordered) and ordered[k][0] <= moment:
+            moved += ordered[k][1]
+            k += 1
+        out.append(value - moved)
+    return out
 
 
 def drawdowns(equity: Sequence[float], initial: float) -> list[float]:
@@ -99,9 +117,12 @@ def _line_chart(
     x0, x1 = PAD_LEFT, WIDTH - PAD_RIGHT
     y0, y1 = HEIGHT - PAD_BOTTOM, PAD_TOP
     n = len(values)
+    first, span = times[0], (times[-1] - times[0]).total_seconds()
 
-    def sx(i: int) -> float:
-        return x0 + (x1 - x0) * (i / (n - 1) if n > 1 else 0.5)
+    def sx(i: int) -> float:  # by time, so downtime shows as a straight stretch
+        if span <= 0:
+            return x0 + (x1 - x0) * (i / (n - 1) if n > 1 else 0.5)
+        return x0 + (x1 - x0) * (times[i] - first).total_seconds() / span
 
     def sy(v: float) -> float:
         return y0 - (y0 - y1) * (v - y_min) / (y_max - y_min)
@@ -117,10 +138,13 @@ def _line_chart(
         for t in ticks
     )
     label_count = min(6, n)
+    stamps = [t.timestamp() for t in times]
+    wanted = [first.timestamp() + span * k / max(label_count - 1, 1) for k in range(label_count)]
+    chosen = sorted({min(bisect.bisect_left(stamps, w), n - 1) for w in wanted})
     x_labels = "".join(
         f'<text class="tick" x="{sx(i):.1f}" y="{HEIGHT - 8}" text-anchor="middle">'
         f"{times[i]:%Y-%m-%d}</text>"
-        for i in sorted({round(k * (n - 1) / max(label_count - 1, 1)) for k in range(label_count)})
+        for i in chosen
     )
     end_x, end_y = points[-1]
     return (
@@ -158,10 +182,11 @@ def _tile(label: str, value: str, delta_class: str = "") -> str:
 def render(data: DashboardData) -> str:
     times = downsample(data.times)
     equity = downsample(data.equity)
-    dd = downsample(drawdowns(data.equity, data.initial))  # peaks between kept points count
+    traded = without_flows(data.times, data.equity, data.flows)
+    dd = downsample(drawdowns(traded, data.initial))  # peaks between kept points count
     final = data.equity[-1] if data.equity else data.initial
-    total_return = final / data.initial - 1 if data.initial else 0.0
-    max_dd = min(drawdowns(data.equity, data.initial), default=0.0)
+    total_return = (traded[-1] if traded else data.initial) / data.initial - 1
+    max_dd = min(drawdowns(traded, data.initial), default=0.0)
     exposure_value = sum(q * (m or 0.0) for _, q, m in data.positions)
     exposure = exposure_value / final if final > 0 else 0.0
 
@@ -309,19 +334,20 @@ details summary {{ cursor: pointer; color: var(--ink-2); }}
     if (!svg || !tip || n === 0) return;
     var hit = svg.querySelector(".hit"), cross = svg.querySelector(".crosshair");
     var focus = svg.querySelector(".focus"), line = svg.querySelector(".line");
-    var x0 = {PAD_LEFT}, x1 = {WIDTH - PAD_RIGHT};
     var value = document.createElement("strong"), label = document.createElement("span");
     tip.appendChild(value); tip.appendChild(label);
-    function pointAt(i) {{
-      var d = line.getAttribute("d").slice(1).split(" L")[i].split(",");
+    var points = line.getAttribute("d").slice(1).split(" L").map(function (pair) {{
+      var d = pair.split(",");
       return [parseFloat(d[0]), parseFloat(d[1])];
-    }}
+    }});
     function show(event) {{
       var rect = svg.getBoundingClientRect();
       var x = (event.clientX - rect.left) * {WIDTH} / rect.width;
-      var i = Math.round((x - x0) / (x1 - x0) * (n - 1));
-      i = Math.max(0, Math.min(n - 1, i));
-      var p = pointAt(i);
+      var i = 0;  // the nearest point: x is by time, not evenly spaced
+      for (var k = 1; k < n; k++) {{
+        if (Math.abs(points[k][0] - x) < Math.abs(points[i][0] - x)) i = k;
+      }}
+      var p = points[i];
       cross.setAttribute("x1", p[0]); cross.setAttribute("x2", p[0]);
       cross.setAttribute("visibility", "visible");
       focus.setAttribute("cx", p[0]); focus.setAttribute("cy", p[1]);
@@ -370,19 +396,30 @@ def from_ledger(config: SessionConfig, store: BarStore, title: str) -> Dashboard
         notes = []
         if guard.state.halted:
             notes.append(f"HALTED: {guard.state.halt_reason} (run `tbot resume`)")
+        if times:
+            hours = (datetime.now(UTC) - times[-1]).total_seconds() / 3600
+            step = min(c.timeframe.delta for c in config.strategies).total_seconds() / 3600
+            if hours > 2 * step:
+                notes.append(f"last bar event {times[-1]:%Y-%m-%d %H:%M} UTC: is the bot running?")
+        adjustments = ledger.adjustments()
+        flows = [
+            (a.time, a.cash + a.quantity * price_at(config, store, a.symbol, a.time))
+            for a in adjustments
+        ]
         created = ledger.get_meta("created_at") or "-"
         return DashboardData(
             title=title,
             subtitle=f"ledger {config.ledger}, created {created[:19]}, "
-            f"{len(portfolio.fills)} fills, {len(ledger.adjustments())} adjustments",
+            f"{len(portfolio.fills)} fills, {len(adjustments)} adjustments, "
+            f"generated {datetime.now(UTC):%Y-%m-%d %H:%M} UTC",
             times=times,
             equity=equity,
-            # Adjustments move money in or out of the book; then the first snapshot is the base.
-            initial=equity[0] if equity and ledger.adjustments() else config.initial_cash,
+            initial=base_cash(config, ledger),
             positions=positions,
             fills=ledger.fills(),
             events=ledger.recent_events(20),
             notes=notes,
+            flows=flows,
         )
     finally:
         ledger.close()

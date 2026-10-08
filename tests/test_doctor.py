@@ -1,4 +1,6 @@
 import asyncio
+import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,8 +11,9 @@ from factories import price_bars
 from tbot.core.config import StrategyConfig
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
+from tbot.live.backup import backup_ledger, daily_backups
 from tbot.live.config import LiveConfig, PaperConfig, Settings
-from tbot.live.doctor import Check, checks_text, guard_check, run_checks
+from tbot.live.doctor import Check, backup_check, checks_text, guard_check, run_checks
 from tbot.live.ledger import Ledger
 from tbot.live.runner import GUARD_META
 from tbot.risk.guard import GuardConfig, GuardState
@@ -167,12 +170,14 @@ def test_ledger_and_heartbeat_problems(tmp_path: Path) -> None:
 
 def test_kill_switch_is_tried_on_the_stored_history(tmp_path: Path) -> None:
     store = BarStore(tmp_path / "data")
-    closes = [100.0] * 700
+    closes = [100.0] * 2600  # over a year after the 90-day warmup
     closes += [closes[-1] * 1.02**i for i in range(1, 21)]  # a breakout
     closes += [closes[-1] * 0.99**i for i in range(1, 200)]  # then a long slide
+    short = BarStore(tmp_path / "short")
     for symbol in ("BTCUSDT", "ETHUSDT"):
         opens = [100.0, *closes[:-1]]
         store.write(symbol, Timeframe.H4, price_bars(T0, Timeframe.H4, opens, closes))
+        short.write(symbol, Timeframe.H4, price_bars(T0, Timeframe.H4, opens[:900], closes[:900]))
     holds = [STRATEGIES[0].model_copy(update={"params": {"entry": 5, "exit": 600}})]
     tight = PaperConfig(
         strategies=holds, ledger=tmp_path / "p.sqlite", guard=GuardConfig(max_drawdown=0.1)
@@ -183,3 +188,19 @@ def test_kill_switch_is_tried_on_the_stored_history(tmp_path: Path) -> None:
     loose = tight.model_copy(update={"guard": GuardConfig(max_drawdown=0.9)})
     assert guard_check(loose, store).status == "ok"
     assert "run `tbot download`" in guard_check(tight, BarStore(tmp_path / "none")).detail
+    few = guard_check(tight, short)  # what a paper start leaves: no verdict either way
+    assert (few.status, few.detail[:42]) == ("warn", "too little stored history to test it (59 d")
+
+
+def test_ledger_backups_are_checked(tmp_path: Path) -> None:
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    with Ledger(config.ledger) as ledger:
+        ledger.add_event(T0, "info", "started")
+    assert backup_check(config).detail.startswith("none yet")
+    with Ledger(config.ledger) as ledger:
+        backup_ledger(ledger, config.ledger, T0, keep=14)
+    assert backup_check(config).status == "ok"
+    old = time.time() - 5 * 86400
+    os.utime(daily_backups(config.ledger)[-1], (old, old))
+    assert "5 days older" in backup_check(config).detail
+    assert backup_check(config.model_copy(update={"backup_days": 0})).detail.startswith("off")

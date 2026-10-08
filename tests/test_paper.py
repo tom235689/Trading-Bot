@@ -13,6 +13,7 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
+from tbot.live.commands import HELP
 from tbot.live.config import LiveConfig, PaperConfig, Settings, load_paper_config
 from tbot.live.executor import PaperExecutor
 from tbot.live.history import BarHistory
@@ -24,6 +25,7 @@ from tbot.live.runner import (
     adopt_resume,
     build_session,
     check_budget,
+    command_answer,
     instance_lock,
     load_checkpoint,
     load_guard,
@@ -31,10 +33,13 @@ from tbot.live.runner import (
     make_notifier,
     restore_portfolio,
     resume,
+    run_paper,
     status_text,
+    stop_path,
     strategies_hash,
     stream_keys,
     summary_text,
+    unbooked_budget,
 )
 from tbot.live.session import Checkpoint, TradingSession
 from tbot.monitoring.telegram import LogNotifier, Telegram
@@ -161,6 +166,12 @@ def test_summary_and_status_text(tmp_path: Path) -> None:
     summary = summary_text(trader.session, ledger, at(1), "paper")
     assert "equity 999.50" in summary
     assert "BTC 5.000000" in summary
+    assert "fills in 24h: 1" in summary
+    assert "% from peak" in summary
+    assert "HALTED" not in summary
+    trader.guard.halt("drawdown 50%")
+    trader.save_guard()
+    assert "HALTED: drawdown 50%" in summary_text(trader.session, ledger, at(1), "paper")
     ledger.close()
 
     store = BarStore(tmp_path / "data")
@@ -169,7 +180,7 @@ def test_summary_and_status_text(tmp_path: Path) -> None:
     assert "fills 1, round trips 0, adjustments 0" in status
     assert "position BTC 5.000000" in status
     assert "last stored bar BTC 1h: 2024-01-01 02:00" in status
-    assert "HALTED" not in status
+    assert "HALTED: drawdown 50% (run `tbot resume`)" in status
 
 
 def test_stream_keys_and_lookback() -> None:
@@ -282,6 +293,11 @@ def test_status_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert "no bars BTCUSDT" in out
     assert main(["resume", str(config_path)]) == 0
     assert "not halted" in capsys.readouterr().out
+    out_file = tmp_path / "copy.sqlite"
+    assert main(["backup", str(config_path), "--out", str(out_file)]) == 0
+    assert f"wrote {out_file}" in capsys.readouterr().out
+    with Ledger(out_file) as copy, Ledger(tmp_path / "paper.sqlite") as original:
+        assert copy.counts() == original.counts()
 
 
 def test_live_command_needs_the_flag_for_real_money(tmp_path: Path) -> None:
@@ -368,10 +384,78 @@ def test_a_changed_budget_is_a_transfer_not_a_loss(tmp_path: Path) -> None:
     config = paper_config(tmp_path)  # initial_cash 1000
     with Ledger(config.ledger) as ledger:
         guard = load_guard(config, ledger)
-        check_budget(config, ledger, guard)
+        check_budget(config, ledger, guard, at(0))
         guard.check(at(1), 1000.0, at(1))
         smaller = config.model_copy(update={"initial_cash": 400.0})
-        check_budget(smaller, ledger, guard)
+        assert restore_portfolio(smaller, ledger).cash == 1000.0  # not booked before a start
+        assert unbooked_budget(smaller, ledger) == -600.0
+        check_budget(smaller, ledger, guard, at(2))
         assert guard.state.peak_equity == pytest.approx(400.0)
         assert guard.check(at(2), 400.0, at(2)).mode == Mode.NORMAL
         assert "initial_cash changed" in ledger.recent_events(1)[0].message
+        # The book keeps its start and books the change, like a withdrawal.
+        assert [(a.symbol, a.cash) for a in ledger.adjustments()] == [("", -600.0)]
+        assert restore_portfolio(smaller, ledger).cash == pytest.approx(400.0)
+        assert unbooked_budget(smaller, ledger) == 0.0
+        check_budget(smaller, ledger, guard, at(3))  # booked once
+        assert len(ledger.adjustments()) == 1
+
+
+def test_a_stop_request_ends_a_session_as_it_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)  # no .env
+    config = paper_config(tmp_path)
+    stop_path(config.ledger).write_text("stop\n", encoding="utf-8")  # `tbot stop` while it waited
+    assert asyncio.run(run_paper(config, Settings(), tmp_path / "data")) == 0
+    assert not stop_path(config.ledger).exists()
+    assert not config.ledger.exists()  # nothing ran
+
+
+def test_a_restart_trades_the_bar_that_closed_while_it_was_down(tmp_path: Path) -> None:
+    config = PaperConfig(
+        strategies=[
+            StrategyConfig(
+                name="donchian_trend",
+                symbols=["BTCUSDT"],
+                timeframe=H4,
+                allocation=1.0,
+                params={"entry": 5, "exit": 3},
+            )
+        ],
+        ledger=tmp_path / "paper.sqlite",
+    )
+    closes = [100.0] * 40 + [120.0]  # the last bar breaks out
+    store = BarStore(tmp_path / "data")
+    store.write("BTCUSDT", H4, price_bars(T0, H4, [closes[0], *closes[:-1]], closes))
+    breakout = T0 + H4.delta * len(closes)  # its close
+    checkpoint = Checkpoint(breakout - H4.delta, [{"BTCUSDT": 0.0}])  # the event before
+
+    # Down from just before the close to 90 s after it: the breakout comes as an event.
+    session = build_session(
+        config, store, Portfolio(1000.0), breakout + timedelta(seconds=90), checkpoint
+    )
+    assert session.histories[("BTCUSDT", H4)].last_open_time == breakout - 2 * H4.delta
+    assert session.slots[0].targets == {"BTCUSDT": 0.0}
+    orders = session.ingest({("BTCUSDT", H4): store.read("BTCUSDT", H4).tail(1)}, breakout)
+    assert orders["BTCUSDT"] > 0  # bought at once, not 4 hours later
+
+    # Down for two hours: too old to trade (the guard would block it), so it is replayed.
+    late = build_session(
+        config, store, Portfolio(1000.0), breakout + timedelta(hours=2), checkpoint
+    )
+    assert late.histories[("BTCUSDT", H4)].last_open_time == breakout - H4.delta
+    assert late.slots[0].targets == {"BTCUSDT": 1.0}
+
+
+def test_telegram_status_and_fills_answers(tmp_path: Path) -> None:
+    trader, ledger, _ = make_trader(tmp_path, {at(1): {"BTC": 0.5}}, FakePrices({"BTC": 100.0}))
+    asyncio.run(trader.handle({BTC: BARS.slice(0, 1)}))
+    answer = command_answer(trader.session, ledger, "paper", lambda: at(1), lambda: ["PAUSED: x"])
+    status = answer("/status")
+    assert status.startswith("[paper] status 2024-01-01 01:00 UTC")
+    assert "last bar event 2024-01-01 01:00 UTC" in status
+    assert status.endswith("PAUSED: x")
+    assert "BUY 5.000000 BTC @ 100.00" in answer("/fills")
+    assert answer("/nope") == HELP
+    ledger.close()

@@ -51,6 +51,7 @@ class MonteCarloConfig(BaseModel):
     runs: int = Field(default=2000, ge=100)
     seed: int = 1
     block_days: int = Field(default=20, ge=1)  # resampled together, keeping streaks
+    kill_switch: float = Field(default=0.45, gt=0, lt=1)  # guard.max_drawdown to weigh
 
 
 class GateConfig(BaseModel):
@@ -138,7 +139,8 @@ class ValidationReport:
     plateau: Plateau
     walk_forward: WalkForwardResult
     oos: Metrics
-    monte_carlo: MonteCarloSummary
+    monte_carlo: MonteCarloSummary  # in-sample baseline
+    monte_carlo_oos: MonteCarloSummary  # stitched walk-forward test segments
     deflated: DeflatedSharpe
     holdout: Metrics
     holdout_evaluations: int
@@ -195,13 +197,21 @@ def run_validation(
 
     progress("Monte Carlo and deflated Sharpe")
     mc = config.monte_carlo
-    monte_carlo = simulate(
-        daily_returns(baseline_result),
-        runs=mc.runs,
-        seed=mc.seed,
-        block_days=mc.block_days,
-        drawdown_limit=config.gate.max_drawdown,
-    )
+
+    def resample(returns: npt.NDArray[np.float64]) -> MonteCarloSummary:
+        return simulate(
+            returns,
+            runs=mc.runs,
+            seed=mc.seed,
+            block_days=mc.block_days,
+            drawdown_limit=config.gate.max_drawdown,
+            kill_switch=mc.kill_switch,
+        )
+
+    # The in-sample run carries the edge its params were chosen for; the stitched
+    # out-of-sample segments are what the strategy did on data it had not seen.
+    monte_carlo = resample(daily_returns(baseline_result))
+    monte_carlo_oos = resample(daily_returns(walk.stitched))
     deflated = _deflated(daily_returns(baseline_result), log.selection_sharpes(baseline_record))
 
     progress("holdout")
@@ -221,6 +231,7 @@ def run_validation(
         walk_forward=walk,
         oos=oos,
         monte_carlo=monte_carlo,
+        monte_carlo_oos=monte_carlo_oos,
         deflated=deflated,
         holdout=holdout,
         holdout_evaluations=log.holdout_looks(holdout_record, config.holdout_start),

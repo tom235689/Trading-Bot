@@ -218,6 +218,11 @@ def test_validation_end_to_end(tmp_path: Path, data_dir: Path) -> None:
     for heading in ("3. Parameter sweep", "4. Walk-forward", "6. Deflated Sharpe", "8. Gate"):
         assert heading in text
     assert ("PASSED" in text) is report.passed
+    # Both resampled: the in-sample run and what the strategy did on unseen data.
+    assert report.monte_carlo_oos.days < report.monte_carlo.days
+    assert "in-sample (" in text
+    assert "out-of-sample (" in text
+    assert "beyond the 45% kill switch" in text
 
 
 def test_validation_rejects_bad_holdout(tmp_path: Path) -> None:

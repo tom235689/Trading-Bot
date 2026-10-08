@@ -17,7 +17,7 @@ def test_write_splits_by_year_and_reads_back(tmp_path: Path) -> None:
     bars = make_bars(NEW_YEAR_EVE, 12, H4)
     store.write("BTCUSDT", H4, bars)
 
-    files = sorted(p.name for p in store.directory("BTCUSDT", H4).iterdir())
+    files = sorted(p.name for p in store.directory("BTCUSDT", H4).glob("*.parquet"))
     assert files == ["2023.parquet", "2024.parquet"]
     assert store.read("BTCUSDT", H4).equals(bars)
     assert store.first_open_time("BTCUSDT", H4) == NEW_YEAR_EVE
@@ -77,3 +77,21 @@ def test_write_retries_while_another_process_reads_the_file(
     assert len(calls) == 3
     assert store.read("BTCUSDT", H4).height == 3
     assert not list(store.directory("BTCUSDT", H4).glob("*.tmp"))
+
+
+def test_writers_take_turns(tmp_path: Path) -> None:
+    import threading
+
+    from tbot.data.store import _locked
+
+    store = BarStore(tmp_path)
+    store.write("BTCUSDT", H4, make_bars(NEW_YEAR_EVE, 2, H4))
+    other = threading.Thread(
+        target=store.write, args=("BTCUSDT", H4, make_bars(NEW_YEAR_EVE, 4, H4).tail(2))
+    )
+    with _locked(store.directory("BTCUSDT", H4) / ".lock"):  # another process is merging
+        other.start()
+        other.join(0.3)
+        assert other.is_alive()  # it waits instead of merging into a stale read
+    other.join(5)
+    assert store.read("BTCUSDT", H4).height == 4

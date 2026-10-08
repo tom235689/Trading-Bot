@@ -154,3 +154,75 @@ def test_failed_backfill_leaves_the_store_as_it_was(
         with pytest.raises(httpx.ConnectError):
             sync(store, client, "BTCUSDT", H1, JAN_1, NOW)
     assert store.first_open_time("BTCUSDT", H1) == datetime(2024, 2, 10, tzinfo=UTC)
+
+
+def _gaps(store: BarStore, timeframe: Timeframe) -> int:
+    from tbot.data.quality import check_bars
+
+    bars = store.read("BTCUSDT", timeframe)
+    return len(check_bars(bars, timeframe, datetime(2030, 1, 1, tzinfo=UTC)).gaps)
+
+
+H4 = Timeframe.H4
+LONG = make_rows(datetime(2023, 1, 1, tzinfo=UTC), 6 * (365 + 366 + 60), H4)
+LATER = datetime(2025, 3, 1, 12, tzinfo=UTC)
+
+
+def test_a_backfill_that_fails_halfway_leaves_no_hole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tbot.data import store as store_module
+
+    fake = FakeBinance("BTCUSDT", H4, LONG)
+    store = BarStore(tmp_path)
+    with fake.client() as client:
+        sync(store, client, "BTCUSDT", H4, datetime(2025, 2, 1, tzinfo=UTC), LATER)
+        real = store_module._replace
+
+        def busy(source: Path, target: Path) -> None:
+            if target.name == "2025.parquet":  # another process has it open
+                source.unlink()
+                raise PermissionError("in use")
+            real(source, target)
+
+        monkeypatch.setattr(store_module, "_replace", busy)
+        with pytest.raises(PermissionError):
+            sync(store, client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
+        assert _gaps(store, H4) == 0  # the year next to the stored bars goes in first
+        monkeypatch.setattr(store_module, "_replace", real)
+        sync(store, client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
+    assert _gaps(store, H4) == 0
+    assert store.first_open_time("BTCUSDT", H4) == datetime(2023, 1, 1, tzinfo=UTC)
+
+
+def test_a_month_missing_from_the_archives_is_filled_before_later_ones_are_stored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeBinance("BTCUSDT", H4, LONG, unpublished={(2023, 6)})
+    store = BarStore(tmp_path)
+
+    def down(*args: object, **kwargs: object) -> object:
+        raise httpx.ConnectError("down")
+
+    with fake.client() as client:
+        monkeypatch.setattr(downloader, "fetch_klines", down)
+        with pytest.raises(httpx.ConnectError):
+            sync(store, client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
+        assert _gaps(store, H4) == 0  # nothing after the missing month was stored
+        monkeypatch.undo()  # REST works again
+        sync(store, client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
+    assert _gaps(store, H4) == 0
+
+
+def test_a_delisted_symbol_keeps_its_archives(tmp_path: Path) -> None:
+    class Delisted(FakeBinance):
+        def _klines(self, params: object) -> httpx.Response:
+            return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+
+    fake = Delisted("BTCUSDT", H4, make_rows(datetime(2023, 1, 1, tzinfo=UTC), 6 * 200, H4))
+    store = BarStore(tmp_path)
+    with fake.client() as client:
+        for _ in range(2):  # the second sync must not fail either
+            result = sync(store, client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
+    assert result.rest_bars == 0
+    assert result.last == datetime(2023, 7, 19, 20, tzinfo=UTC)  # the last archived bar

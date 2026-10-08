@@ -15,9 +15,10 @@ rebalance:
   min_notional: 10
   rebalance_threshold: 0.02
 guard:
-  daily_loss_limit: 0.03
-  # Beyond the strategy's 5th-percentile Monte Carlo drawdown (-44%): it stops a broken
-  # strategy, not a normal drawdown. At 0.15 the backtest halts in Nov 2018 for good.
+  daily_loss_limit: 0.03   # reduce-only for the rest of a bad day; no 2018-2026 fill changes
+  # The kill switch stops a broken strategy, not a normal drawdown. Monte Carlo of this
+  # strategy's daily returns goes past 45% in 5% of in-sample paths and in 16% of 4-year
+  # out-of-sample paths (55%: 0.6% and 4.5%). At 0.15 the backtest halts in Nov 2018 for good.
   max_drawdown: 0.45
   stale_seconds: 900
 strategies:
@@ -31,3 +32,5 @@ heartbeat_seconds: 300
 stale_after_seconds: 600
 batch_wait_seconds: 5
 summary_hour_utc: 0
+backup_days: 14           # daily copies of the ledger in data/backups
+telegram_commands: true   # /status and /fills from the chat; one session per bot token

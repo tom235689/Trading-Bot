@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tbot.core.models import Fill
+from tbot.live.backup import backup_ledger, daily_backups
 from tbot.live.ledger import EquityPoint, Event, Ledger, config_hash
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -70,3 +71,18 @@ def test_old_ledgers_gain_client_ids_and_orders_in_doubt_are_listed(tmp_path: Pa
         assert [r.client_id for r in ledger.unresolved_orders()] == ["b"]
         assert ledger.client_id_used("a")
         assert not ledger.client_id_used("c")
+
+
+def test_backups_copy_the_ledger_and_keep_the_newest_days(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite"
+    with Ledger(path) as ledger:
+        ledger.add_event(T0, "info", "started")
+        for day in range(4):
+            target = backup_ledger(ledger, path, T0 + timedelta(days=day), keep=2)
+        ledger.add_event(T0, "info", "after the backup")
+    assert target == tmp_path / "backups" / "paper-20240104.sqlite"
+    kept = [p.name for p in daily_backups(path)]
+    assert kept == ["paper-20240103.sqlite", "paper-20240104.sqlite"]
+    assert not list((tmp_path / "backups").glob("*.partial"))
+    with Ledger(target) as copy:
+        assert [e.message for e in copy.recent_events(5)] == ["started"]
