@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import polars as pl
 import pytest
 
@@ -197,3 +198,18 @@ def test_failing_reconciliations_pause_new_orders_until_one_works(tmp_path: Path
         "[live] reconciliation failing (down); new orders wait until it works again",
         "[live] reconciliation works again",
     ]
+
+
+def test_a_network_error_at_start_is_told_in_one_line() -> None:
+    request = httpx.Request("GET", "https://data-api.binance.vision/api/v3/time?secret=x")
+    forbidden = httpx.HTTPStatusError(
+        "403", request=request, response=httpx.Response(403, request=request)
+    )
+    assert runner.start_problem(forbidden) == (
+        "HTTP 403 from data-api.binance.vision; often brief: a supervised bot tries again, "
+        "by hand start it again"
+    )
+    assert runner.start_problem(httpx.ConnectError("down", request=request)).startswith(
+        "network error ConnectError;"
+    )
+    assert runner.start_problem(ValueError("no keys")) == "no keys"

@@ -192,9 +192,15 @@ def alert_checks(settings: Settings) -> list[Check]:
     if token and chat:
         telegram = Check("ok", "telegram", "configured; `tbot notify` sends a test message")
     elif token or chat:
-        telegram = Check("fail", "telegram", "set both TBOT_TELEGRAM_TOKEN and _CHAT_ID")
+        telegram = Check(
+            "fail", "telegram", "set both TBOT_TELEGRAM_TOKEN and _CHAT_ID (`tbot notify` helps)"
+        )
     else:
-        telegram = Check("warn", "telegram", "not configured: alerts only reach the log")
+        telegram = Check(
+            "warn",
+            "telegram",
+            "not configured: alerts only reach the log (`tbot notify` sets it up)",
+        )
     url = settings.heartbeat_url
     if not url:
         return [

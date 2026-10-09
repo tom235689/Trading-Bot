@@ -64,3 +64,25 @@ class Settings(BaseSettings):
     heartbeat_url: str | None = None
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
+
+
+def save_settings(path: Path, values: dict[str, str]) -> None:
+    """Set KEY=value lines in a .env file and keep everything else.
+
+    A missing file starts from .env.example next to it. The file is replaced in one step.
+    """
+    template = path.with_name(".env.example")
+    source = path if path.exists() else template if template.exists() else None
+    text = source.read_bytes().decode("utf-8-sig") if source else ""  # as is: CRLF stays
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+    for key, value in values.items():
+        line = f"{key}={value}"
+        found = [i for i, old in enumerate(lines) if old.split("=", 1)[0].strip() == key]
+        if found:
+            lines[found[0]] = line
+        else:
+            lines.append(line)
+    partial = path.with_name(path.name + ".partial")
+    partial.write_bytes((newline.join(lines) + newline).encode("utf-8"))
+    partial.replace(path)

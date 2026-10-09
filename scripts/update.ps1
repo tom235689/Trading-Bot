@@ -3,8 +3,9 @@
 Updates the bot: stops its scheduled sessions gracefully, pulls, syncs packages, starts them again.
 
 .DESCRIPTION
-Run it from an elevated PowerShell, like scripts\install_task.ps1. Tasks that run this
-repository's scripts\run_bot.ps1 are found by their action. A running one is asked to stop with
+Tasks that run this repository's scripts\run_bot.ps1 are found by their action; stopping and
+starting them needs administrator rights, so with tasks, run from a normal terminal, it asks
+for them and goes on in a new window. A running one is asked to stop with
 `tbot stop` (it finishes the event in progress). Whatever happens afterwards, every task that was
 running is started again, after `tbot doctor --offline` checks its config; the network checks are
 left to the bot, which retries them. Nothing is sold or cancelled.
@@ -14,14 +15,17 @@ at the old version with your changes. Exit code 1 means the update was not appli
 was not started again. A bot started by hand in a console must be stopped by hand first.
 
 .EXAMPLE
-powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -DryRun
+tbot update -DryRun
+tbot update
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1
 #>
 param(
     [switch] $DryRun,  # only show the tasks and what would be done
-    [int] $StopTimeoutSeconds = 120
+    [int] $StopTimeoutSeconds = 120,
+    [switch] $Elevated  # set when the script elevated itself
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 $uv = (Get-Command uv -ErrorAction Stop).Source
@@ -35,8 +39,13 @@ function Invoke-Checked([string] $exe, [string[]] $arguments) {
 }
 
 function Invoke-Tbot([string[]] $arguments) {
-    & $uv run --frozen python -m tbot @arguments | Write-Host
+    & $uv run --quiet --frozen python -m tbot @arguments | Write-Host
     return $LASTEXITCODE
+}
+
+function Get-Version {
+    $text = & $uv run --quiet --frozen python -m tbot --version 2>$null
+    if ($LASTEXITCODE -eq 0) { return [string] $text } else { return "an unknown version" }
 }
 
 function Get-VenvProcesses {
@@ -54,90 +63,109 @@ $tasks = @(Get-ScheduledTask | ForEach-Object {
         [pscustomobject] @{ Name = $_.TaskName; State = [string] $_.State; Config = $config }
     }
 })
-foreach ($task in $tasks) { Write-Output "task '$($task.Name)': $($task.State), $($task.Config)" }
-if (-not $tasks) { Write-Output "no scheduled tbot task for $repo" }
-$running = @($tasks | Where-Object { $_.State -eq "Running" })
-
-if (git stash list | Select-String -SimpleMatch $StashName -Quiet) {
-    throw "an earlier update left your local changes in 'git stash list' ($StashName). " +
-        "Put them back with 'git stash pop' (or drop them), then run this again."
-}
-$status = @(git status --porcelain --untracked-files=no)
-if ($status) { Write-Output "local changes, kept across the update:`n$($status -join "`n")" }
-if ($DryRun) {
-    git fetch --quiet
-    Write-Output "would stop: $(($running | ForEach-Object { $_.Name }) -join ', ')"
-    Write-Output "would pull:"
-    git log --oneline "HEAD..@{u}"
-    return
+if ($tasks -and -not $DryRun -and -not $Elevated -and -not (Test-Admin)) {
+    exit (Invoke-Elevated $PSCommandPath $PSBoundParameters)
 }
 
-$failed = $false
-$notStarted = @()
-$before = git rev-parse HEAD
+$exitCode = 0
 try {
-    foreach ($task in $running) {
-        Write-Output "stopping '$($task.Name)'"
-        $code = Invoke-Tbot @("stop", $task.Config, "--timeout", "$StopTimeoutSeconds")
-        if ($code -ne 0) { throw "'$($task.Name)' did not stop in time" }
-        # The bot is gone; a supervisor still running is waiting to restart it: end it.
-        $deadline = (Get-Date).AddSeconds(30)
-        while ((Get-ScheduledTask -TaskName $task.Name).State -eq "Running") {
-            if ((Get-Date) -gt $deadline) {
-                Stop-ScheduledTask -TaskName $task.Name
-                $deadline = (Get-Date).AddSeconds(30)
-            }
-            Start-Sleep -Seconds 2
-        }
+    foreach ($task in $tasks) { Write-Output "task '$($task.Name)': $($task.State), $($task.Config)" }
+    if (-not $tasks) { Write-Output "no scheduled tbot task for $repo" }
+    $running = @($tasks | Where-Object { $_.State -eq "Running" })
+
+    if (git stash list | Select-String -SimpleMatch $StashName -Quiet) {
+        throw "an earlier update left your local changes in 'git stash list' ($StashName). " +
+            "Put them back with 'git stash pop' (or drop them), then run this again."
     }
-    $busy = Get-VenvProcesses
-    if ($busy) {
-        throw "a bot or tool started by hand still runs from .venv (process $($busy[0].Id)); stop it first"
+    $status = @(git status --porcelain --untracked-files=no)
+    if ($status) { Write-Output "local changes, kept across the update:`n$($status -join "`n")" }
+    if ($DryRun) {
+        git fetch --quiet
+        Write-Output "would stop: $(($running | ForEach-Object { $_.Name }) -join ', ')"
+        Write-Output "would pull:"
+        git log --oneline "HEAD..@{u}"
+        return
     }
 
-    $stashed = $false
-    if ($status) {  # set aside for the pull, put back last
-        Invoke-Checked "git" @("stash", "push", "--quiet", "-m", $StashName)
-        $stashed = $true
-    }
+    $failed = $false
+    $notStarted = @()
+    $before = git rev-parse HEAD
+    $oldVersion = Get-Version
     try {
-        Invoke-Checked "git" @("pull", "--ff-only")
-        Invoke-Checked $uv @("sync", "--frozen")
-        if ($stashed) {
-            & git stash pop --quiet
-            if ($LASTEXITCODE -ne 0) { throw "the update changes the same lines as your local changes" }
-            $stashed = $false
+        foreach ($task in $running) {
+            Write-Output "stopping '$($task.Name)'"
+            $code = Invoke-Tbot @("stop", $task.Config, "--timeout", "$StopTimeoutSeconds")
+            if ($code -ne 0) { throw "'$($task.Name)' did not stop in time" }
+            # The bot is gone; a supervisor still running is waiting to restart it: end it.
+            $deadline = (Get-Date).AddSeconds(30)
+            while ((Get-ScheduledTask -TaskName $task.Name).State -eq "Running") {
+                if ((Get-Date) -gt $deadline) {
+                    Stop-ScheduledTask -TaskName $task.Name
+                    $deadline = (Get-Date).AddSeconds(30)
+                }
+                Start-Sleep -Seconds 2
+            }
+        }
+        $busy = Get-VenvProcesses
+        if ($busy) {
+            throw "a bot or tool still runs from .venv (process $($busy[0].Id)): stop it first " +
+                "(tbot stop), or run this as administrator if a scheduled task runs it"
+        }
+
+        $stashed = $false
+        if ($status) {  # set aside for the pull, put back last
+            Invoke-Checked "git" @("stash", "push", "--quiet", "-m", $StashName)
+            $stashed = $true
+        }
+        try {
+            Invoke-Checked "git" @("pull", "--ff-only")
+            Invoke-Checked $uv @("sync", "--frozen")
+            if ($stashed) {
+                & git stash pop --quiet
+                if ($LASTEXITCODE -ne 0) { throw "the update changes the same lines as your local changes" }
+                $stashed = $false
+            }
+        } catch {
+            $failed = $true
+            Write-Output "update NOT applied: $_"
+            if ((git rev-parse HEAD) -ne $before) {
+                Write-Output "going back to $before"
+                & git reset --hard --quiet $before  # local changes are still in the stash
+            }
+            if ($stashed) {
+                & git stash pop --quiet  # applies cleanly on the old version
+                if ($LASTEXITCODE -ne 0) { Write-Output "your local changes are in 'git stash list'" }
+            }
+            & $uv sync --frozen
         }
     } catch {
         $failed = $true
         Write-Output "update NOT applied: $_"
-        if ((git rev-parse HEAD) -ne $before) {
-            Write-Output "going back to $before"
-            & git reset --hard --quiet $before  # local changes are still in the stash
+    } finally {
+        $after = git rev-parse HEAD
+        if ($before -ne $after) { git log --oneline "$before..$after" }
+        foreach ($task in $running) {
+            if ((Get-ScheduledTask -TaskName $task.Name).State -eq "Running") { continue }
+            $null = Invoke-Tbot @("stop", $task.Config, "--cancel")  # or the new start stops at once
+            if ((Invoke-Tbot @("doctor", $task.Config, "--offline")) -ne 0) {
+                Write-Output "NOT started '$($task.Name)': doctor reports a problem. Fix it, then: Start-ScheduledTask -TaskName '$($task.Name)'"
+                $notStarted += $task.Name
+                continue
+            }
+            Start-ScheduledTask -TaskName $task.Name
+            Write-Output "started '$($task.Name)'"
         }
-        if ($stashed) {
-            & git stash pop --quiet  # applies cleanly on the old version
-            if ($LASTEXITCODE -ne 0) { Write-Output "your local changes are in 'git stash list'" }
-        }
-        & $uv sync --frozen
+    }
+    if ($failed -or $notStarted) { exit 1 }
+    if ($before -eq $after) {
+        Write-Output "already up to date ($oldVersion)"
+    } else {
+        Write-Output "updated: $oldVersion -> $(Get-Version); what changed: CHANGELOG.md"
     }
 } catch {
-    $failed = $true
-    Write-Output "update NOT applied: $_"
+    Write-Output "FAILED: $($_.Exception.Message)"
+    $exitCode = 1
 } finally {
-    $after = git rev-parse HEAD
-    if ($before -ne $after) { git log --oneline "$before..$after" }
-    foreach ($task in $running) {
-        if ((Get-ScheduledTask -TaskName $task.Name).State -eq "Running") { continue }
-        $null = Invoke-Tbot @("stop", $task.Config, "--cancel")  # or the new start stops at once
-        if ((Invoke-Tbot @("doctor", $task.Config, "--offline")) -ne 0) {
-            Write-Output "NOT started '$($task.Name)': doctor reports a problem. Fix it, then: Start-ScheduledTask -TaskName '$($task.Name)'"
-            $notStarted += $task.Name
-            continue
-        }
-        Start-ScheduledTask -TaskName $task.Name
-        Write-Output "started '$($task.Name)'"
-    }
+    Wait-Close -Elevated:$Elevated
 }
-if ($failed -or $notStarted) { exit 1 }
-if ($before -eq $after) { Write-Output "already up to date" } else { Write-Output "updated" }
+exit $exitCode

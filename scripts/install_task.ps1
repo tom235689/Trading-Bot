@@ -1,64 +1,97 @@
 <#
 .SYNOPSIS
-Registers a scheduled task that runs the bot at startup, whether anyone is logged on or not.
+Runs a session at every boot, restarted after crashes: registers a scheduled task and starts it.
 
 .DESCRIPTION
-The task runs scripts/run_bot.ps1, which starts the bot again after a crash. Run this from an
-elevated PowerShell: tasks that start at boot need administrator rights. It runs
-`tbot doctor` first and refuses to register while doctor reports a problem.
+The task runs scripts/run_bot.ps1, which starts the bot again after a crash, whether anyone is
+logged on or not. Tasks that start at boot need administrator rights: run from a normal
+terminal, it asks for them and goes on in a new window. It runs `tbot doctor` first and refuses
+to register while doctor reports a problem. The task is started at once, unless -NoStart or a
+session already runs on the config (then it starts at the next boot). -Remove stops the bot
+gracefully and removes the task (scripts\remove_task.ps1).
 
 .EXAMPLE
-powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1 -Config config\paper.yaml
-powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1 -Config config\live.yaml -Live
-Start-ScheduledTask -TaskName "tbot paper"
-powershell -ExecutionPolicy Bypass -File scripts\remove_task.ps1 -Config config\paper.yaml
+tbot autostart paper
+tbot autostart live -Live
+tbot autostart paper -Remove
+powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1 paper -DryRun
 #>
 param(
-    [Parameter(Mandatory = $true)] [string] $Config,
-    [switch] $Live,
-    [string] $Name = "",
+    [Parameter(Position = 0)] [string] $Config = "paper",  # a config file or a name from config\
+    [switch] $Live,  # required for a config with mode: live
+    [string] $Name = "",  # default "tbot <config name>"
     [switch] $SkipDoctor,
-    [switch] $DryRun
+    [switch] $NoStart,
+    [switch] $Remove,
+    [switch] $DryRun,  # only show the task
+    [switch] $Elevated  # set when the script elevated itself
 )
 $ErrorActionPreference = "Stop"
-
+. (Join-Path $PSScriptRoot "common.ps1")
 $repo = Split-Path -Parent $PSScriptRoot
-$path = if ([IO.Path]::IsPathRooted($Config)) { $Config } else { Join-Path $repo $Config }
-if (-not (Test-Path $path -PathType Leaf)) { throw "no config at $path" }
-$text = Get-Content -Raw $path
-$isLive = $text -match '(?m)^mode:\s*["'']?live["'']?\s*(#.*)?$'
-if ($isLive -and -not $Live) { throw "$Config trades real money: add -Live to confirm" }
-if ($Live -and -not $isLive) { throw "-Live is only for a config with mode: live" }
-if (-not $Name) { $Name = "tbot " + [IO.Path]::GetFileNameWithoutExtension($Config) }
-$uv = (Get-Command uv).Source  # the task may not see the same PATH
-$identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-$admin = $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $admin -and -not $DryRun) {
-    throw "run this from an elevated PowerShell (Run as administrator): tasks that start at boot need it"
+
+if ($Remove) {
+    & (Join-Path $PSScriptRoot "remove_task.ps1") -Config $Config -Name $Name
+    exit $LASTEXITCODE
+}
+if (-not $DryRun -and -not $Elevated -and -not (Test-Admin)) {
+    exit (Invoke-Elevated $PSCommandPath $PSBoundParameters)
 }
 
-if (-not $SkipDoctor) {
-    & $uv --directory $repo run --frozen python -m tbot doctor $path
-    if ($LASTEXITCODE -ne 0) { throw "doctor found problems: fix the FAIL lines, or pass -SkipDoctor" }
+$code = 0
+try {
+    $path = Resolve-Config $repo $Config
+    $text = Get-Content -Raw $path
+    $isLive = $text -match '(?m)^mode:\s*["'']?live["'']?\s*(#.*)?$'
+    if ($isLive -and -not $Live) { throw "$Config trades real money: add -Live to confirm" }
+    if ($Live -and -not $isLive) { throw "-Live is only for a config with mode: live" }
+    $stem = [IO.Path]::GetFileNameWithoutExtension($path)
+    if (-not $Name) { $Name = "tbot $stem" }
+    $uv = (Get-Command uv).Source  # the task may not see the same PATH
+
+    $busy = $false
+    if (-not $SkipDoctor) {
+        $report = @(& $uv --directory $repo run --quiet --frozen python -m tbot doctor $path)
+        $doctorCode = $LASTEXITCODE
+        $report | ForEach-Object { Write-Output $_ }
+        if ($doctorCode -ne 0) { throw "doctor found problems: fix the FAIL lines, or pass -SkipDoctor" }
+        $busy = [bool] ($report | Where-Object { $_ -match "process: a session is running" })
+    }
+
+    $runner = Join-Path $PSScriptRoot "run_bot.ps1"
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runner`" -Config `"$path`" -Uv `"$uv`""
+    if ($Live) { $arguments += " -Live" }
+
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments -WorkingDirectory $repo
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+        -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U  # no stored password
+    $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings `
+        -Principal $principal -Description "Trading bot ($stem), restarted after crashes"
+
+    if ($DryRun) {
+        Write-Output "task '$Name' as $user at startup: powershell.exe $arguments"
+    } else {
+        $existing = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+        Register-ScheduledTask -TaskName $Name -InputObject $task -Force | Out-Null
+        if ($existing -and $existing.State -eq "Running") {
+            Write-Output "updated '$Name'; it is running, and the new settings apply at its next start"
+        } elseif ($NoStart) {
+            Write-Output "registered '$Name': it starts at the next boot, or now with: Start-ScheduledTask -TaskName '$Name'"
+        } elseif ($busy) {
+            Write-Output ("registered '$Name'. A session started by hand already runs on $stem, so the task " +
+                "starts at the next boot. To hand over now: tbot stop $stem, then Start-ScheduledTask -TaskName '$Name'")
+        } else {
+            Start-ScheduledTask -TaskName $Name
+            Write-Output "registered and started '$Name': it runs at every boot. Watch it: tbot status, tbot log $stem -f"
+        }
+    }
+} catch {
+    Write-Output "FAILED: $($_.Exception.Message)"
+    $code = 1
 }
-
-$runner = Join-Path $PSScriptRoot "run_bot.ps1"
-$arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runner`" -Config `"$path`" -Uv `"$uv`""
-if ($Live) { $arguments += " -Live" }
-
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments -WorkingDirectory $repo
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
-    -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U  # no stored password
-$task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings `
-    -Principal $principal -Description "Trading bot ($Config), restarted after crashes"
-
-if ($DryRun) {
-    Write-Output "task '$Name' as $user at startup: powershell.exe $arguments"
-    return
-}
-Register-ScheduledTask -TaskName $Name -InputObject $task -Force | Out-Null
-Write-Output "registered '$Name'. Start it now: Start-ScheduledTask -TaskName '$Name'"
+Wait-Close -Elevated:$Elevated
+exit $code

@@ -1,22 +1,27 @@
 <#
 .SYNOPSIS
-Sets up the bot on Windows: Python environment, git hooks, .env, market data, and a doctor run.
+Sets up the bot on Windows: Python environment, git hooks, .env, the tbot command, market data,
+and a doctor run.
 
 .DESCRIPTION
 Safe to run again at any time; every step skips what is already done.
+The repository folder is added to your user PATH (-NoPath skips it), so `tbot` (tbot.cmd)
+works in any new terminal.
 With Smart App Control on, unsigned Python files can be blocked, so the environment is built
 on Python signed by the Python Software Foundation: an existing install, or the official
 "python" package from nuget.org, unpacked to PythonHome after its signature is checked.
 
 .EXAMPLE
+.\tbot setup
+.\tbot setup -SkipDownload
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -SkipDownload
 #>
 param(
     [string] $Python = "",  # a python.exe to build the environment on
     [string] $PythonVersion = "3.12.10",
     [string] $PythonHome = "",  # where the nuget Python goes; default %LOCALAPPDATA%\tbot\python-<version>
     [switch] $SkipDownload,  # no market data download (a few minutes on the first run)
+    [switch] $NoPath,  # leave the user PATH alone; run .\tbot from this folder
     [string] $Config = "config\paper.yaml"  # the config doctor checks at the end
 )
 $ErrorActionPreference = "Stop"
@@ -35,6 +40,28 @@ function Test-Signed([string] $exe) {
 function Invoke-Checked([string] $exe, [string[]] $arguments) {
     & $exe @arguments
     if ($LASTEXITCODE -ne 0) { throw "failed (exit $LASTEXITCODE): $exe $($arguments -join ' ')" }
+}
+
+function Add-UserPath([string] $folder, [string] $variable = "Path") {
+    # Appends the folder to the user's PATH, keeping %VARIABLES% and the registry value type.
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+    try {
+        $raw = [string] $key.GetValue($variable, "",
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $entries = @($raw -split ";" | Where-Object { $_ })
+        $expanded = @($entries | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd("\") })
+        if ($expanded -contains $folder.TrimEnd("\")) { return "already on your PATH" }
+        $other = $expanded | Where-Object { Test-Path (Join-Path $_ "tbot.cmd") } | Select-Object -First 1
+        if ($other) { return "another tbot folder is on your PATH ($other): left as it is; use .\tbot here" }
+        $kind = if ($raw) { $key.GetValueKind($variable) } else { [Microsoft.Win32.RegistryValueKind]::ExpandString }
+        $key.SetValue($variable, ((@($entries) + $folder) -join ";"), $kind)
+    } finally {
+        $key.Close()
+    }
+    # Changing a user variable this way tells Windows to hand programs started from now on the new PATH.
+    [Environment]::SetEnvironmentVariable("TBOT_SETUP", "1", "User")
+    [Environment]::SetEnvironmentVariable("TBOT_SETUP", $null, "User")
+    return "added $folder to your PATH: tbot works in every new terminal (in this one: .\tbot)"
 }
 
 Step "uv"
@@ -125,12 +152,19 @@ if (Test-Path ".git") {
     Write-Output "not a git clone: skipped"
 }
 
+Step "tbot command"
+if ($NoPath) {
+    Write-Output "skipped (-NoPath): run .\tbot in this folder"
+} else {
+    Write-Output (Add-UserPath $repo)
+}
+
 Step ".env"
 if (Test-Path ".env") {
     Write-Output ".env exists: left as it is"
 } else {
     Copy-Item ".env.example" ".env"
-    Write-Output "created .env from .env.example: add the Telegram and heartbeat settings (README)"
+    Write-Output "created .env from .env.example; tbot notify sets up Telegram alerts"
 }
 
 Step "market data"
@@ -141,9 +175,13 @@ if ($SkipDownload) {
 }
 
 Step "doctor $Config"
-& $uv run --frozen python -m tbot doctor $Config
+& $uv run --quiet --frozen python -m tbot doctor $Config
 if ($LASTEXITCODE -ne 0) {
-    Write-Output "doctor reports a problem: fix the FAIL lines above, then run it again"
+    Write-Output "doctor reports a problem: fix the FAIL lines above, then run tbot doctor again"
     exit 1
 }
-Write-Output "ready: uv run python -m tbot paper $Config (README, Paper trading)"
+Write-Output ""
+Write-Output "Ready. Next (README, Everyday use):"
+Write-Output "  tbot notify    Telegram alerts, guided (optional; WARN telegram above until then)"
+Write-Output "  tbot paper     paper trading until you stop it with Ctrl+C"
+Write-Output "  tbot status    every session at a glance, from another terminal"

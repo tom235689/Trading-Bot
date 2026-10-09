@@ -8,8 +8,8 @@ that doubles up to MaxDelaySeconds, so a persistent failure does not flood Teleg
 end the loop: 0 (stopped on purpose, e.g. `tbot stop`), 3 (the ledger is in use by another
 process, damaged, or SQLite cannot load), and 4 (the config or the command is wrong).
 Each config has its own logs: logs\<config>.supervisor.log records every start and exit,
-logs\<config>.console.txt the last run's console. scripts/install_task.ps1 registers this
-script to run at startup.
+logs\<config>.console.txt the last run's console. `tbot autostart <config>`
+(scripts/install_task.ps1) registers this script to run at startup.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File scripts\run_bot.ps1 -Config config\paper.yaml
@@ -61,7 +61,7 @@ while ($true) {
     $code = -1
     $last = ""
     if (-not $exe) {
-        $last = "uv not found (was $Uv): install uv again, then run scripts\install_task.ps1 again"
+        $last = "uv not found (was $Uv): install uv again, then run tbot autostart $name again"
     } else {
         Write-Journal "starting: $exe $line"
         try {

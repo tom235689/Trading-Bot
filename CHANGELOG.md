@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0 (2026-10-09)
+
+Easier to use every day. Nothing changes in how the bot trades. Upgrade notes: after `tbot update` (or a pull), run `.\tbot setup` once to put the `tbot` command on your PATH; scheduled tasks keep working as they are.
+
+**One short command**
+- `tbot.cmd` in the repository runs every command from any folder, always in the repository, where `.env`, `config`, `data`, and `logs` live: `tbot status` instead of `uv run python -m tbot status config/paper.yaml`. Setup adds the folder to your user PATH (`-NoPath` skips it), keeping the other entries and their `%VARIABLES%` as they are.
+- `tbot setup`, `tbot update`, and `tbot autostart <config>` run the PowerShell scripts, and the scripts take a config name (`paper`) as well as a path.
+- A config can be named: `tbot status testnet`, `tbot backtest donchian_voltarget`. Session commands may leave it out and take the running session, else the only one that has run, else paper; they say which, and never guess between two. `tbot stop` stops the running session, `tbot resume` clears the halted one, and `tbot stop --cancel` withdraws every request.
+
+**Seeing what the bot does**
+- `tbot status` without a config shows every session on one line each: running or not, equity, profit (budget changes and transfers are money put in, not profit), 24-hour change, drawdown from the peak, positions, and a halt or orders in doubt.
+- `tbot log` shows the JSON log as readable lines (an alert's text, tracebacks indented); `-f` follows it, also through rotations, and `--level warning` shows problems only.
+- `tbot dashboard` and `tbot backtest --html` open the report in the browser when run at a terminal (`--no-open` to skip).
+- A session prints its ledger, its log file, and how to stop it as it starts. A start that fails on the network says so in one line (host and status) and that a supervised bot tries again.
+
+**Setting up**
+- `tbot notify` sets Telegram up step by step: it asks for the token, checks it, waits for your first message to the bot, finds your chat, saves both in `.env` (every other line stays as it was), and sends a test message. `tbot doctor` points at it while Telegram is not set up.
+- `tbot autostart paper` registers the scheduled task and starts it at once, unless a session started by hand already runs on the config (then it waits for the next boot); `-NoStart` waits too, and `-Remove` takes it away. Autostart, removal, and an update with scheduled tasks ask for administrator rights themselves from a normal terminal and run in a new window that stays open until you press Enter.
+- `tbot update` ends with the old and new version.
+- `tbot -h` starts with the first steps; commands are listed in the order they are used.
+
+**Tests**
+- 17 new tests (357 in all): naming and picking configs, the session overview, the log view and following it through a rotation, the guided Telegram setup, `.env` editing, opening a dashboard, and the message of a failed start. Each was checked to fail without the code it covers.
+
 ## 0.3.1 (2026-10-08)
 
 Fixes from four independent reviews of 0.3.0 (live path, research, operations, and a mutation test of the suite). Upgrade notes: a paper session now logs to `logs\<config name>.jsonl`, like live (`paper.jsonl` for `config\paper.yaml`, as before); `.gitattributes` merges the trial log by union.

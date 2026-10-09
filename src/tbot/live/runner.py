@@ -463,6 +463,17 @@ def install_stop_handlers(stop: asyncio.Event) -> None:
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
 
 
+def start_problem(exc: Exception) -> str:
+    """A failed start in a line: a network error names the host, never the URL."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        problem = f"HTTP {exc.response.status_code} from {exc.request.url.host}"
+    elif isinstance(exc, httpx.HTTPError):
+        problem = f"network error {type(exc).__name__}"
+    else:
+        return str(exc) or repr(exc)
+    return f"{problem}; often brief: a supervised bot tries again, by hand start it again"
+
+
 def stop_path(ledger: Path) -> Path:
     """`tbot stop` leaves this file: a graceful stop for a bot that has no console."""
     return ledger.with_name(ledger.name + ".stop")
@@ -693,7 +704,7 @@ async def _trade(
         except Exception as exc:  # tell the operator; a supervisor would restart silently
             log.error("start_failed", error=repr(exc))
             ledger.add_event(utc_now(), "error", f"failed to start: {exc!r}")
-            await notifier.send(f"[{label}] failed to start: {exc}")
+            await notifier.send(f"[{label}] failed to start: {start_problem(exc)}")
             return 1
         trader = SessionTrader(
             session,
