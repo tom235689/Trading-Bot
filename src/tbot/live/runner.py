@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import signal
 import sys
 import time
@@ -53,6 +54,7 @@ RECONCILE_ALERT_AFTER = 3  # consecutive failed reconciliations before trading p
 GUARD_META = "guard"
 BUDGET_META = "initial_cash"  # the budget the guard levels refer to
 BASE_META = "base_cash"  # what the book started with
+SUPERVISED_ENV = "TBOT_SUPERVISED"  # set by scripts/run_bot.ps1
 BUDGET_NOTE = "initial_cash changed"  # adjustments that book a changed budget
 TARGETS_META = "targets"
 OPERATIONAL = {"ledger", "backup_days", "telegram_commands"}  # not in the config hash
@@ -354,11 +356,14 @@ def summary_text(
 ) -> str:
     equity = session.portfolio.equity(session.marks)
     earlier = ledger.equity_before(now - timedelta(days=1))
-    change = (
-        f"{equity / earlier.equity - 1:+.2%} over 24h"
-        if earlier and earlier.equity > 0
-        else "no 24h reference"
-    )
+    change = "no 24h reference"
+    if earlier and earlier.equity > 0:
+        moved = sum(  # deposits, withdrawals, budget changes: not a gain or a loss
+            a.cash + a.quantity * session.marks.get(a.symbol, 0.0)
+            for a in ledger.adjustments()
+            if earlier.time < a.time <= now
+        )
+        change = f"{(equity - moved) / earlier.equity - 1:+.2%} over 24h"
     raw = ledger.get_meta(GUARD_META)
     guard = GuardState.model_validate_json(raw) if raw else GuardState()
     if guard.peak_equity > 0:
@@ -464,14 +469,24 @@ def install_stop_handlers(stop: asyncio.Event) -> None:
 
 
 def start_problem(exc: Exception) -> str:
-    """A failed start in a line: a network error names the host, never the URL."""
+    """A failed start in a line: a network error names the host and the answer, never the URL."""
     if isinstance(exc, httpx.HTTPStatusError):
-        problem = f"HTTP {exc.response.status_code} from {exc.request.url.host}"
+        status = exc.response.status_code
+        answer = exc.response.text.strip()
+        problem = f"HTTP {status} from {exc.request.url.host}"
+        if answer.startswith("{"):  # an exchange error such as {"code":-2015,"msg":...}
+            problem += f": {answer[:200]}"
+        passing = status >= 500 or status in (403, 418, 429)  # 403: Binance's firewall
     elif isinstance(exc, httpx.HTTPError):
-        problem = f"network error {type(exc).__name__}"
+        problem, passing = f"network error {type(exc).__name__}", True
     else:
         return str(exc) or repr(exc)
-    return f"{problem}; often brief: a supervised bot tries again, by hand start it again"
+    if passing:
+        return f"{problem}; often brief: a supervised bot tries again, by hand start it again"
+    return (
+        f"{problem}; a supervised bot tries again, but if it keeps failing, check the API key, "
+        "its IP restriction, and the network"
+    )
 
 
 def stop_path(ledger: Path) -> Path:
@@ -492,6 +507,11 @@ def take_stop_request(ledger: Path) -> bool:
         return False
     path.unlink(missing_ok=True)
     return age < STOP_REQUEST_SECONDS
+
+
+def supervised() -> bool:
+    """Started by scripts/run_bot.ps1, which restarts the bot after a crash."""
+    return os.environ.get(SUPERVISED_ENV) == "1"
 
 
 def is_running(ledger: Path) -> bool:
@@ -588,8 +608,11 @@ async def run_session(
     new_ledger = not config.ledger.exists()
     with instance_lock(config.ledger, wait=3.0):
         if take_stop_request(config.ledger):
-            log.warning("stopped_at_start", reason="`tbot stop` asked this session to stop")
-            return 0
+            if supervised():
+                log.warning("stopped_at_start", reason="`tbot stop` asked this session to stop")
+                return 0
+            # Started by hand on purpose: the request was for a supervisor's restart.
+            log.warning("stop_request_dropped", reason="this session was started by hand")
         ledger = Ledger(config.ledger)
         try:
             return await _run_session(
@@ -812,7 +835,9 @@ def valid_url(url: str) -> bool:
     except httpx.InvalidURL:
         parsed = None
     if parsed is None or parsed.scheme not in ("http", "https") or not parsed.host:
-        log.warning("heartbeat_url_invalid", hint="TBOT_HEARTBEAT_URL must be a full https:// URL")
+        log.warning(
+            "heartbeat_url_invalid", hint="TBOT_HEARTBEAT_URL must be a full http(s):// URL"
+        )
         return False
     return True
 

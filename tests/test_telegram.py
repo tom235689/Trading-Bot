@@ -154,3 +154,15 @@ def test_an_odd_reply_from_telegram_never_ends_the_session(
 
     asyncio.run(run())
     assert sent == ["answer /status"]
+
+
+def test_me_reads_the_bot_name_and_survives_an_odd_answer() -> None:
+    answers = iter([{"ok": True, "result": {"username": "tbot_bot"}}, ["not", "a", "dict"]])
+
+    async def scenario() -> list[str]:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json=next(answers)))
+        async with httpx.AsyncClient(transport=transport) as client:
+            bot = Telegram("123:abc", "", client)
+            return [await bot.me(), await bot.me()]
+
+    assert asyncio.run(scenario()) == ["tbot_bot", ""]

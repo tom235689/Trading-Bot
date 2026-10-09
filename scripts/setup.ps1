@@ -4,7 +4,9 @@ Sets up the bot on Windows: Python environment, git hooks, .env, the tbot comman
 and a doctor run.
 
 .DESCRIPTION
-Safe to run again at any time; every step skips what is already done.
+Safe to run again at any time; every step skips what is already done. While a bot runs from
+.venv, the Python and package steps are skipped (rebuilding them under a running bot breaks it)
+and everything else runs.
 The repository folder is added to your user PATH (-NoPath skips it), so `tbot` (tbot.cmd)
 works in any new terminal.
 With Smart App Control on, unsigned Python files can be blocked, so the environment is built
@@ -16,6 +18,7 @@ on Python signed by the Python Software Foundation: an existing install, or the 
 .\tbot setup -SkipDownload
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 #>
+[CmdletBinding()]
 param(
     [string] $Python = "",  # a python.exe to build the environment on
     [string] $PythonVersion = "3.12.10",
@@ -49,9 +52,13 @@ function Add-UserPath([string] $folder, [string] $variable = "Path") {
         $raw = [string] $key.GetValue($variable, "",
             [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         $entries = @($raw -split ";" | Where-Object { $_ })
-        $expanded = @($entries | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd("\") })
+        $expanded = @($entries | ForEach-Object {
+            [Environment]::ExpandEnvironmentVariables($_).Trim('"').TrimEnd("\")
+        })
         if ($expanded -contains $folder.TrimEnd("\")) { return "already on your PATH" }
-        $other = $expanded | Where-Object { Test-Path (Join-Path $_ "tbot.cmd") } | Select-Object -First 1
+        $other = $expanded | Where-Object {
+            try { [IO.File]::Exists([IO.Path]::Combine($_, "tbot.cmd")) } catch { $false }
+        } | Select-Object -First 1
         if ($other) { return "another tbot folder is on your PATH ($other): left as it is; use .\tbot here" }
         $kind = if ($raw) { $key.GetValueKind($variable) } else { [Microsoft.Win32.RegistryValueKind]::ExpandString }
         $key.SetValue($variable, ((@($entries) + $folder) -join ";"), $kind)
@@ -77,12 +84,15 @@ $venv = (Join-Path $repo ".venv").ToLowerInvariant()
 $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
     $_.Path -and $_.Path.ToLowerInvariant().StartsWith($venv)
 })
+$run = @("run", "--frozen")
 if ($busy) {  # rebuilding or syncing the environment under a running bot breaks it
-    throw "a bot or tool runs from .venv (process $($busy[0].Id)): stop it first " +
-        "(tbot stop <config>, or scripts\update.ps1 to update a scheduled bot)"
+    Write-Output ("a bot or tool runs from .venv (process $($busy[0].Id)): the Python and " +
+        "package steps are skipped; to redo them, stop it (tbot stop) and run this again")
+    $run = @("run", "--frozen", "--no-sync")
 }
 
 Step "Python"
+if ($busy) { Write-Output "skipped: .venv is in use" }
 $smartAppControl = 0
 try {
     $policy = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -ErrorAction Stop
@@ -91,7 +101,7 @@ try {
     }
 } catch { }
 if (-not $PythonHome) { $PythonHome = Join-Path $env:LOCALAPPDATA "tbot\python-$PythonVersion" }
-if (-not $Python -and $smartAppControl -ne 0) {
+if (-not $busy -and -not $Python -and $smartAppControl -ne 0) {
     Write-Output "Smart App Control is on: using Python signed by the Python Software Foundation"
     $short = ($PythonVersion -split "\.")[0..1] -join ""
     $candidates = @(
@@ -123,7 +133,7 @@ if (-not $Python -and $smartAppControl -ne 0) {
         $Python = Join-Path $PythonHome "python.exe"
     }
 }
-if ($Python) {
+if (-not $busy -and $Python) {
     if (-not (Test-Path $Python -PathType Leaf)) { throw "no python.exe at $Python" }
     $wanted = Split-Path -Parent (Resolve-Path $Python).Path
     $current = ""
@@ -140,9 +150,13 @@ if ($Python) {
 }
 
 Step "packages"
-Invoke-Checked $uv @("sync", "--frozen")
-Invoke-Checked $uv @("run", "--frozen", "python", "-c", "import sqlite3, polars, pydantic_core, tbot")
-Invoke-Checked $uv @("run", "--frozen", "python", "-m", "tbot", "--version")
+if ($busy) {
+    Write-Output "skipped: .venv is in use"
+} else {
+    Invoke-Checked $uv @("sync", "--frozen")
+    Invoke-Checked $uv @("run", "--frozen", "python", "-c", "import sqlite3, polars, pydantic_core, tbot")
+}
+Invoke-Checked $uv ($run + @("python", "-m", "tbot", "--version"))
 
 Step "git hooks"
 if (Test-Path ".git") {
@@ -171,11 +185,11 @@ Step "market data"
 if ($SkipDownload) {
     Write-Output "skipped (-SkipDownload); sessions download what they need at start"
 } else {
-    Invoke-Checked $uv @("run", "--frozen", "python", "-m", "tbot", "download")
+    Invoke-Checked $uv ($run + @("python", "-m", "tbot", "download"))
 }
 
 Step "doctor $Config"
-& $uv run --quiet --frozen python -m tbot doctor $Config
+& $uv @run --quiet python -m tbot doctor $Config
 if ($LASTEXITCODE -ne 0) {
     Write-Output "doctor reports a problem: fix the FAIL lines above, then run tbot doctor again"
     exit 1

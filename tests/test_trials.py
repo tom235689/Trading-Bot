@@ -82,3 +82,12 @@ def test_log_lines_end_in_lf(tmp_path: Path) -> None:
     log = TrialLog(tmp_path / "trials.jsonl")
     log.append([make_record(CONFIG, metrics(1.0), "sweep")])
     assert b"\r\n" not in log.path.read_bytes()
+
+
+def test_a_line_cut_by_a_crash_is_skipped_and_kept_apart(tmp_path: Path) -> None:
+    log = TrialLog(tmp_path / "trials.jsonl")
+    log.append([make_record(CONFIG, metrics(1.0), "sweep")])
+    with log.path.open("ab") as file:
+        file.write(b'{"time": "2026-10-09T08')  # the process died while appending
+    log.append([make_record(CONFIG, metrics(0.5), "sweep")])
+    assert [record.sharpe for record in log.read()] == [1.0, 0.5]

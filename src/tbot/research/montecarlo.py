@@ -1,7 +1,8 @@
 """Monte Carlo on the equity curve: how bad could the drawdown have been?
 
-Daily returns are resampled in blocks (a moving block bootstrap). Losses while a trade is
-still open count, and so do streaks of bad days, which shuffling closed trades would hide.
+The returns of every bar are resampled in blocks of whole days (a moving block bootstrap).
+Losses while a trade is still open count, and so do streaks of bad days, which shuffling
+closed trades would hide.
 """
 
 import math

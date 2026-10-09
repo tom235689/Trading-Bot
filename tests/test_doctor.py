@@ -160,7 +160,7 @@ def test_ledger_and_heartbeat_problems(tmp_path: Path) -> None:
         )
     )
     assert found["ledger"][0][0] == "fail"
-    assert found["heartbeat"] == [("fail", "TBOT_HEARTBEAT_URL must start with https://")]
+    assert found["heartbeat"] == [("fail", "TBOT_HEARTBEAT_URL must be a full http(s):// URL")]
     broken = tmp_path / "broken.sqlite"
     broken.write_text("not a database", encoding="utf-8")
     found = by_name(check(PaperConfig(strategies=STRATEGIES, ledger=broken), settings(), fake()))

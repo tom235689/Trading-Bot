@@ -262,3 +262,16 @@ def test_validation_rejects_a_guard(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="without a guard"):
         load_validation_config(path)
+
+
+def test_a_lone_peak_among_failing_neighbors_is_no_plateau(data_dir: Path) -> None:
+    grid = {"entry": [5, 10, 15, 20, 25]}
+    runs = run_sweep(BASE, grid, data_dir)
+    scores = [1.5, -1.0, 2.0, -1.0, 1.5]  # 10 and 20 trade too little to qualify
+    trades = [40, 5, 40, 5, 40]
+    scored = [
+        replace(run, metrics=replace(run.metrics, sharpe=score, trades=count))
+        for run, score, count in zip(runs, scores, trades, strict=True)
+    ]
+    assert select_run(scored, grid, "sharpe", 30, "neighborhood").params != {"entry": 15}
+    assert neighborhood_mean(scored, grid, {"entry": 15}, "sharpe", 30) == pytest.approx(0.0)

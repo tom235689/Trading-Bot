@@ -8,6 +8,7 @@ import sys
 import webbrowser
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from time import monotonic, sleep
@@ -23,6 +24,7 @@ from tbot.backtest.config import load_config
 from tbot.backtest.metrics import compute_metrics
 from tbot.backtest.report import format_metrics
 from tbot.backtest.runner import data_ends, run_backtest
+from tbot.core.config import TradingConfig
 from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.http import describe_error, retry_after
@@ -34,7 +36,7 @@ from tbot.live.compare import compare_session, comparison_text
 from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings, save_settings
 from tbot.live.doctor import Check, checks_text, run_checks
 from tbot.live.ledger import Ledger, LedgerUnavailable
-from tbot.live.overview import overview_text, session_row
+from tbot.live.overview import broken_row, overview_text, session_row
 from tbot.live.runner import (
     STOP_REQUEST_SECONDS,
     AlreadyRunning,
@@ -143,7 +145,9 @@ def read_yaml(path: Path) -> dict[str, Any]:
         raise ConfigError(f"{path}: no such config (names in {CONFIG_DIR}/: {names})") from None
     except OSError as exc:
         raise ConfigError(f"{path}: cannot read ({exc.strerror})") from None
-    except yaml.YAMLError as exc:
+    except UnicodeDecodeError:
+        raise ConfigError(f"{path}: not UTF-8 text; save it as UTF-8") from None
+    except (yaml.YAMLError, ValueError) as exc:  # ValueError: a date such as 2024-02-30
         raise ConfigError(f"{path}: not valid YAML: {exc}") from None
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: expected a mapping of settings")
@@ -187,29 +191,66 @@ def load_live_config(path: Path) -> LiveConfig:
     return load(path, lambda path: LiveConfig.model_validate(read_yaml(path)))
 
 
-def session_configs(*, live: bool = False) -> list[tuple[Path, SessionConfig]]:
-    """The paper, testnet, and live configs in config/, one per ledger, paper first."""
+@dataclass(frozen=True)
+class Broken:
+    """A session config in config/ that does not load, and the ledger it names if any."""
+
+    path: Path
+    problem: str
+    ledger: Path | None
+
+
+def scan_configs() -> tuple[list[tuple[Path, SessionConfig]], list[Broken]]:
+    """The paper, testnet, and live configs in config/, one per ledger, paper first.
+
+    Configs that look like sessions but do not load come back apart, so a session still
+    running on one can be shown and stopped.
+    """
     order = {"paper": 0, "testnet": 1, "live": 2}
     found: dict[Path, tuple[Path, SessionConfig]] = {}
+    broken: list[Broken] = []
     for path in sorted(CONFIG_DIR.glob("*.yaml"), key=lambda p: (order.get(p.stem, 3), p.stem)):
         try:
             raw = read_yaml(path)
-            if "ledger" not in raw and "mode" not in raw:
-                continue  # a backtest or validation config
+        except ConfigError as exc:
+            broken.append(Broken(path, str(exc.code), None))
+            continue
+        if "ledger" not in raw and "mode" not in raw:
+            continue  # a backtest or validation config
+        try:
             config = load_session_config(path)
-        except ConfigError:
-            continue  # reported when it is named
-        if not live or isinstance(config, LiveConfig):
-            found.setdefault(config.ledger.resolve(), (path, config))
-    return list(found.values())
+        except ConfigError as exc:
+            named = raw.get("ledger")
+            broken.append(
+                Broken(path, str(exc.code), Path(named) if isinstance(named, str) else None)
+            )
+            continue
+        found.setdefault(config.ledger.resolve(), (path, config))
+    return list(found.values()), broken
+
+
+def session_configs(*, live: bool = False) -> list[tuple[Path, SessionConfig]]:
+    sessions, _ = scan_configs()
+    return [(path, c) for path, c in sessions if not live or isinstance(c, LiveConfig)]
 
 
 def running_configs() -> list[Path]:
-    return [
-        path
-        for path, config in session_configs()
-        if config.ledger.is_file() and is_running(config.ledger)
-    ]
+    """Configs whose session runs, including one whose file no longer loads."""
+    sessions, broken = scan_configs()
+    ledgers = [(path, config.ledger) for path, config in sessions]
+    ledgers += [(b.path, b.ledger) for b in broken if b.ledger is not None]
+    return [path for path, ledger in ledgers if ledger.is_file() and is_running(ledger)]
+
+
+def stop_ledger(path: Path) -> Path:
+    """The ledger a stop request goes next to; a config that no longer loads still names it."""
+    try:
+        return load_session_config(path).ledger
+    except ConfigError:
+        named = read_yaml(path).get("ledger")
+        if isinstance(named, str):
+            return Path(named)
+        raise
 
 
 def pick_config(command: str, *, live: bool = False) -> Path:
@@ -246,8 +287,8 @@ def which(command: str, paths: list[Path], what: str) -> str:
 
 
 CONFIG_HELP = "a config file, or a name from config/ such as donchian_voltarget"
-SESSION_HELP = "a config file or a name from config/ (paper, testnet, live); default: {}"
-ANY_SESSION = "the running session, else the only one that has run"
+SESSION_HELP = "a config file or a name from config/ ({}); default: {}"
+ANY_SESSION = "the running session, else the only one that has run, else paper"
 EPILOG = """\
 start here:
   tbot doctor         check the setup before a session
@@ -275,12 +316,20 @@ def build_parser() -> argparse.ArgumentParser:
     def command(name: str, text: str) -> argparse.ArgumentParser:
         return commands.add_parser(name, help=text, description=text[0].upper() + text[1:] + ".")
 
-    def session(name: str, text: str, default: str = ANY_SESSION) -> argparse.ArgumentParser:
+    def session(
+        name: str, text: str, default: str = ANY_SESSION, names: str = "paper, testnet, live"
+    ) -> argparse.ArgumentParser:
         parser = command(name, text)
-        parser.add_argument("config", nargs="?", type=config_arg, help=SESSION_HELP.format(default))
+        parser.add_argument(
+            "config", nargs="?", type=config_arg, help=SESSION_HELP.format(names, default)
+        )
         return parser
 
-    status = session("status", "every session at a glance; with a config, that one in detail")
+    status = session(
+        "status",
+        "every session at a glance; with a config, that one in detail",
+        "every session",
+    )
     status.add_argument("--data-dir", type=Path, default=Path("data"))
 
     paper = command("paper", "paper trade on live Binance data until stopped")
@@ -336,7 +385,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     session("resume", "clear the kill switch of a halted session", "the halted one")
-    session("account", "show exchange balances and open orders (testnet or live)")
+    session(
+        "account",
+        "show exchange balances and open orders (testnet or live)",
+        "the running one, else the only one that has run",
+        "testnet, live",
+    )
 
     download = command("download", "download closed bars from Binance")
     download.add_argument(
@@ -375,7 +429,11 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--no-open", action="store_true", help="do not open the HTML file")
 
     validate = command("validate", "run the validation pipeline")
-    validate.add_argument("config", type=config_arg, help=CONFIG_HELP)
+    validate.add_argument(
+        "config",
+        type=config_arg,
+        help="a validation config, or its name from config/ such as donchian_voltarget_validation",
+    )
     validate.add_argument("--data-dir", type=Path, default=Path("data"))
     validate.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     return parser
@@ -456,15 +514,32 @@ def trial_log(data_dir: Path) -> TrialLog:
     return TrialLog(data_dir / "trials.jsonl")
 
 
-def run_backtest_command(args: argparse.Namespace) -> int:
-    config = load(args.config, load_config)
-    ends = data_ends(config, BarStore(args.data_dir))
+def print_notes(config: TradingConfig, store: BarStore) -> None:
+    """What a backtest of this config cannot show, said before it runs."""
+    ends = data_ends(config, store)
     if len(set(ends.values())) > 1:
         (symbol, timeframe), first = min(ends.items(), key=lambda item: item[1])
         print(
             f"Note: {symbol} {timeframe} data ends {first:%Y-%m-%d %H:%M}; every stream stops "
             "there (`tbot download` brings it up to date)"
         )
+    finest: dict[str, Timeframe] = {}
+    for strategy in config.strategies:
+        for symbol in strategy.symbols:
+            known = finest.get(symbol, strategy.timeframe)
+            finest[symbol] = min(known, strategy.timeframe, key=lambda t: t.millis)
+    if len(set(finest.values())) > 1:
+        print(
+            "Note: symbols trade on different bars ("
+            + ", ".join(f"{symbol} {tf}" for symbol, tf in sorted(finest.items()))
+            + "); a buy paid for by another symbol's sale fills when that sale has, a few bars "
+            "later than in paper and live trading"
+        )
+
+
+def run_backtest_command(args: argparse.Namespace) -> int:
+    config = load(args.config, load_config)
+    print_notes(config, BarStore(args.data_dir))
     result = run_backtest(config, BarStore(args.data_dir))
     metrics = compute_metrics(result)
     trial_log(args.data_dir).append([make_record(config, metrics, "backtest")])
@@ -515,6 +590,7 @@ def run_dashboard_command(args: argparse.Namespace) -> int:
 
 def run_validate_command(args: argparse.Namespace) -> int:
     config, base = load(args.config, load_validation_config)
+    print_notes(base, BarStore(args.data_dir))
     report = run_validation(
         config,
         base,
@@ -570,7 +646,9 @@ def log_path(config: Path) -> Path:
 def run_status_command(args: argparse.Namespace) -> int:
     store = BarStore(args.data_dir)
     if args.config is None:
-        rows = [session_row(path.stem, config, store) for path, config in session_configs()]
+        sessions, broken = scan_configs()
+        rows = [session_row(path.stem, config, store) for path, config in sessions]
+        rows += [broken_row(b.path.stem, b.problem, b.ledger) for b in broken]
         print(overview_text(rows))
         return 0
     print(status_text(existing_ledger(load_session_config(args.config)), store))
@@ -585,7 +663,10 @@ def run_log_command(args: argparse.Namespace) -> int:
     size = 0
     if path.is_file():
         lines, size = tail(path, args.lines, minimum)
-        print("\n".join(lines) if lines else f"{path} has no lines at level {args.level} or above")
+        if lines:
+            print("\n".join(lines))
+        elif args.lines > 0:
+            print(f"{path} has no lines at level {args.level} or above")
     elif not args.follow:
         print(f"no log at {path} yet: a session writes it while it runs")
         return EXIT_ERROR
@@ -611,10 +692,14 @@ def run_doctor_command(args: argparse.Namespace) -> int:
 
 def run_stop_command(args: argparse.Namespace) -> int:
     if args.cancel:
-        paths = [args.config] if args.config else [path for path, _ in session_configs()]
+        if args.config:
+            paths = [args.config]
+        else:
+            sessions, broken = scan_configs()
+            paths = [path for path, _ in sessions] + [b.path for b in broken if b.ledger]
         withdrawn = False
         for path in paths:
-            request = stop_path(load_session_config(path).ledger)
+            request = stop_path(stop_ledger(path))
             if request.exists():
                 request.unlink(missing_ok=True)
                 print(f"stop request for {short_name(path)} withdrawn")
@@ -627,25 +712,31 @@ def run_stop_command(args: argparse.Namespace) -> int:
         running = running_configs()
         if len(running) > 1:
             raise ConfigError(which("stop", running, "running"))
-        if not running:
-            print("no session is running")
-            return 0
-        path = picked(running[0])
-    config = existing_ledger(load_session_config(path))
-    request = stop_path(config.ledger)
+        if running:
+            path = picked(running[0])
+        else:
+            started = [p for p, config in session_configs() if config.ledger.is_file()]
+            if len(started) != 1:
+                print("no session is running")
+                return 0
+            path = picked(started[0])  # its supervisor may be about to start it again
+    ledger = stop_ledger(path)
+    if not ledger.is_file():
+        raise ConfigError(f"no ledger at {ledger}: nothing has run with this config yet")
+    request = stop_path(ledger)
     request.write_text("stop\n", encoding="utf-8")  # also stops a restart by the supervisor
     later = (
-        f"a session that starts in the next {STOP_REQUEST_SECONDS // 60} minutes "
-        "(a supervisor's restart) stops at once"
+        f"a supervisor's restart in the next {STOP_REQUEST_SECONDS // 60} minutes stops at "
+        f"once (`tbot stop --cancel` withdraws it)"
     )
-    if not is_running(config.ledger):
-        print(f"no session is running on {config.ledger}; {later}")
+    if not is_running(ledger):
+        print(f"no session is running on {ledger}; {later}")
         return 0
-    print(f"asked the session on {config.ledger} to stop; it finishes the event in progress")
+    print(f"asked the session on {ledger} to stop; it finishes the event in progress")
     deadline = monotonic() + args.timeout
     while monotonic() < deadline:
         sleep(1.0)
-        if not is_running(config.ledger):
+        if not is_running(ledger):
             if request.exists():  # it ended some other way, such as a crash
                 print(f"the session ended without taking the request; {later}")
             else:
@@ -692,6 +783,12 @@ def run_resume_command(args: argparse.Namespace) -> int:
         if not halted:
             print("no session is halted")
             return 0
+        config = load_session_config(halted[0])
+        if isinstance(config, LiveConfig) and config.mode == "live":
+            raise ConfigError(
+                f"the halted session trades real money: name it to resume it: "
+                f"tbot resume {short_name(halted[0])}"
+            )
         path = picked(halted[0])
     print(resume(existing_ledger(load_session_config(path))))
     return 0
@@ -788,9 +885,13 @@ async def find_chat(bot: Telegram, name: str) -> str | None:
     except httpx.HTTPError as exc:
         busy = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 409
         print(
-            "a running session reads this bot's messages (telegram_commands): stop it first"
-            if busy
-            else f"cannot read the bot's messages ({describe_error(exc)})"
+            f"cannot read the bot's messages ({describe_error(exc)})"
+            + (
+                ": another program reads them, such as a running session with "
+                "telegram_commands, or a webhook"
+                if busy
+                else ""
+            )
         )
         return None
     if not chats:
@@ -798,7 +899,14 @@ async def find_chat(bot: Telegram, name: str) -> str | None:
         return None
     ids = list(chats)
     if len(ids) == 1:
-        return ids[0]
+        print(f"found chat {ids[0]} {chats[ids[0]]}".rstrip())
+        if not interactive():
+            return ids[0]
+        answer = input("Send the alerts to this chat? [Y/n] ").strip().lower()
+        if answer in ("", "y", "yes"):
+            return ids[0]
+        print("not saved: send the bot a message from the chat you want, then run it again")
+        return None
     for number, chat in enumerate(ids, 1):
         print(f"{number}. chat {chat} {chats[chat]}".rstrip())
     if interactive():
@@ -858,6 +966,9 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(str(exc), EXIT_LEDGER, alert=session and isinstance(exc, LedgerUnavailable))
     except UnicodeDecodeError as exc:  # .env or a config saved as UTF-16: fix the file
         return _fail(f"error: {brief(exc)}", EXIT_CONFIG, alert=False)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return EXIT_ERROR
     except Exception as exc:  # one line; TBOT_DEBUG=1 shows the traceback
         if os.environ.get("TBOT_DEBUG"):
             raise

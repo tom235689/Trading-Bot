@@ -3,6 +3,7 @@
 import json
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 LEVELS = ("debug", "info", "warning", "error", "critical")
@@ -72,21 +73,31 @@ def follow(
     """Print lines as they are written, from byte `start`; a rotated log starts over."""
     position = start
     pending = b""
+
+    def read(source: Path, end: int) -> None:
+        nonlocal position, pending
+        with source.open("rb") as handle:
+            handle.seek(position)
+            data = handle.read(end - position)
+        position += len(data)
+        *complete, pending = (pending + data).split(b"\n")
+        for raw in complete:
+            line = raw.decode("utf-8", errors="replace")
+            if line.strip() and level_rank(line) >= minimum:
+                emit(format_line(line))
+
     while not stop():
         try:
             size = path.stat().st_size
         except FileNotFoundError:
             size = 0
-        if size < position:  # rotated: a new, shorter file
+        if size < position:  # rotated: finish the old file, now .1, then start the new one
+            old = path.with_name(path.name + ".1")
+            with suppress(OSError):
+                end = old.stat().st_size
+                if end > position:
+                    read(old, end)
             position, pending = 0, b""
         if size > position:
-            with path.open("rb") as handle:
-                handle.seek(position)
-                data = handle.read(size - position)
-            position += len(data)
-            *complete, pending = (pending + data).split(b"\n")
-            for raw in complete:
-                line = raw.decode("utf-8", errors="replace")
-                if line.strip() and level_rank(line) >= minimum:
-                    emit(format_line(line))
+            read(path, size)
         time.sleep(interval)

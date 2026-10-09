@@ -24,7 +24,7 @@ from tbot.live.config import PaperConfig, Settings
 from tbot.live.executor import Executor, PaperExecutor
 from tbot.live.feed import LiveFeed
 from tbot.live.ledger import Ledger
-from tbot.live.runner import Context, Health, reconcile_loop, run_paper, run_session
+from tbot.live.runner import Context, Health, reconcile_loop, run_paper, run_session, stop_path
 from tbot.risk.guard import GuardConfig
 
 H4 = Timeframe.H4
@@ -135,6 +135,27 @@ def test_a_paper_session_trades_a_bar_and_stops_cleanly(
         assert ledger.latest_equity() is not None
 
 
+def test_a_start_by_hand_drops_a_stop_request_left_for_a_supervisor(
+    tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TBOT_SUPERVISED", raising=False)
+    notifier, _ = offline
+    config, _, _ = setup_store(tmp_path)
+    stop_path(config.ledger).write_text("stop\n", encoding="utf-8")  # an earlier `tbot stop`
+
+    async def scenario() -> int:
+        stop = asyncio.Event()
+        session = asyncio.create_task(
+            run_paper(config, Settings(_env_file=None), tmp_path / "data", stop=stop)  # type: ignore[call-arg]
+        )
+        await until(lambda: any("started" in m for m in notifier.messages))
+        stop.set()
+        return await session
+
+    assert asyncio.run(scenario()) == 0
+    assert not stop_path(config.ledger).exists()  # taken away, not obeyed
+
+
 def test_a_crashed_task_ends_the_session_with_an_alert(
     tmp_path: Path, offline: tuple[Collect, list[LiveFeed]]
 ) -> None:
@@ -205,11 +226,26 @@ def test_a_network_error_at_start_is_told_in_one_line() -> None:
     forbidden = httpx.HTTPStatusError(
         "403", request=request, response=httpx.Response(403, request=request)
     )
-    assert runner.start_problem(forbidden) == (
+    assert runner.start_problem(forbidden) == (  # Binance's firewall: it passes
         "HTTP 403 from data-api.binance.vision; often brief: a supervised bot tries again, "
         "by hand start it again"
     )
+    body = '{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}'
+    rejected = httpx.HTTPStatusError(
+        "401", request=request, response=httpx.Response(401, text=body, request=request)
+    )
+    assert runner.start_problem(rejected) == (
+        f"HTTP 401 from data-api.binance.vision: {body}; a supervised bot tries again, but if "
+        "it keeps failing, check the API key, its IP restriction, and the network"
+    )
+    busy = httpx.HTTPStatusError(
+        "503", request=request, response=httpx.Response(503, text="<html>", request=request)
+    )
+    assert runner.start_problem(busy) == (
+        "HTTP 503 from data-api.binance.vision; often brief: a supervised bot tries again, "
+        "by hand start it again"
+    )
     assert runner.start_problem(httpx.ConnectError("down", request=request)).startswith(
-        "network error ConnectError;"
+        "network error ConnectError; often brief"
     )
     assert runner.start_problem(ValueError("no keys")) == "no keys"

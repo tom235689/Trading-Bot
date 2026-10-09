@@ -1,7 +1,7 @@
 # Example of two strategies running together: 4h trend following and 1h mean reversion.
 # Run `tbot backtest config/multi.yaml --attribution` to see each alone and the combination.
 # Not a recommendation: on 2018-2026 data the RSI leg loses money alone and lowers the mix's
-# Sharpe below Donchian alone (see docs/reports). It shows the machinery, not an edge.
+# Sharpe below Donchian alone (see docs/DESIGN.md, Attribution). It shows the machinery, not an edge.
 start: 2018-01-01
 initial_cash: 10000
 costs:

@@ -2,6 +2,8 @@
 
 Date: 2026-09-29. Config: `config/donchian_voltarget_validation.yaml` (base `config/donchian_voltarget.yaml`). Data: Binance spot 4h bars, 2018-01-01 to 2026-09-28. Compare with `donchian_trend_2026-09-24.md` (same strategy, full exposure).
 
+**Superseded** by `donchian_voltarget_2026-10-05.md`, which repeats this validation with corrected tools; its verdict replaces the one below. Configs have changed since: the per-symbol cap in `config/live.yaml` is now 0.5.
+
 ## Verdict
 
 Gate FAILED on one of five checks, narrowly: out-of-sample max drawdown -27.0% against a -25% limit (was -28.5% at full exposure). Everything else passed with room to spare. Volatility targeting did what it was meant to do: the same signals, less exposure in violent periods, better risk-adjusted returns. The remaining drawdown comes from one walk-forward window (2022) where the grid search chose an atypical parameter set (entry 90, exit 40) that lost 14%; that is parameter-selection instability, not exposure.

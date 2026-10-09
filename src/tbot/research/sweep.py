@@ -1,6 +1,7 @@
 """One backtest per parameter combination."""
 
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
@@ -53,6 +54,8 @@ def run_sweep(
     points = grid_points(grid)
     configs = [base.with_params(point) for point in points]
     jobs = [(config.model_dump_json(), str(data_dir)) for config in configs]
+    if sys.platform == "win32":
+        workers = min(workers, 61)  # the most a process pool takes on Windows
     if workers > 1:
         with ProcessPoolExecutor(max_workers=workers) as pool:
             raw = list(pool.map(_evaluate_job, jobs))
@@ -128,11 +131,20 @@ def neighborhood_mean(
     def near(params: Mapping[str, Any]) -> bool:
         return all(abs(index[n][params[n]] - index[n][center[n]]) <= 1 for n in grid)
 
-    values = [
-        objective_value(run.metrics, objective, min_trades) for run in runs if near(run.params)
-    ]
-    finite = [value for value in values if math.isfinite(value)]
-    return sum(finite) / len(finite) if finite else math.nan
+    scores = [objective_value(run.metrics, objective, min_trades) for run in runs]
+    # A neighbor with too few trades counts, not as missing, but as no better than its own
+    # result, break-even, or the worst qualifying run: else a lone peak among failing
+    # neighbors would look like a plateau.
+    floor = min((score for score in scores if math.isfinite(score)), default=0.0)
+    values = []
+    for run, score in zip(runs, scores, strict=True):
+        if not near(run.params):
+            continue
+        if not math.isfinite(score):
+            raw = float(getattr(run.metrics, objective))
+            score = min(raw if math.isfinite(raw) else 0.0, 0.0, floor)
+        values.append(score)
+    return sum(values) / len(values) if values else math.nan
 
 
 def rank_of(runs: Sequence[SweepRun], params: Mapping[str, Any], objective: str) -> int:

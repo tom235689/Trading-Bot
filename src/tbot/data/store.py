@@ -84,6 +84,8 @@ class BarStore:
                 # Write then rename so a crash never leaves a partial file.
                 tmp = file.with_suffix(f".{os.getpid()}.tmp")
                 merged.sort("open_time").write_parquet(tmp)
+                with tmp.open("rb+") as handle:  # on disk before it replaces the old file
+                    os.fsync(handle.fileno())
                 _replace(tmp, file)
 
 

@@ -17,7 +17,7 @@ from tbot.live.commands import HELP
 from tbot.live.config import LiveConfig, PaperConfig, Settings, load_paper_config
 from tbot.live.executor import PaperExecutor
 from tbot.live.history import BarHistory
-from tbot.live.ledger import Ledger
+from tbot.live.ledger import Adjustment, Ledger
 from tbot.live.runner import (
     GUARD_META,
     AlreadyRunning,
@@ -410,6 +410,7 @@ def test_a_stop_request_ends_a_session_as_it_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)  # no .env
+    monkeypatch.setenv("TBOT_SUPERVISED", "1")  # a restart by scripts/run_bot.ps1
     config = paper_config(tmp_path)
     stop_path(config.ledger).write_text("stop\n", encoding="utf-8")  # `tbot stop` while it waited
     assert asyncio.run(run_paper(config, Settings(), tmp_path / "data")) == 0
@@ -535,4 +536,15 @@ def test_the_checkpoint_waits_for_the_event_to_finish(tmp_path: Path) -> None:
         asyncio.run(trader.handle({BTC: BARS.slice(1, 1)}))
     after = load_checkpoint(trader.session.config, ledger)  # type: ignore[arg-type]
     assert after == before  # a restart hands the 02:00 bar over again
+    ledger.close()
+
+
+def test_the_daily_change_leaves_out_money_put_in(tmp_path: Path) -> None:
+    trader, ledger, _ = make_trader(tmp_path, {at(1): {"BTC": 0.0}}, FakePrices({"BTC": 100.0}))
+    asyncio.run(trader.handle({BTC: BARS.slice(0, 1)}))
+    later = at(1) + timedelta(days=1, hours=1)
+    ledger.add_adjustment(Adjustment(at(2), "", 0.0, 500.0, "budget raised"))
+    trader.session.portfolio.adjust("", 0.0, 500.0)
+    summary = summary_text(trader.session, ledger, later, "paper")
+    assert "(+0.00% over 24h" in summary  # 1000 to 1500, all of it a deposit
     ledger.close()

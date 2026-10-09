@@ -63,3 +63,23 @@ def test_follow_prints_new_lines_and_starts_over_after_a_rotation(tmp_path: Path
 
     follow(path, emit, start=len(old), minimum=LEVELS.index("info"), interval=0, stop=stop)
     assert seen == ["new", "rotated"]
+
+
+def test_follow_finishes_the_old_file_before_the_new_one(tmp_path: Path) -> None:
+    path = tmp_path / "paper.jsonl"
+    first = record("first")
+    path.write_bytes(first)
+    seen: list[str] = []
+    polls = 0
+
+    def stop() -> bool:
+        nonlocal polls
+        polls += 1
+        if polls == 1:  # between two polls: one more line, then the handler rotates
+            path.write_bytes(first + record("last of the old"))
+            path.replace(tmp_path / "paper.jsonl.1")
+            path.write_bytes(record("new"))
+        return polls > 1
+
+    follow(path, lambda line: seen.append(line.split()[3]), start=len(first), interval=0, stop=stop)
+    assert seen == ["last", "new"]

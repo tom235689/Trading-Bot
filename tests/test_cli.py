@@ -12,7 +12,9 @@ import pytest
 
 from binance_fake import make_bars
 from tbot import __version__
+from tbot.backtest.config import BacktestConfig
 from tbot.cli import (
+    COMMANDS,
     EXIT_CONFIG,
     EXIT_ERROR,
     EXIT_LEDGER,
@@ -23,6 +25,7 @@ from tbot.cli import (
     main,
     parse_symbol,
     pick_config,
+    print_notes,
     write_dashboard,
 )
 from tbot.core.timeframe import Timeframe
@@ -420,7 +423,7 @@ def test_notify_guides_a_first_setup_and_saves_it(
     no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     telegram = FakeTelegram(monkeypatch, [[], [message(42, "Tom")]])
-    answers = iter(["  123:abc  "])
+    answers = iter(["  123:abc  ", ""])  # the token, then Enter: yes, this chat
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
     monkeypatch.setattr("tbot.cli.interactive", lambda: True)
     assert main(["notify"]) == 0
@@ -479,3 +482,120 @@ def test_a_dashboard_opens_only_for_a_person(
     assert opened == []
     write_dashboard(data, out, show=True)
     assert opened == [out.resolve().as_uri()]
+
+
+def test_a_config_that_cannot_be_read_is_named_and_hides_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    (tmp_path / "config" / "korean.yaml").write_bytes("ledger: x\n".encode("utf-16"))
+    (tmp_path / "config" / "date.yaml").write_text("start: 2024-02-30\n", "utf-8")
+    assert main(["status", "korean"]) == EXIT_CONFIG
+    assert "korean.yaml: not UTF-8 text" in capsys.readouterr().err
+    assert main(["status", "date"]) == EXIT_CONFIG
+    assert "date.yaml: not valid YAML" in capsys.readouterr().err
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "paper    not started" in out
+    assert "korean   invalid" in out
+
+
+def test_stop_finds_a_session_whose_config_no_longer_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    Ledger(tmp_path / "paper.sqlite").close()
+    with instance_lock(tmp_path / "paper.sqlite"):  # running on settings edited since
+        (tmp_path / "config" / "paper.yaml").write_text(
+            "ledger: paper.sqlite\nstrategies: []\n", "utf-8"
+        )
+        assert main(["stop", "--timeout", "0"]) == EXIT_ERROR  # asked; it did not react
+        assert "asked the session on paper.sqlite to stop" in capsys.readouterr().out
+    assert stop_path(tmp_path / "paper.sqlite").exists()
+    assert main(["stop", "--cancel"]) == 0
+    assert capsys.readouterr().out == "stop request for paper withdrawn\n"
+
+
+def test_stop_reaches_a_supervisor_about_to_restart_the_only_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    Ledger(tmp_path / "testnet.sqlite").close()  # crashed; its supervisor waits
+    assert main(["stop"]) == 0
+    assert "no session is running on testnet.sqlite; a supervisor's restart" in (
+        capsys.readouterr().out
+    )
+    assert stop_path(tmp_path / "testnet.sqlite").exists()
+
+
+def test_resume_never_picks_a_real_money_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "live.yaml").write_text(
+        f"mode: live\nledger: live.sqlite\nstrategies:\n{STRATEGY}", "utf-8"
+    )
+    with Ledger(tmp_path / "live.sqlite") as ledger:
+        state = GuardState(peak_equity=100.0, halted=True, halt_reason="drawdown 50%")
+        ledger.set_meta(GUARD_META, state.model_dump_json())
+    assert main(["resume"]) == EXIT_CONFIG
+    assert "trades real money: name it to resume it: tbot resume live" in capsys.readouterr().err
+    assert main(["resume", "live"]) == 0  # named: done
+    assert "resumed" in capsys.readouterr().out
+
+
+def test_ctrl_c_ends_a_command_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def interrupted(args: object) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setitem(COMMANDS, "status", interrupted)
+    assert main(["status"]) == EXIT_ERROR
+    assert capsys.readouterr().err == "interrupted\n"
+
+
+def test_save_settings_sets_every_copy_of_a_key(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_bytes(b"TBOT_TELEGRAM_CHAT_ID=1\nTBOT_TELEGRAM_CHAT_ID=\n")
+    save_settings(env, {"TBOT_TELEGRAM_CHAT_ID": "42"})
+    assert env.read_bytes() == b"TBOT_TELEGRAM_CHAT_ID=42\nTBOT_TELEGRAM_CHAT_ID=42\n"
+
+
+def test_log_with_no_lines_asked_for_prints_only_new_ones(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "paper.jsonl"
+    path.write_bytes(b'{"event": "old", "level": "info"}\n')
+    assert main(["log", "--file", str(path), "-n", "0"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_backtest_notes_symbols_that_trade_on_different_bars(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = BacktestConfig.model_validate(
+        {
+            "start": "2024-01-01",
+            "strategies": [
+                {
+                    "name": "donchian_trend",
+                    "symbols": ["BTCUSDT", "ETHUSDT"],
+                    "timeframe": "4h",
+                    "allocation": 0.5,
+                },
+                {
+                    "name": "rsi_reversion",
+                    "symbols": ["BTCUSDT"],
+                    "timeframe": "1h",
+                    "allocation": 0.5,
+                },
+            ],
+        }
+    )
+    print_notes(config, BarStore(tmp_path))
+    assert "symbols trade on different bars (BTCUSDT 1h, ETHUSDT 4h)" in capsys.readouterr().out

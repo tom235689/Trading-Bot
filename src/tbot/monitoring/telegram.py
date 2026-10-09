@@ -36,7 +36,9 @@ class Telegram:
         """The bot's username. Raises httpx errors (401 for a wrong token); never log their URL."""
         response = await self.client.get(f"{self.base}/getMe", timeout=15.0)
         response.raise_for_status()
-        return str((response.json().get("result") or {}).get("username", ""))
+        body = response.json()
+        result = body.get("result") if isinstance(body, dict) else None
+        return str(result.get("username", "")) if isinstance(result, dict) else ""
 
     async def updates(self, offset: int | None, timeout: int) -> list[dict[str, Any]]:
         """Messages sent to the bot (long poll). Raises httpx errors; never log their URL."""

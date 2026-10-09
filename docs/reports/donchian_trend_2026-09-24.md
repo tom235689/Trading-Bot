@@ -2,6 +2,8 @@
 
 Date: 2026-09-24. Config: `config/donchian_validation.yaml`. Data: Binance spot 4h bars, 2018-01-01 to 2026-09-23.
 
+**Superseded** by `donchian_voltarget_2026-10-05.md`, which repeats the full-exposure candidate with corrected tools; its verdict replaces the one below.
+
 ## Verdict
 
 Gate FAILED on one of five checks: the out-of-sample max drawdown is -28.5% against a -25% limit. Everything else passed. The strategy has a real but modest edge whose cost is deep drawdowns; at 100% exposure it cannot meet the drawdown limit. The next lever is exposure control (volatility targeting, per-symbol caps), not parameter tuning.

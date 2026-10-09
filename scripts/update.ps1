@@ -19,6 +19,7 @@ tbot update -DryRun
 tbot update
 powershell -ExecutionPolicy Bypass -File scripts\update.ps1
 #>
+[CmdletBinding()]
 param(
     [switch] $DryRun,  # only show the tasks and what would be done
     [int] $StopTimeoutSeconds = 120,
@@ -28,7 +29,6 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
-$uv = (Get-Command uv -ErrorAction Stop).Source
 $runner = (Join-Path $PSScriptRoot "run_bot.ps1").ToLowerInvariant()
 $venv = (Join-Path $repo ".venv").ToLowerInvariant()
 $StashName = "tbot update"
@@ -44,6 +44,7 @@ function Invoke-Tbot([string[]] $arguments) {
 }
 
 function Get-Version {
+    $ErrorActionPreference = "Continue"  # under Stop, a line on stderr would throw
     $text = & $uv run --quiet --frozen python -m tbot --version 2>$null
     if ($LASTEXITCODE -eq 0) { return [string] $text } else { return "an unknown version" }
 }
@@ -54,21 +55,21 @@ function Get-VenvProcesses {
     })
 }
 
-$tasks = @(Get-ScheduledTask | ForEach-Object {
-    $action = $_.Actions | Where-Object {
-        $_.Arguments -and $_.Arguments.ToLowerInvariant().Contains($runner)
-    } | Select-Object -First 1
-    if ($action) {
-        $config = if ($action.Arguments -match '-Config "([^"]+)"') { $Matches[1] } else { "" }
-        [pscustomobject] @{ Name = $_.TaskName; State = [string] $_.State; Config = $config }
-    }
-})
-if ($tasks -and -not $DryRun -and -not $Elevated -and -not (Test-Admin)) {
-    exit (Invoke-Elevated $PSCommandPath $PSBoundParameters)
-}
-
 $exitCode = 0
 try {
+    $uv = (Get-Command uv -ErrorAction Stop).Source
+    $tasks = @(Get-ScheduledTask | ForEach-Object {
+        $action = $_.Actions | Where-Object {
+            $_.Arguments -and $_.Arguments.ToLowerInvariant().Contains($runner)
+        } | Select-Object -First 1
+        if ($action) {
+            $config = if ($action.Arguments -match '-Config "([^"]+)"') { $Matches[1] } else { "" }
+            [pscustomobject] @{ Name = $_.TaskName; State = [string] $_.State; Config = $config }
+        }
+    })
+    if ($tasks -and -not $DryRun -and -not $Elevated -and -not (Test-Admin)) {
+        exit (Invoke-Elevated $PSCommandPath $PSBoundParameters)
+    }
     foreach ($task in $tasks) { Write-Output "task '$($task.Name)': $($task.State), $($task.Config)" }
     if (-not $tasks) { Write-Output "no scheduled tbot task for $repo" }
     $running = @($tasks | Where-Object { $_.State -eq "Running" })
@@ -95,7 +96,10 @@ try {
         foreach ($task in $running) {
             Write-Output "stopping '$($task.Name)'"
             $code = Invoke-Tbot @("stop", $task.Config, "--timeout", "$StopTimeoutSeconds")
-            if ($code -ne 0) { throw "'$($task.Name)' did not stop in time" }
+            if ($code -ne 0) {
+                $null = Invoke-Tbot @("stop", $task.Config, "--cancel")  # it keeps running
+                throw "'$($task.Name)' did not stop in time"
+            }
             # The bot is gone; a supervisor still running is waiting to restart it: end it.
             $deadline = (Get-Date).AddSeconds(30)
             while ((Get-ScheduledTask -TaskName $task.Name).State -eq "Running") {

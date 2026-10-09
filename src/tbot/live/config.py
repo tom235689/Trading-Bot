@@ -79,9 +79,9 @@ def save_settings(path: Path, values: dict[str, str]) -> None:
     for key, value in values.items():
         line = f"{key}={value}"
         found = [i for i, old in enumerate(lines) if old.split("=", 1)[0].strip() == key]
-        if found:
-            lines[found[0]] = line
-        else:
+        for i in found:  # every copy: the last one is the one that counts
+            lines[i] = line
+        if not found:
             lines.append(line)
     partial = path.with_name(path.name + ".partial")
     partial.write_bytes((newline.join(lines) + newline).encode("utf-8"))

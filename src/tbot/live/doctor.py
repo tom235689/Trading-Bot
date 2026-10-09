@@ -208,7 +208,10 @@ def alert_checks(settings: Settings) -> list[Check]:
             Check("warn", "heartbeat", "not configured: nobody hears about a dead bot"),
         ]
     if not valid_url(url):
-        return [telegram, Check("fail", "heartbeat", "TBOT_HEARTBEAT_URL must start with https://")]
+        return [
+            telegram,
+            Check("fail", "heartbeat", "TBOT_HEARTBEAT_URL must be a full http(s):// URL"),
+        ]
     return [telegram]  # pinged once the network is known to work
 
 

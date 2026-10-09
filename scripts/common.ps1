@@ -20,6 +20,14 @@ function Test-Admin {
     return $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function ConvertTo-Argument([string] $value) {
+    # Quoted so that Windows splits the command line back into this exact value:
+    # backslashes before a quote or at the end are doubled, and quotes are escaped.
+    $escaped = [regex]::Replace($value, '(\\*)"', { param($m) $m.Groups[1].Value * 2 + '\"' })
+    $escaped = [regex]::Replace($escaped, '(\\+)$', { param($m) $m.Groups[1].Value * 2 })
+    return '"' + $escaped + '"'
+}
+
 function Format-Arguments([System.Collections.IDictionary] $bound) {
     # Bound script parameters as a powershell.exe command line.
     $parts = foreach ($key in $bound.Keys) {
@@ -28,7 +36,7 @@ function Format-Arguments([System.Collections.IDictionary] $bound) {
             if ($value.IsPresent) { "-$key" }
         } else {
             "-$key"
-            '"' + ([string] $value) + '"'
+            ConvertTo-Argument ([string] $value)
         }
     }
     return ($parts -join " ")

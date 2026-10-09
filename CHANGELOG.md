@@ -1,8 +1,45 @@
 # Changelog
 
+## 0.4.1 (2026-10-09)
+
+Fixes from five reviews of 0.4.0 (command line, Windows scripts, live path, research, documentation). Upgrade notes:
+- From 0.3.x: update as before with `powershell -ExecutionPolicy Bypass -File scripts\update.ps1` (there is no `tbot` command yet), then run `.\tbot setup -SkipDownload` once to put `tbot` on your PATH. Running bots may keep running: setup now leaves the Python environment alone while one does.
+- From 0.4.0: run this one update with `powershell -ExecutionPolicy Bypass -File scripts\update.ps1` too. A `tbot update` would also work, but the old `tbot.cmd` reads the new one from the wrong place when the update replaces it, prints an error line, and runs the update a second time; from this version on it cannot.
+
+**Command line**
+- One config in `config/` that cannot be read (not UTF-8, a date like 2024-02-30) no longer breaks every command that looks through the folder; it is named in an error when used, and `tbot status` lists it as invalid.
+- `tbot stop` without a config also finds a session whose config no longer loads (by the ledger the file names), and when no session runs but one has, it leaves the request for a supervisor about to restart it. Only a restart by the supervisor obeys such a request: a session you start by hand drops it, so an earlier `tbot stop` no longer ends it at once.
+- `tbot resume` without a config never clears the kill switch of a real-money session; name it.
+- The overview shows a row for a ledger it cannot read instead of failing as a whole, values a reconciled coin the config no longer trades from its stored bars, and leaves deposits and budget changes out of the 24-hour change. The daily Telegram summary leaves them out too.
+- `tbot notify` shows the chat it found and asks before saving it, and passes on what Telegram says when another program reads the bot's messages. Every copy of a key in `.env` is updated, not only the first.
+- A failed start says "often brief" only for errors that are (5xx, rate limits, Binance's firewall, the network); a rejected key or IP says what Binance answered and what to check.
+- `tbot log -f` finishes the old file before following the new one after a rotation; `-n 0` shows only new lines. Ctrl+C ends any command without a traceback. Help texts say what each command takes when no config is given.
+- `tbot backtest` and `tbot validate` say when a stream ends early (the run stops there) and when symbols trade on different bars, where a buy paid for by another symbol's sale fills later than in paper and live trading.
+
+**Windows scripts**
+- `tbot update` can replace `tbot.cmd` safely: the script runs and exits on one line, which cmd has read before the update changes the file.
+- `tbot setup`, `tbot update`, and `tbot autostart` pass the rest of the line on exactly as typed (`=`, `,`, quotes, empty values), and the scripts refuse an unknown option such as `--dry-run` instead of ignoring it and running for real.
+- Values with spaces, quotes, or a trailing backslash survive the switch to an administrator window. An elevated update waits for Enter on every failure, and a broken environment no longer stops it from reporting the version.
+- An update whose `tbot stop` times out withdraws the request, so the bot does not stop later and stay down. `tbot autostart <config> -Remove` stops the session the task really runs, withdraws the request it leaves, and has `-DryRun`.
+- Setup no longer stops at a PATH entry on a missing drive or in quotes.
+
+**Live**
+- An order found again by lookup whose executions are not listed yet, or cannot be read, is booked with the commission where Binance takes it by default (the coin bought, or the quote sold for), so the book holds what the account holds.
+
+**Research and data**
+- `selection: neighborhood` counts a neighbor with too few trades as no better than break-even or the worst qualifying point, so a lone peak among failing neighbors is no plateau (no logged run had too few trades, so no result changes).
+- A trial-log line cut short by a crash is skipped with a warning, and the next append starts on a new line instead of joining it.
+- Stored bar files are flushed to disk before they replace the old ones; the validation report says the Monte Carlo resamples bar returns; the default number of workers stays within what Windows allows (61).
+
+**Documentation**
+- The Monte Carlo inputs, the attribution numbers (Sharpe -0.36, correlation 0.19 on data to 2026-10-05), the heartbeat URL (`http://` is accepted, for a monitor on your own network), `tbot log` with `--log-file`, and the 0.4.0 notes are corrected; the 2026-09-24 and 2026-09-29 reports say the 2026-10-05 report supersedes them.
+
+**Tests**
+- 17 new tests (374 in all); each fix was checked to fail its test when undone.
+
 ## 0.4.0 (2026-10-09)
 
-Easier to use every day. Nothing changes in how the bot trades. Upgrade notes: after `tbot update` (or a pull), run `.\tbot setup` once to put the `tbot` command on your PATH; scheduled tasks keep working as they are.
+Easier to use every day. Nothing changes in how the bot trades. Upgrade notes: see 0.4.1, which corrects them.
 
 **One short command**
 - `tbot.cmd` in the repository runs every command from any folder, always in the repository, where `.env`, `config`, `data`, and `logs` live: `tbot status` instead of `uv run python -m tbot status config/paper.yaml`. Setup adds the folder to your user PATH (`-NoPath` skips it), keeping the other entries and their `%VARIABLES%` as they are.
@@ -19,7 +56,7 @@ Easier to use every day. Nothing changes in how the bot trades. Upgrade notes: a
 - `tbot notify` sets Telegram up step by step: it asks for the token, checks it, waits for your first message to the bot, finds your chat, saves both in `.env` (every other line stays as it was), and sends a test message. `tbot doctor` points at it while Telegram is not set up.
 - `tbot autostart paper` registers the scheduled task and starts it at once, unless a session started by hand already runs on the config (then it waits for the next boot); `-NoStart` waits too, and `-Remove` takes it away. Autostart, removal, and an update with scheduled tasks ask for administrator rights themselves from a normal terminal and run in a new window that stays open until you press Enter.
 - `tbot update` ends with the old and new version.
-- `tbot -h` starts with the first steps; commands are listed in the order they are used.
+- `tbot -h` ends with the first steps; commands are listed in the order they are used.
 
 **Tests**
 - 17 new tests (357 in all): naming and picking configs, the session overview, the log view and following it through a rotation, the guided Telegram setup, `.env` editing, opening a dashboard, and the message of a failed start. Each was checked to fail without the code it covers.

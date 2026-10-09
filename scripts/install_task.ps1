@@ -8,7 +8,8 @@ logged on or not. Tasks that start at boot need administrator rights: run from a
 terminal, it asks for them and goes on in a new window. It runs `tbot doctor` first and refuses
 to register while doctor reports a problem. The task is started at once, unless -NoStart or a
 session already runs on the config (then it starts at the next boot). -Remove stops the bot
-gracefully and removes the task (scripts\remove_task.ps1).
+gracefully and removes the task (scripts\remove_task.ps1); with -DryRun it only says what it
+would do.
 
 .EXAMPLE
 tbot autostart paper
@@ -31,7 +32,7 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 
 if ($Remove) {
-    & (Join-Path $PSScriptRoot "remove_task.ps1") -Config $Config -Name $Name
+    & (Join-Path $PSScriptRoot "remove_task.ps1") -Config $Config -Name $Name -DryRun:$DryRun
     exit $LASTEXITCODE
 }
 if (-not $DryRun -and -not $Elevated -and -not (Test-Admin)) {

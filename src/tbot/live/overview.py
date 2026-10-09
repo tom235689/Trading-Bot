@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from tbot.data.store import BarStore
 from tbot.live.compare import price_at
@@ -35,8 +36,16 @@ def session_row(name: str, config: SessionConfig, store: BarStore) -> SessionRow
         return SessionRow(name, state, notes=(f"ledger unusable: {exc}",))
     try:
         return _row(name, state, config, ledger, store)
+    except Exception as exc:  # one session that cannot be read never hides the others
+        return SessionRow(name, state, notes=(f"cannot read the ledger: {exc!r}",))
     finally:
         ledger.close()
+
+
+def broken_row(name: str, problem: str, ledger: Path | None) -> SessionRow:
+    """A config that does not load; a session may still run on the ledger it names."""
+    running = ledger is not None and ledger.is_file() and is_running(ledger)
+    return SessionRow(name, "running" if running else "invalid", notes=(problem,))
 
 
 def _row(
@@ -54,13 +63,17 @@ def _row(
     if point is None:
         return SessionRow(name, state, notes=(*notes, "no bar event yet"))
     # Deposits, withdrawals, and budget changes are money put in, not profit.
-    flows = sum(
-        a.cash + a.quantity * price_at(config, store, a.symbol, a.time)
+    flows = [
+        (a.time, a.cash + a.quantity * price_at(config, store, a.symbol, a.time))
         for a in ledger.adjustments()
         if a.time <= point.time
-    )
-    invested = base_cash(config, ledger) + flows
+    ]
+    invested = base_cash(config, ledger) + sum(value for _, value in flows)
     earlier = ledger.equity_before(point.time - timedelta(days=1))
+    day_change = None
+    if earlier and earlier.equity > 0:
+        moved = sum(value for at, value in flows if at > earlier.time)
+        day_change = (point.equity - moved) / earlier.equity - 1
     positions = restore_portfolio(config, ledger).positions
     return SessionRow(
         name,
@@ -68,7 +81,7 @@ def _row(
         equity=point.equity,
         profit=point.equity - invested,
         invested=invested,
-        day_change=point.equity / earlier.equity - 1 if earlier and earlier.equity > 0 else None,
+        day_change=day_change,
         from_peak=(
             min(point.equity / guard.peak_equity - 1, 0.0) if guard.peak_equity > 0 else None
         ),

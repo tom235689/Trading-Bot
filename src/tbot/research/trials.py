@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+import structlog
 from pydantic import BaseModel, ConfigDict
 
 from tbot.backtest.config import BacktestConfig
@@ -14,6 +15,9 @@ from tbot.backtest.metrics import Metrics
 
 # Tags whose runs count as selection attempts on a sample.
 SELECTION_TAGS = frozenset({"backtest", "baseline", "sweep", "walkforward-train"})
+
+
+log = structlog.get_logger(__name__)
 
 
 class TrialRecord(BaseModel):
@@ -80,7 +84,14 @@ class TrialLog:
         if not records:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        torn = False
+        if self.path.exists() and self.path.stat().st_size:
+            with self.path.open("rb") as file:
+                file.seek(-1, 2)
+                torn = file.read(1) != b"\n"
         with self.path.open("a", encoding="utf-8", newline="\n") as file:  # LF on every OS
+            if torn:
+                file.write("\n")  # a line cut by a crash stays alone, not glued to the next
             for record in records:
                 file.write(record.model_dump_json() + "\n")
 
@@ -88,7 +99,17 @@ class TrialLog:
         if not self.path.exists():
             return []
         lines = self.path.read_text(encoding="utf-8").splitlines()
-        return [TrialRecord.model_validate_json(line) for line in lines if line.strip()]
+        records, broken = [], []
+        for number, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                records.append(TrialRecord.model_validate_json(line))
+            except ValueError:  # cut short by a crash while appending
+                broken.append(number)
+        if broken:
+            log.warning("trial_log_lines_skipped", path=str(self.path), lines=broken)
+        return records
 
     def selection_sharpes(self, like: TrialRecord) -> list[float]:
         """Annualized Sharpe of each distinct trial on the same sample; NaN when undefined.

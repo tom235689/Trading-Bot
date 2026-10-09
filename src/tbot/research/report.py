@@ -63,7 +63,7 @@ def format_report(r: ValidationReport) -> str:
     mc = r.monte_carlo
     lines.extend(
         [
-            f"5. Monte Carlo: {mc.runs} runs in {mc.block_days}-day blocks of daily returns",
+            f"5. Monte Carlo: {mc.runs} runs in {mc.block_days}-day blocks of bar returns",
             *_monte_carlo_lines("in-sample", mc),
             *_monte_carlo_lines("out-of-sample", r.monte_carlo_oos),
             "",

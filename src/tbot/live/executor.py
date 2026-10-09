@@ -325,9 +325,9 @@ class LiveExecutor:
                 trades = await self.spot.my_trades(order.symbol, order.order_id)
             except (BinanceError, httpx.HTTPError) as exc:
                 log.warning("trades_unavailable", symbol=order.symbol, error=repr(exc))
-                trades = [
-                    TradeFill(0.0, 0.0, order.quote_qty * self.fee_rate, rules.quote)
-                ]  # estimate at the configured rate
+            if not trades:  # unreadable, or not listed yet: estimate at the configured rate
+                log.warning("commission_estimated", symbol=order.symbol)
+                trades = [self._estimated_commission(order, rules)]
         fill, commissions = aggregate_fill(order, self.clock(), trades)
         assert fill is not None
         quantity, fee = fill.quantity, 0.0
@@ -344,6 +344,12 @@ class LiveExecutor:
                 except (BinanceError, httpx.HTTPError) as exc:
                     log.warning("fee_unpriced", asset=asset, amount=amount, error=repr(exc))
         return replace(fill, quantity=quantity, fee=fee)
+
+    def _estimated_commission(self, order: Order, rules: SymbolRules) -> TradeFill:
+        """Where Binance takes it by default: from the coin bought, or the quote sold for."""
+        if order.side == "BUY":
+            return TradeFill(0.0, 0.0, order.executed_qty * self.fee_rate, rules.base)
+        return TradeFill(0.0, 0.0, order.quote_qty * self.fee_rate, rules.quote)
 
     # outside events: orders in doubt and stops that executed
 

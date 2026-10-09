@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from tbot.backtest.engine import BacktestResult
 from tbot.backtest.runner import run_period
 from tbot.core.models import Fill
+from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Ledger
@@ -169,13 +170,17 @@ def price_at(config: SessionConfig, store: BarStore, symbol: str, moment: dateti
     """Close of the symbol's finest stream at or before moment (the next one if none)."""
     if not symbol:
         return 0.0  # a cash-only adjustment
-    timeframe = min(
-        (c.timeframe for c in config.strategies if symbol in c.symbols), key=lambda t: t.millis
-    )
-    bars = store.read(symbol, timeframe, moment - timeframe.delta * 50, moment + timeframe.delta)
-    closed = bars.filter(bars["open_time"] + timeframe.delta <= moment)
-    chosen = closed if not closed.is_empty() else bars
-    return float(chosen["close"][-1 if not closed.is_empty() else 0]) if chosen.height else 0.0
+    configured = {c.timeframe for c in config.strategies if symbol in c.symbols}
+    # A symbol the config no longer trades is valued from whatever stream is stored.
+    for timeframe in sorted(configured or set(Timeframe), key=lambda t: t.millis):
+        bars = store.read(
+            symbol, timeframe, moment - timeframe.delta * 50, moment + timeframe.delta
+        )
+        if bars.is_empty():
+            continue
+        closed = bars.filter(bars["open_time"] + timeframe.delta <= moment)
+        return float(closed["close"][-1]) if not closed.is_empty() else float(bars["close"][0])
+    return 0.0
 
 
 def match_fills(

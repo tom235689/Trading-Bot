@@ -26,6 +26,7 @@ param(
 
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo  # .env, data/, logs/, and ledgers are relative to the repository
+$env:TBOT_SUPERVISED = "1"  # a restart obeys a `tbot stop` left for it; a start by hand does not
 New-Item -ItemType Directory -Force logs | Out-Null
 $name = [IO.Path]::GetFileNameWithoutExtension($Config)
 $journal = Join-Path $repo "logs\$name.supervisor.log"

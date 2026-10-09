@@ -681,3 +681,25 @@ def test_a_fill_while_balances_are_read_waits_for_the_next_round(
 
     run(fake, tmp_path, action)
     assert compared == []  # balances that may or may not show the fill are not compared
+
+
+def test_an_order_whose_trades_are_not_listed_yet_is_booked_at_the_usual_commission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        portfolio = Portfolio(1000.0)
+
+        async def none_yet(symbol: str, order_id: int) -> list[object]:
+            return []
+
+        fake.error_after_next_order = httpx.Response(503)  # found again by lookup
+        monkeypatch.setattr(executor.spot, "my_trades", none_yet)
+        [fill] = await executor.execute({BTC: 0.01}, T0, portfolio, MARKS)
+        assert fill.fee > 0
+        return portfolio
+
+    portfolio = run(fake, tmp_path, action, stop_pct=0.0)
+    # A buy pays its commission in the coin bought: the book holds what the account holds.
+    assert portfolio.position(BTC) == pytest.approx(fake.balances["BTC"])

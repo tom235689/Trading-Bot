@@ -19,16 +19,13 @@ popd
 exit /b %CODE%
 
 :script
-shift
-set "ARGS="
-:collect
-if "%~1"=="" goto run
-set ARGS=%ARGS% "%~1"
-shift
-goto collect
-:run
-powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\%SCRIPT%" %ARGS%
-exit /b %ERRORLEVEL%
+rem The rest of the line as typed: everything after the first word.
+set "ALL=%*"
+call set "ARGS=%%ALL:*%~1=%%"
+rem One line: "tbot update" may replace this file, and cmd reads a file again after each
+rem command; !ERRORLEVEL! is read when the script has ended.
+setlocal EnableDelayedExpansion
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\%SCRIPT%" %ARGS% & exit /b !ERRORLEVEL!
 
 :nouv
 echo uv is not installed: winget install --id astral-sh.uv -e, then open a new terminal 1>&2

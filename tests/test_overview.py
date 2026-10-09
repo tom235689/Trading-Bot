@@ -5,13 +5,14 @@ from pathlib import Path
 
 import pytest
 
+from factories import price_bars
 from tbot.core.config import StrategyConfig
 from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.live.config import PaperConfig
 from tbot.live.ledger import Adjustment, EquityPoint, Ledger
-from tbot.live.overview import SessionRow, overview_text, session_row
+from tbot.live.overview import SessionRow, broken_row, overview_text, session_row
 from tbot.live.runner import BASE_META, GUARD_META, instance_lock
 from tbot.risk.guard import GuardState
 
@@ -43,7 +44,7 @@ def test_a_row_counts_money_put_in_apart_from_profit(tmp_path: Path) -> None:
     assert row.state == "stopped"
     assert row.equity == 1600.0
     assert row.profit == pytest.approx(100.0)  # 1000 to start and 500 added later
-    assert row.day_change == pytest.approx(0.6)
+    assert row.day_change == pytest.approx(0.1)  # 1000 to 1600 with 500 of it put in
     assert row.from_peak == pytest.approx(1600.0 / 1700.0 - 1)
     assert row.symbols == ("BTCUSDT",)
     assert row.notes == (
@@ -59,7 +60,7 @@ def test_a_row_counts_money_put_in_apart_from_profit(tmp_path: Path) -> None:
         "config", "state", "equity", "profit", "24h", "peak", "last", "bar", "(UTC)", "positions"
     ]  # fmt: skip
     assert lines[1].split() == [
-        "paper", "stopped", "1,600.00", "+100.00", "(+6.7%)", "+60.0%", "-5.9%",
+        "paper", "stopped", "1,600.00", "+100.00", "(+6.7%)", "+10.0%", "-5.9%",
         "2026-10-02", "00:00", "BTCUSDT",
     ]  # fmt: skip
     assert lines[2].strip() == "HALTED: drawdown 46% (tbot resume paper)"
@@ -88,3 +89,33 @@ def test_rows_without_a_ledger_or_with_a_broken_one(tmp_path: Path) -> None:
         "new", paper(tmp_path).model_copy(update={"ledger": tmp_path / "new.sqlite"}), store
     )
     assert empty.notes == ("no bar event yet",)
+
+
+def test_a_symbol_no_longer_traded_is_valued_from_its_stored_bars(tmp_path: Path) -> None:
+    config = paper(tmp_path)
+    store = BarStore(tmp_path / "data")
+    store.write("ETHUSDT", Timeframe.H1, price_bars(T0, Timeframe.H1, [2000.0] * 3, [2000.0] * 3))
+    with Ledger(config.ledger) as ledger:
+        ledger.set_meta(BASE_META, "1000")
+        ledger.add_adjustment(Adjustment(T0 + timedelta(hours=2), "ETHUSDT", 0.1, 0.0, "found"))
+        ledger.add_equity(EquityPoint(T0 + timedelta(hours=3), 1200.0, 1000.0, 0.17))
+    row = session_row("paper", config, store)
+    assert row.profit == pytest.approx(0.0)  # the 200 of ETH came in from outside
+
+
+def test_one_session_that_cannot_be_read_does_not_hide_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = paper(tmp_path)
+    with Ledger(config.ledger) as ledger:
+        ledger.add_equity(EquityPoint(T0, 1000.0, 1000.0, 0.0))
+
+    def broken(*args: object) -> SessionRow:
+        raise ValueError("min() arg is an empty sequence")
+
+    monkeypatch.setattr("tbot.live.overview._row", broken)
+    row = session_row("paper", config, BarStore(tmp_path / "data"))
+    assert row.notes == ("cannot read the ledger: ValueError('min() arg is an empty sequence')",)
+    assert broken_row("old", "config/old.yaml: not valid YAML", None).state == "invalid"
+    with instance_lock(config.ledger):
+        assert broken_row("paper", "invalid", config.ledger).state == "running"
