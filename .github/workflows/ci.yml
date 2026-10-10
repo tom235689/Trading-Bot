@@ -39,7 +39,15 @@ jobs:
       - run: uv run --frozen python -m ruff check .
       - run: uv run --frozen python -m ruff format --check .
       - run: uv run --frozen python -m mypy
-      - run: uv run --frozen python -m pytest -q
+      - name: pytest
+        shell: bash
+        run: |
+          status=0
+          uv run --frozen python -m pytest -q -rfE > pytest.log 2>&1 || status=$?
+          cat pytest.log
+          # Failed tests as annotations: they show on the commit page without the log.
+          grep -E '^(FAILED|ERROR) ' pytest.log | cut -c1-400 | sed 's/^/::error::/' || true
+          exit $status
       - if: matrix.os == 'ubuntu-latest'
         run: uv build
 
@@ -54,4 +62,10 @@ jobs:
       - run: uv lock --upgrade
       - run: uv sync --locked
       - run: uv run --locked python -m mypy
-      - run: uv run --locked python -m pytest -q
+      - name: pytest
+        run: |
+          status=0
+          uv run --locked python -m pytest -q -rfE > pytest.log 2>&1 || status=$?
+          cat pytest.log
+          grep -E '^(FAILED|ERROR) ' pytest.log | cut -c1-400 | sed 's/^/::error::/' || true
+          exit $status

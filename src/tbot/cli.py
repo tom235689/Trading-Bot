@@ -608,7 +608,11 @@ def output_file(value: str | None, folder: Path, name: str) -> Path:
     if value is None:
         return folder / name
     path = Path(value)
-    return path / name if path.is_dir() or value.endswith(("/", "\\")) else path
+    if path.is_dir():
+        return path / name
+    if value.endswith(("/", "\\")):  # a folder to create; a backslash ends one on any system
+        return Path(value.rstrip("/\\")) / name
+    return path
 
 
 def run_backtest_command(args: argparse.Namespace) -> int:
