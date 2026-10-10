@@ -13,6 +13,24 @@ With Smart App Control on, unsigned Python files can be blocked, so the environm
 on Python signed by the Python Software Foundation: an existing install, or the official
 "python" package from nuget.org, unpacked to PythonHome after its signature is checked.
 
+.PARAMETER Python
+A python.exe to build the environment on.
+
+.PARAMETER PythonVersion
+The Python version of the nuget package, used when no signed Python is found.
+
+.PARAMETER PythonHome
+Where the nuget Python goes; default %LOCALAPPDATA%\tbot\python-<version>.
+
+.PARAMETER SkipDownload
+No market data download (a few minutes on the first run); sessions download what they need.
+
+.PARAMETER NoPath
+Leave the user PATH alone; run .\tbot from this folder.
+
+.PARAMETER Config
+The config doctor checks at the end.
+
 .EXAMPLE
 .\tbot setup
 .\tbot setup -SkipDownload
@@ -20,12 +38,12 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 #>
 [CmdletBinding()]
 param(
-    [string] $Python = "",  # a python.exe to build the environment on
+    [string] $Python = "",
     [string] $PythonVersion = "3.12.10",
-    [string] $PythonHome = "",  # where the nuget Python goes; default %LOCALAPPDATA%\tbot\python-<version>
-    [switch] $SkipDownload,  # no market data download (a few minutes on the first run)
-    [switch] $NoPath,  # leave the user PATH alone; run .\tbot from this folder
-    [string] $Config = "config\paper.yaml"  # the config doctor checks at the end
+    [string] $PythonHome = "",
+    [switch] $SkipDownload,
+    [switch] $NoPath,
+    [string] $Config = "config\paper.yaml"
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot

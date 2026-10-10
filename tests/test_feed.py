@@ -525,3 +525,32 @@ def test_server_clock_ignores_a_step_of_the_wall_clock(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(clock_module, "datetime", Stepped)
     assert clock.now() - before < timedelta(seconds=1)  # the server did not move
+
+
+def test_a_stale_stream_that_comes_back_is_reported(tmp_path: Path) -> None:
+    stale: list[StreamKey] = []
+    back: list[StreamKey] = []
+    rows = {BTC1: make_rows(T0, 3, H1)}
+    feed, store, _ = make_feed(
+        tmp_path,
+        [BTC1],
+        now=at(5.5),
+        rows=rows,
+        poll_seconds=0.01,
+        stale_after=60,
+        on_stale=lambda key, last: stale.append(key),
+        on_fresh=back.append,
+    )
+    store.write(*BTC1, from_rows(rows[BTC1]))
+    feed.last[BTC1] = at(2)
+
+    async def watch() -> None:
+        task = asyncio.create_task(feed.run_watchdog())
+        await asyncio.sleep(0.1)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(watch())
+    assert (stale, feed.stale(), back) == ([BTC1], [BTC1], [])
+    assert feed._emit(BTC1, from_rows(make_rows(at(3), 2, H1))) == 2
+    assert (feed.stale(), back) == ([], [BTC1])

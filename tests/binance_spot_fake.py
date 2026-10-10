@@ -46,6 +46,8 @@ class FakeSpot:
     locked: dict[str, float] = field(default_factory=dict)
     requests: list[httpx.Request] = field(default_factory=list)
     fail_next: list[httpx.Response] = field(default_factory=list)
+    raise_next: list[Exception] = field(default_factory=list)  # a connection lost before sending
+    statuses: dict[str, str] = field(default_factory=dict)  # e.g. BREAK; TRADING otherwise
     lose_next_order_response: bool = False  # place the order, then fail the response
     error_after_next_order: httpx.Response | None = None  # place it, then answer this
     next_id: int = 1000
@@ -99,6 +101,8 @@ class FakeSpot:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if self.raise_next:
+            raise self.raise_next.pop(0)
         if self.fail_next:
             return self.fail_next.pop(0)
         path = request.url.path
@@ -109,7 +113,11 @@ class FakeSpot:
             return httpx.Response(200, json={"serverTime": int(time.time() * 1000)})
         if path == "/api/v3/exchangeInfo":
             symbols = json.loads(params["symbols"])
-            infos = [symbol_info(s, self.rules[s]) for s in symbols if s in self.rules]
+            infos = [
+                symbol_info(s, self.rules[s], self.statuses.get(s, "TRADING"))
+                for s in symbols
+                if s in self.rules
+            ]
             return httpx.Response(200, json={"symbols": infos})
         if path == "/api/v3/ticker/bookTicker":
             price = self.prices[params["symbol"]]

@@ -11,6 +11,30 @@ session already runs on the config (then it starts at the next boot). -Remove st
 gracefully and removes the task (scripts\remove_task.ps1); with -DryRun it only says what it
 would do.
 
+.PARAMETER Config
+A config file or a name from config\.
+
+.PARAMETER Live
+Required for a config with mode: live.
+
+.PARAMETER Name
+The task name; default "tbot <config name>".
+
+.PARAMETER SkipDoctor
+Register without running tbot doctor first.
+
+.PARAMETER NoStart
+Register only; the session starts at the next boot.
+
+.PARAMETER Remove
+Stop the session gracefully and remove its task.
+
+.PARAMETER DryRun
+Only show what would be done; changes nothing and asks for no rights.
+
+.PARAMETER Elevated
+Internal: set when the script restarted itself with administrator rights.
+
 .EXAMPLE
 tbot autostart paper
 tbot autostart live -Live
@@ -18,14 +42,14 @@ tbot autostart paper -Remove
 powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1 paper -DryRun
 #>
 param(
-    [Parameter(Position = 0)] [string] $Config = "paper",  # a config file or a name from config\
-    [switch] $Live,  # required for a config with mode: live
-    [string] $Name = "",  # default "tbot <config name>"
+    [Parameter(Position = 0)] [string] $Config = "paper",
+    [switch] $Live,
+    [string] $Name = "",
     [switch] $SkipDoctor,
     [switch] $NoStart,
     [switch] $Remove,
-    [switch] $DryRun,  # only show the task
-    [switch] $Elevated  # set when the script elevated itself
+    [switch] $DryRun,
+    [switch] $Elevated
 )
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
@@ -81,7 +105,7 @@ try {
         if ($existing) {
             $other = Get-TaskRunner $existing
             if (-not $other) { throw "a task '$Name' exists and is no tbot task: pass -Name with another name" }
-            if (-not (Test-SameFile $other $runner)) {
+            if (-not (Test-OwnTask $other $runner)) {
                 throw "'$Name' runs the bot of another folder ($other): pass -Name with another name"
             }
         }

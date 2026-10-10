@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import math
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,11 +26,20 @@ PRODUCTION_URL = "https://api.binance.com"
 TESTNET_URL = "https://testnet.binance.vision"
 RETRY_STATUS = frozenset({418, 429, 500, 502, 503, 504})
 MAX_RETRY_WAIT = 30.0  # seconds; a longer Retry-After (an IP ban) fails at once
+RATE_LIMITED = frozenset({418, 429})
+RULES_MAX_AGE = 3600.0  # seconds; Binance changes filters and statuses of listed pairs
 ORDER_NOT_FOUND = -2013
 NOTHING_TO_CANCEL = -2011
 TIMESTAMP_OUTSIDE_WINDOW = -1021
 SEND_STATUS_UNKNOWN = -1007
 INVALID_SYMBOL = -1121
+FILTER_FAILURE = -1013
+BAD_PRECISION = -1111
+BAD_SIGNATURE = -1022
+BAD_KEY_FORMAT = -2014
+RULE_ERRORS = frozenset({FILTER_FAILURE, BAD_PRECISION})  # the cached rules may be out of date
+KEY_ERRORS = frozenset({BAD_SIGNATURE, BAD_KEY_FORMAT})  # the key or secret is wrong
+TRADING = "TRADING"
 NOISE = Decimal("1e-6")  # of a step: closer than this to it is float rounding, not a remainder
 Params = Mapping[str, str | int | float]
 
@@ -69,6 +79,11 @@ class SymbolRules:
         if abs(nearest - exact) > self.step_size * NOISE:
             nearest = exact.quantize(self.step_size, rounding=ROUND_DOWN)
         return math.copysign(float(nearest), quantity) if nearest else 0.0
+
+    def floor_quantity(self, quantity: float) -> float:
+        """Round a balance down to the step size: never more than is there."""
+        exact = Decimal(str(max(quantity, 0.0)))
+        return float(exact.quantize(self.step_size, rounding=ROUND_DOWN))
 
     def round_price(self, price: float) -> float:
         return float(Decimal(str(price)).quantize(self.tick_size, rounding=ROUND_DOWN))
@@ -200,6 +215,9 @@ class BinanceSpot:
         self.retries = retries
         self.resync = resync  # re-measures the clock after a -1021 timestamp error
         self.rules: dict[str, SymbolRules] = {}
+        self.status: dict[str, str] = {}  # TRADING, or BREAK while Binance pauses a pair
+        self.rules_time = -math.inf  # monotonic time of the last load
+        self.paused_until = 0.0  # monotonic: Binance asked for a longer pause than a retry
 
     # transport
 
@@ -212,20 +230,32 @@ class BinanceSpot:
     async def _request(
         self, method: str, path: str, params: Params | None = None, *, signed: bool = False
     ) -> Any:
-        """Send a request, retrying rate limits and server errors.
+        """Send a request, retrying lost connections, rate limits, and server errors.
 
         POST is never retried on these: an order may have gone through, so callers
         look it up by client order id. Any request rejected for its timestamp (-1021)
-        was not executed, so it is signed again once after a clock resync.
+        was not executed, so it is signed again once after a clock resync. During a
+        pause Binance asked for, nothing is sent: calling on makes a ban longer.
         """
         params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key}
         attempts = 1 if method == "POST" else self.retries
         attempt, resynced = 0, False
         while True:
+            wait = self.paused_until - time.monotonic()
+            if wait > 0:
+                raise BinanceError(0, f"rate limited: Binance asked to wait {wait:.0f} s more", 429)
             query = self._sign(params) if signed else urlencode(params)
             url = f"{self.base_url}{path}?{query}" if query else f"{self.base_url}{path}"
-            response = await self.client.request(method, url, headers=headers, timeout=15.0)
+            try:
+                response = await self.client.request(method, url, headers=headers, timeout=15.0)
+            except httpx.TransportError as exc:
+                if method == "POST" or attempt >= attempts - 1:
+                    raise
+                log.warning("binance_retry", path=path, error=type(exc).__name__, delay=2**attempt)
+                await asyncio.sleep(2**attempt)
+                attempt += 1
+                continue
             delay = retry_seconds(response.headers.get("Retry-After"), 2**attempt)
             if (
                 response.status_code in RETRY_STATUS
@@ -236,8 +266,12 @@ class BinanceSpot:
                 await asyncio.sleep(delay)
                 attempt += 1
                 continue
+            if response.status_code in RATE_LIMITED:
+                self.paused_until = max(self.paused_until, time.monotonic() + delay)
             if response.status_code >= 400:
                 error = _error_from(response)
+                if error.code in RULE_ERRORS:
+                    self.rules_time = -math.inf  # reload them before the next order
                 if (
                     error.code == TIMESTAMP_OUTSIDE_WINDOW
                     and signed
@@ -258,16 +292,29 @@ class BinanceSpot:
         return datetime.fromtimestamp(data["serverTime"] / 1000, UTC)
 
     async def load_rules(self, symbols: list[str]) -> dict[str, SymbolRules]:
+        """Filters and status of each symbol; a pair Binance pauses (BREAK) is listed with
+        its status, one it does not list fails with INVALID_SYMBOL."""
         query = json.dumps(sorted(symbols), separators=(",", ":"))
         data = await self._request("GET", "/api/v3/exchangeInfo", {"symbols": query})
-        for info in data["symbols"]:
-            if info["status"] != "TRADING":
-                raise BinanceError(0, f"{info['symbol']} is not trading: {info['status']}")
-            self.rules[info["symbol"]] = parse_rules(info)
-        missing = set(symbols) - set(self.rules)
+        infos = {info["symbol"]: info for info in data["symbols"]}
+        missing = set(symbols) - set(infos)
         if missing:
-            raise BinanceError(INVALID_SYMBOL, f"unknown symbols: {sorted(missing)}")
+            raise BinanceError(INVALID_SYMBOL, f"unknown symbols: {', '.join(sorted(missing))}")
+        for symbol, info in infos.items():
+            self.rules[symbol] = parse_rules(info)
+            self.status[symbol] = str(info["status"])
+        self.rules_time = time.monotonic()
         return self.rules
+
+    async def refresh_rules(self, max_age: float = RULES_MAX_AGE) -> bool:
+        """Reload the rules once they are max_age old, or an order failed a filter."""
+        if not self.rules or time.monotonic() - self.rules_time < max_age:
+            return False
+        await self.load_rules(sorted(self.rules))
+        return True
+
+    def trading(self, symbol: str) -> bool:
+        return self.status.get(symbol, TRADING) == TRADING
 
     async def book_price(self, symbol: str, side: int) -> float:
         data = await self._request("GET", "/api/v3/ticker/bookTicker", {"symbol": symbol})

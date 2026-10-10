@@ -37,6 +37,10 @@ def test_invalid_utf8_flagged() -> None:
     [
         ("-----BEGIN " + "RSA PRIVATE KEY-----", "private key"),
         ("123456789:" + "A" * 35, "telegram bot token"),
+        ("12345678901:" + "A" * 35, "telegram bot token"),
+        ("https://hc-ping.com/" + "0f3e9a1c-" * 4, "monitor ping url"),
+        ("https://kuma.example/api/push/" + "Ab3" * 4 + "?status=up", "monitor ping url"),
+        ("TBOT_HEARTBEAT_URL=" + "https://monitor.example/ping", "monitor ping url"),
         ("key " + "aB3" * 21 + "x", "api key"),
         ("BINANCE_API_KEY=" + "x" * 20, "credential assignment"),
         ('"api_secret": "' + "y" * 20 + '"', "credential assignment"),
@@ -52,6 +56,8 @@ def test_secret_detected(text: str, name: str) -> None:
         "sha256:" + "a1" * 32,
         "password_hash = compute(value)",
         "api_key = os.environ['BINANCE_API_KEY']",
+        "TBOT_HEARTBEAT_URL=",
+        "a monitor such as https://healthchecks.io/docs/",
     ],
 )
 def test_non_secret_passes(text: str) -> None:
@@ -225,3 +231,11 @@ def test_utf16_files_are_scanned_as_text(repo: Path) -> None:
     assert ("staged plain.bin", "possible secret (telegram bot token)") in found
     run(repo, "commit", "-q", "-m", "Add files")
     assert ("out.txt:2", "Hangul at column 1") in [(f.where, f.kind) for f in gg.audit(repo)]
+
+
+def test_an_icon_is_not_read_as_utf16_text() -> None:
+    # Mostly zero high bytes, as in an .ico; one pair would decode to a Hangul syllable.
+    icon = b"\x00\x00\x01\x00\x01\x00" + b"\x00\xac" + b"\x10\x00\x00\x00" * 40
+    assert list(gg.scan_blob("app.ico", icon)) == []
+    text = "x = 1\n".encode("utf-16-le")  # UTF-16 without a byte order mark is still read
+    assert gg.blob_text(text) == "x = 1\n"

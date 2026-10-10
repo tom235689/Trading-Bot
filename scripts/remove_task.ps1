@@ -7,15 +7,27 @@ Needs administrator rights: run from a normal terminal, it asks for them and goe
 window. The bot finishes the event in progress (`tbot stop`); nothing is sold, exchange stops
 stay in place, and the ledger, data, and logs are kept.
 
+.PARAMETER Config
+A config file or a name from config\.
+
+.PARAMETER Name
+The task name; default "tbot <config name>".
+
+.PARAMETER DryRun
+Only say what would be done; changes nothing and asks for no rights.
+
+.PARAMETER Elevated
+Internal: set when the script restarted itself with administrator rights.
+
 .EXAMPLE
 tbot autostart paper -Remove
 powershell -ExecutionPolicy Bypass -File scripts\remove_task.ps1 paper
 #>
 param(
-    [Parameter(Position = 0)] [string] $Config = "paper",  # a config file or a name from config\
+    [Parameter(Position = 0)] [string] $Config = "paper",
     [string] $Name = "",
-    [switch] $DryRun,  # only say what would be done
-    [switch] $Elevated  # set when the script elevated itself
+    [switch] $DryRun,
+    [switch] $Elevated
 )
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
@@ -28,14 +40,16 @@ $task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
 $runner = Join-Path $PSScriptRoot "run_bot.ps1"
 if ($task) {
     $other = Get-TaskRunner $task
-    if (-not $other -or -not (Test-SameFile $other $runner)) {
+    if (-not $other -or -not (Test-OwnTask $other $runner)) {
         $owner = if ($other) { "the bot of another folder ($other)" } else { "no tbot task" }
         Write-Output "'$Name' is $($owner): remove it from there, or in Task Scheduler"
         exit 1
     }
 } elseif (-not $named) {
     try { $null = Resolve-Config $repo $Config } catch {
-        Write-Output "no task '$Name' here, and $($_.Exception.Message)"  # a typo: no prompt for it
+        # A typo: no prompt for it. A task Task Scheduler lists can still be removed elevated.
+        Write-Output "no task '$Name' visible here, and $($_.Exception.Message)"
+        Write-Output "(a task Task Scheduler lists: run this from an administrator terminal)"
         exit 1
     }
 }

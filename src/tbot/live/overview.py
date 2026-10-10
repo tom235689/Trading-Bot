@@ -42,6 +42,7 @@ def session_row(name: str, config: SessionConfig, store: BarStore) -> SessionRow
 
 
 def broken_row(name: str, problem: str, ledger: Path | None) -> SessionRow:
+    problem = " ".join(problem.split())  # a YAML error spans lines
     """A config that does not load; a session may still run on the ledger it names."""
     running = ledger is not None and ledger.is_file() and is_running(ledger)
     return SessionRow(name, "running" if running else "invalid", notes=(problem,))

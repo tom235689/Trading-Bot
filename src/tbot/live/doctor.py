@@ -9,13 +9,23 @@ from typing import Any, Literal
 import httpx
 from pydantic import ValidationError
 
+from tbot import __version__
 from tbot.backtest.runner import run_period
+from tbot.data.http import describe_error
 from tbot.data.store import BarStore
-from tbot.exchange.binance import PRODUCTION_URL, TESTNET_URL, BinanceError, BinanceSpot
+from tbot.exchange.binance import (
+    INVALID_SYMBOL,
+    KEY_ERRORS,
+    PRODUCTION_URL,
+    TESTNET_URL,
+    BinanceError,
+    BinanceSpot,
+)
 from tbot.live.backup import daily_backups
 from tbot.live.config import LiveConfig, SessionConfig, Settings
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.runner import (
+    KEY_REJECTED,
     KEYS_MISSING,
     AlreadyRunning,
     StartRefused,
@@ -54,7 +64,8 @@ async def run_checks(
     offline: bool = False,
 ) -> list[Check]:
     """Offline leaves out what depends on the network, which a running bot retries."""
-    checks = strategy_checks(config) + ledger_checks(config) + alert_checks(settings)
+    real_money = isinstance(config, LiveConfig) and config.mode == "live"
+    checks = strategy_checks(config) + ledger_checks(config) + alert_checks(settings, real_money)
     if isinstance(config, LiveConfig) and not (
         settings.binance_api_key and settings.binance_api_secret
     ):
@@ -139,8 +150,8 @@ async def heartbeat_check(url: str, client: httpx.AsyncClient) -> Check:
     try:
         response = await client.get(url, timeout=10.0)
         response.raise_for_status()
-    except httpx.HTTPError as exc:
-        return Check("fail", "heartbeat", f"ping failed: {exc!r}")
+    except httpx.HTTPError as exc:  # the URL is a secret: anyone with it can ping
+        return Check("fail", "heartbeat", f"ping failed: {describe_error(exc)}")
     return Check("ok", "heartbeat", f"ping answered {response.status_code}")
 
 
@@ -209,7 +220,8 @@ def ledger_checks(config: SessionConfig) -> list[Check]:
     return [*checks, backup]
 
 
-def alert_checks(settings: Settings) -> list[Check]:
+def alert_checks(settings: Settings, real_money: bool = False) -> list[Check]:
+    """A real-money bot must be able to say that it failed: no Telegram fails it."""
     token, chat = settings.telegram_token, settings.telegram_chat_id
     if token and chat:
         telegram = Check("ok", "telegram", "configured; `tbot notify` sends a test message")
@@ -219,7 +231,7 @@ def alert_checks(settings: Settings) -> list[Check]:
         )
     else:
         telegram = Check(
-            "warn",
+            "fail" if real_money else "warn",
             "telegram",
             "not configured: alerts only reach the log (`tbot notify` sets it up)",
         )
@@ -238,10 +250,22 @@ def alert_checks(settings: Settings) -> list[Check]:
 
 
 async def symbol_checks(config: SessionConfig, spot: BinanceSpot) -> list[Check]:
+    symbols = symbols_of(config)
     try:
-        rules = await spot.load_rules(symbols_of(config))
+        rules = await spot.load_rules(symbols)
     except BinanceError as exc:
+        if exc.code == INVALID_SYMBOL and "unknown symbols" not in exc.message:
+            return [Check("fail", "symbols", f"Binance lists not all of {', '.join(symbols)}")]
         return [Check("fail", "symbols", exc.message)]
+    paused = [f"{s} {spot.status[s]}" for s in sorted(rules) if not spot.trading(s)]
+    if paused:
+        return [
+            Check(
+                "warn",
+                "symbols",
+                f"Binance does not trade {', '.join(paused)} now; its orders wait until it does",
+            )
+        ]
     small = [
         f"{symbol} {rule.min_notional}"
         for symbol, rule in sorted(rules.items())
@@ -273,7 +297,9 @@ async def account_checks(
     try:
         account = await spot.account()
     except (httpx.HTTPError, BinanceError) as exc:
-        return [*checks, Check("fail", "api key", f"rejected: {exc}")]
+        key = isinstance(exc, BinanceError) and exc.code in KEY_ERRORS
+        hint = f"; {KEY_REJECTED}" if key else ""
+        return [*checks, Check("fail", "api key", f"rejected: {exc}{hint}")]
     checks.append(
         Check("ok", "api key", f"valid on {spot.base_url}")
         if account.get("canTrade", False)
@@ -333,7 +359,8 @@ def budget_check(config: LiveConfig, account: dict[str, Any], quote: str) -> Che
 
 
 def checks_text(checks: list[Check]) -> str:
-    lines = [f"{c.status.upper():<5}{c.name}: {c.detail}" for c in checks]
+    lines = [f"tbot {__version__}"]
+    lines += [f"{c.status.upper():<5}{c.name}: {c.detail}" for c in checks]
     failed = sum(c.status == "fail" for c in checks)
     warned = sum(c.status == "warn" for c in checks)
     lines.append(f"{_count(failed, 'problem')}, {_count(warned, 'warning')}")

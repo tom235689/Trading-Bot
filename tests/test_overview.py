@@ -117,5 +117,8 @@ def test_one_session_that_cannot_be_read_does_not_hide_the_others(
     row = session_row("paper", config, BarStore(tmp_path / "data"))
     assert row.notes == ("cannot read the ledger: ValueError('min() arg is an empty sequence')",)
     assert broken_row("old", "config/old.yaml: not valid YAML", None).state == "invalid"
+    problem = "config/old.yaml: not valid YAML: while parsing\n  in line 3"
+    multiline = broken_row("old", problem, None)
+    assert multiline.notes == ("config/old.yaml: not valid YAML: while parsing in line 3",)
     with instance_lock(config.ledger):
         assert broken_row("paper", "invalid", config.ledger).state == "running"

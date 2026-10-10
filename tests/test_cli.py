@@ -1,7 +1,9 @@
 import asyncio
 import io
 import json
+import logging
 import os
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,6 +11,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
+import yaml
 
 from binance_fake import make_bars
 from tbot import __version__
@@ -24,12 +27,16 @@ from tbot.cli import (
     config_names,
     load_session_config,
     main,
+    not_running,
     output_file,
     parse_symbol,
     pick_config,
     print_notes,
+    run,
+    session_logging,
     write_dashboard,
 )
+from tbot.core.config import load_yaml
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.live.config import Settings, save_settings
@@ -303,7 +310,8 @@ def test_status_without_a_config_shows_every_session(
     monkeypatch.chdir(tmp_path)
     write_configs(tmp_path)
     assert main(["status"]) == 0
-    assert capsys.readouterr().out.splitlines()[:3] == [
+    assert capsys.readouterr().out.splitlines()[:4] == [
+        f"tbot {__version__}",
         "config   state",
         "paper    not started",
         "testnet  not started",
@@ -311,7 +319,7 @@ def test_status_without_a_config_shows_every_session(
     with Ledger(tmp_path / "paper.sqlite") as ledger:
         ledger.add_equity(EquityPoint(datetime(2026, 10, 1, tzinfo=UTC), 10_250.0, 10_250.0, 0.0))
     assert main(["status"]) == 0
-    row = capsys.readouterr().out.splitlines()[1].split()
+    row = capsys.readouterr().out.splitlines()[2].split()
     assert row[:5] == ["paper", "stopped", "10,250.00", "+250.00", "(+2.5%)"]  # from 10,000
 
 
@@ -411,8 +419,14 @@ class FakeTelegram:
         monkeypatch.setattr("tbot.cli.Telegram.send", send)
 
 
-def message(chat: int, name: str) -> dict[str, Any]:
-    return {"update_id": chat, "message": {"chat": {"id": chat, "first_name": name}}}
+CODE = "tb482913"
+
+
+def message(chat: int, name: str, text: str = "hi") -> dict[str, Any]:
+    return {
+        "update_id": chat,
+        "message": {"chat": {"id": chat, "first_name": name}, "text": text},
+    }
 
 
 @pytest.fixture
@@ -420,6 +434,8 @@ def no_telegram(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
     for name in ("TBOT_TELEGRAM_TOKEN", "TBOT_TELEGRAM_CHAT_ID"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("tbot.cli.one_time_code", lambda: CODE)
+    monkeypatch.setattr("tbot.cli.CHAT_WAIT_SECONDS", 0.2)
     (tmp_path / ".env.example").write_bytes(
         b"# Telegram\nTBOT_TELEGRAM_TOKEN=\nTBOT_TELEGRAM_CHAT_ID=\nTBOT_HEARTBEAT_URL=\n"
     )
@@ -429,9 +445,11 @@ def no_telegram(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_notify_guides_a_first_setup_and_saves_it(
     no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    telegram = FakeTelegram(monkeypatch, [[], [message(42, "Tom")]])
-    answers = iter(["  123:abc  ", ""])  # the token, then Enter: yes, this chat
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    # A stranger wrote to the bot first; only the chat that sends the code gets the alerts.
+    telegram = FakeTelegram(
+        monkeypatch, [[message(7, "Stranger")], [], [message(42, "Tom", f" {CODE} ")]]
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt="": "  123:abc  ")
     monkeypatch.setattr("tbot.cli.interactive", lambda: True)
     assert main(["notify"]) == 0
     assert no_telegram.read_bytes() == (
@@ -439,7 +457,8 @@ def test_notify_guides_a_first_setup_and_saves_it(
     )
     assert telegram.sent == [("42", "tbot: test alert. Alerts from the bot arrive in this chat.")]
     out = capsys.readouterr().out
-    assert "Now send any message to @tbot_test_bot in Telegram" in out  # it waited for one
+    assert f"Now send this code to @tbot_test_bot in Telegram: {CODE}" in out
+    assert "found chat 42 Tom" in out
     assert "saved chat 42 in .env" in out
     assert main(["notify"]) == 0  # set up: only the test message
     assert len(telegram.sent) == 2
@@ -448,19 +467,19 @@ def test_notify_guides_a_first_setup_and_saves_it(
 def test_notify_without_a_terminal_or_with_a_wrong_token(
     no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    telegram = FakeTelegram(monkeypatch, [[]])
+    telegram = FakeTelegram(monkeypatch, [[message(1, "Tom", CODE)]])
     assert main(["notify"]) == EXIT_ERROR  # nobody to ask for the token
     assert "set TBOT_TELEGRAM_TOKEN (from @BotFather) in .env" in capsys.readouterr().out
     monkeypatch.setenv("TBOT_TELEGRAM_TOKEN", "123:abc")
-    assert main(["notify"]) == EXIT_ERROR
-    assert "no message to @tbot_test_bot yet" in capsys.readouterr().out
-    telegram.inbox = [[message(1, "Tom"), message(2, "Group")]]
-    assert main(["notify"]) == EXIT_ERROR  # two chats and nobody to choose
-    out = capsys.readouterr().out
-    assert "1. chat 1 Tom\n2. chat 2 Group\n" in out
+    assert main(["notify"]) == EXIT_ERROR  # nobody to send the code: no chat is guessed
+    assert "run `tbot notify` in a terminal to pick the chat" in capsys.readouterr().out
     assert not no_telegram.exists()
     monkeypatch.setattr("tbot.cli.interactive", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "2")
+    telegram.inbox = [[message(1, "Tom"), message(2, "Group", "123456")]]  # no code: waits
+    assert main(["notify"]) == EXIT_ERROR
+    assert "the code did not reach @tbot_test_bot" in capsys.readouterr().out
+    assert not no_telegram.exists()
+    telegram.inbox = [[message(1, "Tom"), message(2, "Group", f"/{CODE}@tbot_test_bot")]]
     assert main(["notify"]) == 0
     assert "TBOT_TELEGRAM_CHAT_ID=2\n" in no_telegram.read_text("utf-8")
     assert "TBOT_TELEGRAM_TOKEN=\n" in no_telegram.read_text("utf-8")  # from the environment
@@ -697,10 +716,10 @@ def test_a_second_start_is_refused_before_it_says_how_to_stop(
 def test_notify_takes_a_new_token_for_a_revoked_one(
     no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    telegram = FakeTelegram(monkeypatch, [[message(42, "Tom")]])
+    telegram = FakeTelegram(monkeypatch, [[message(42, "Tom", CODE)]])
     telegram.status = 401  # the token in .env was revoked
     save_settings(no_telegram, {"TBOT_TELEGRAM_TOKEN": "111:old"})
-    answers = iter(["222:new", ""])  # a new token, then Enter: yes, this chat
+    answers = iter(["222:new"])  # a new token
 
     def answer(prompt: str = "") -> str:
         telegram.status = 200  # Telegram knows the new one
@@ -710,3 +729,128 @@ def test_notify_takes_a_new_token_for_a_revoked_one(
     monkeypatch.setattr("tbot.cli.interactive", lambda: True)
     assert main(["notify"]) == 0
     assert "TBOT_TELEGRAM_TOKEN=222:new\n" in no_telegram.read_text("utf-8")
+
+
+def test_merge_keys_are_no_key_given_twice() -> None:
+    text = "base: &base\n  x: 1\nother:\n  <<: *base\n  y: 2\n"
+    assert load_yaml(text)["other"] == {"x": 1, "y": 2}
+    with pytest.raises(yaml.YAMLError, match="key 'y' given twice"):
+        load_yaml(text + "  y: 3\n")
+
+
+def test_a_start_waits_out_a_brief_check_by_another_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    config = load_session_config(Path("config/paper.yaml"))
+    config.ledger.write_bytes(b"")
+    held = threading.Event()
+
+    def brief_check() -> None:
+        with instance_lock(config.ledger):  # what `tbot status` does
+            held.set()
+            time.sleep(0.5)
+
+    thread = threading.Thread(target=brief_check)
+    thread.start()
+    held.wait()
+    try:
+        not_running(config)  # a supervised restart at that moment still starts
+    finally:
+        thread.join()
+
+
+def test_tbot_runs_in_the_repository_wherever_it_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, elsewhere = tmp_path / "repo", tmp_path / "elsewhere"
+    (repo / "config").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("", "utf-8")
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    seen: list[Path] = []
+
+    def main() -> int:
+        seen.append(Path.cwd())
+        return 0
+
+    monkeypatch.setattr("tbot.cli.main", main)
+    monkeypatch.setattr("tbot.cli.ROOT", tmp_path / "installed")  # a wheel: no repository
+    assert run() == 0
+    monkeypatch.setattr("tbot.cli.ROOT", repo)
+    assert run() == 0
+    assert seen == [elsewhere, repo]
+
+
+def test_two_configs_on_one_ledger_are_pointed_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    paper = tmp_path / "config" / "paper.yaml"
+    (tmp_path / "config" / "mypaper.yaml").write_text(
+        paper.read_text("utf-8") + "initial_cash: 500\n", "utf-8"
+    )
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "config/mypaper.yaml also use paper.sqlite" in out.replace("\\", "/")
+    assert main(["doctor", "mypaper", "--offline"]) in (0, 1)
+    out = capsys.readouterr().out.replace("\\", "/")
+    assert "WARN ledger: config/paper.yaml also use paper.sqlite: one book for two" in out
+
+
+def test_account_without_keys_says_so_before_any_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    monkeypatch.setattr("tbot.cli.Settings", lambda: Settings(_env_file=None))  # type: ignore[call-arg]
+    for name in ("TBOT_BINANCE_API_KEY", "TBOT_BINANCE_API_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+
+    def no_network(*args: object, **kwargs: object) -> None:
+        raise AssertionError("no request without keys")
+
+    monkeypatch.setattr("tbot.cli.account_text", no_network)
+    assert main(["account", "testnet"]) == EXIT_CONFIG
+    assert "testnet.binance.vision" in capsys.readouterr().err
+
+
+def test_debug_is_on_only_when_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken(args: object) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(COMMANDS, "check", broken)
+    monkeypatch.setenv("TBOT_DEBUG", "0")
+    assert main(["check"]) == EXIT_ERROR
+    assert "error: boom" in capsys.readouterr().err
+    monkeypatch.setenv("TBOT_DEBUG", "1")
+    with pytest.raises(RuntimeError, match="boom"):
+        main(["check"])
+
+
+def test_a_supervised_session_logs_only_problems_to_its_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    levels: list[int] = []
+    monkeypatch.setattr(
+        "tbot.cli.configure_logging",
+        lambda log_file, console_level: levels.append(console_level),
+    )
+    monkeypatch.delenv("TBOT_SUPERVISED", raising=False)
+    session_logging(tmp_path / "paper.jsonl")
+    monkeypatch.setenv("TBOT_SUPERVISED", "1")  # the console file is never rotated
+    session_logging(tmp_path / "paper.jsonl")
+    assert levels == [logging.INFO, logging.WARNING]
+
+
+def test_a_missing_ledger_names_the_command_that_starts_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    assert main(["compare", "testnet"]) == EXIT_CONFIG
+    assert "(`tbot live testnet` starts it;" in capsys.readouterr().err

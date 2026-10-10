@@ -29,6 +29,11 @@ function Test-SameFile([string] $a, [string] $b) {
     return [IO.Path]::GetFullPath($a).TrimEnd('\') -ieq [IO.Path]::GetFullPath($b).TrimEnd('\')
 }
 
+function Test-OwnTask([string] $other, [string] $runner) {
+    # A task runs this folder's bot, or the bot of a folder that is gone (moved or renamed).
+    return (Test-SameFile $other $runner) -or -not (Test-Path -LiteralPath $other)
+}
+
 function Test-Admin {
     $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     return $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)

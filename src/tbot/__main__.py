@@ -2,6 +2,6 @@
 
 import sys
 
-from tbot.cli import main
+from tbot.cli import run
 
-sys.exit(main())
+sys.exit(run())

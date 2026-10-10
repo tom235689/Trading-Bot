@@ -20,9 +20,17 @@ from tbot.exchange.binance import (
     SymbolRules,
 )
 from tbot.live.config import LiveConfig
-from tbot.live.executor import TAG_META, LiveExecutor, order_id
+from tbot.live.executor import TAG_META, BinanceBookTicker, LiveExecutor, order_id
 from tbot.live.ledger import Adjustment, Ledger
-from tbot.live.runner import BUDGET_NOTE, GUARD_META, reconcile_round
+from tbot.live.runner import (
+    BUDGET_META,
+    BUDGET_NOTE,
+    GUARD_META,
+    OWED_META,
+    budget_owed,
+    check_budget,
+    reconcile_round,
+)
 from tbot.portfolio.portfolio import Portfolio
 from tbot.risk.guard import GuardConfig, GuardState, Mode, RiskGuard
 
@@ -811,3 +819,219 @@ def test_a_lowered_budget_stays_lowered(tmp_path: Path) -> None:
 
     portfolio = run(fake, tmp_path, action, stop_pct=0.0)
     assert portfolio.cash == pytest.approx(-496.0)  # not handed back as a deposit
+
+
+def test_a_paused_symbol_gets_no_orders_until_binance_trades_it_again(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+    fake.statuses[BTC] = "BREAK"  # maintenance, or a pair on its way out
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        portfolio = Portfolio(1000.0)
+        await executor.report_status()
+        await executor.report_status()  # said once
+        assert await executor.execute({BTC: 0.01}, T0, portfolio, MARKS) == []
+        await executor.after_event(portfolio, MARKS)
+        fake.statuses.clear()
+        executor.spot.rules_time = float("-inf")  # due for a reload
+        await executor.check_rules()
+        assert len(await executor.execute({BTC: 0.01}, T0, portfolio, MARKS)) == 1
+        return statuses(ledger)
+
+    assert run(fake, tmp_path, action) == ["skipped", "pending", "filled"]
+    assert fake.order_count("MARKET") == 1
+
+
+def test_paused_symbol_alerts(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+    fake.statuses[BTC] = "BREAK"
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        await executor.report_status()
+        fake.statuses.clear()
+        executor.spot.rules_time = float("-inf")
+        await executor.check_rules()
+        await executor.check_rules()
+        return notifier.messages
+
+    assert run(fake, tmp_path, action) == [
+        "[live] Binance does not trade BTCUSDT now (BREAK): no orders or stops for it until it "
+        "does",
+        "[live] Binance trades BTCUSDT again; its orders and stops resume",
+    ]
+
+
+def test_reconciliation_reloads_the_rules_after_a_filter_failure(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.01234}, prices={BTC: 50000.0})
+    config = _live_config(tmp_path)
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Decimal:
+        fake.rules[BTC] = {**fake.rules[BTC], "step": "0.001", "minQty": "0.001"}
+        fake.fail_next = [httpx.Response(400, json={"code": -1013, "msg": "LOT_SIZE"})]
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01234, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)  # the stop fails the new step size
+        assert executor.unprotected == {BTC}
+        guard = RiskGuard(GuardConfig())
+        await reconcile_round(
+            executor, portfolio, MARKS, ledger, notifier, guard, config, lambda: T0
+        )
+        assert executor.unprotected == set()  # placed on the reloaded rules
+        return executor.spot.rules[BTC].step_size
+
+    assert run(fake, tmp_path, action) == Decimal("0.001")
+    [stop] = [o for o in fake.orders if o["type"] == "STOP_LOSS_LIMIT"]
+    assert float(stop["origQty"]) == pytest.approx(0.012)
+
+
+def test_a_sell_never_asks_for_more_than_is_free(tmp_path: Path) -> None:
+    doge = "DOGEUSDT"
+    fake = FakeSpot(
+        balances={"USDT": 0.0, "DOGE": 99.99999999},  # a hair under the 100 booked
+        prices={doge: 0.1},
+        rules={
+            **fake_rules(),
+            doge: {"tick": "0.00001", "step": "1", "minQty": "1", "minNotional": "1"},
+        },
+    )
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[Fill]:
+        await executor.spot.load_rules([doge])
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, doge, 100.0, 0.1, 0.0))
+        return await executor.execute({doge: -100.0}, T0, portfolio, {doge: 0.1})
+
+    [fill] = run(fake, tmp_path, action, stop_pct=0.0)
+    assert fill.quantity == pytest.approx(-99.0)  # not 100, which Binance would refuse
+
+
+def fake_rules() -> dict[str, dict[str, str]]:
+    return dict(FakeSpot(balances={}, prices={}).rules)
+
+
+def test_a_stop_over_part_of_the_position_says_so_once(tmp_path: Path) -> None:
+    # The owner's order locks 0.4 of the 0.5 BTC the bot holds.
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.1}, prices={BTC: 50000.0})
+    fake.locked["BTC"] = 0.4
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.5, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)
+        await executor.after_event(portfolio, MARKS)
+        assert executor.partial == {BTC: pytest.approx(0.4)}
+        assert executor.unprotected == set()  # the stop placed is not replaced every round
+        return notifier.messages
+
+    assert run(fake, tmp_path, action) == [
+        "[live] BTCUSDT: the stop covers 0.100000 of 0.500000; other orders lock the rest, "
+        "which has no exchange stop"
+    ]
+
+
+def test_a_budget_cut_the_cash_covered_leaves_nothing_owed(tmp_path: Path) -> None:
+    # 1000 in cash, budget lowered to 500: nothing is owed, so a book that goes negative
+    # later (a fill booked twice) is set back to zero, as before budgets could owe.
+    fake = FakeSpot(balances={"USDT": 600.0}, prices={BTC: 50000.0})
+    config = _live_config(tmp_path).model_copy(update={"initial_cash": 500.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> float:
+        ledger.set_meta(BUDGET_META, "1000.0")
+        guard = RiskGuard(GuardConfig())
+        check_budget(config, ledger, guard, T0)
+        assert budget_owed(ledger) == 0.0
+        portfolio = Portfolio(500.0)
+        portfolio.adjust("", 0.0, -800.0)  # the bug that books cash twice
+        await reconcile_round(
+            executor, portfolio, MARKS, ledger, notifier, guard, config, lambda: T0
+        )
+        return portfolio.cash
+
+    assert run(fake, tmp_path, action, stop_pct=0.0) == pytest.approx(0.0)
+
+
+def test_what_a_budget_cut_owes_shrinks_as_sales_repay_it(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 4.0, "BTC": 0.01992}, prices={BTC: 50000.0})
+    config = _live_config(tmp_path).model_copy(update={"initial_cash": 500.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[float]:
+        portfolio = Portfolio(1000.0)
+        fill = Fill(T0, BTC, 0.01992, 50000.0, 0.0)
+        portfolio.apply(fill)
+        ledger.add_fill(fill, 50000.0)
+        ledger.set_meta(BUDGET_META, "1000.0")
+        guard = RiskGuard(GuardConfig())
+        check_budget(config, ledger, guard, T0)  # takes 500 from the 4 the book holds
+        portfolio.adjust("", 0.0, -500.0)
+        owed = [budget_owed(ledger)]
+        portfolio.adjust("", 0.0, 296.0)  # a sale repaid 296 of it
+        fake.balances["USDT"] = 300.0
+        await reconcile_round(
+            executor, portfolio, MARKS, ledger, notifier, guard, config, lambda: T0
+        )
+        owed.append(float(ledger.get_meta(OWED_META) or "nan"))
+        return owed
+
+    assert run(fake, tmp_path, action, stop_pct=0.0) == [-496.0, -200.0]
+
+
+def test_a_paused_symbol_keeps_its_stop_as_it_is(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.01}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)  # a stop while it trades
+        fake.statuses[BTC] = "BREAK"
+        executor.spot.rules_time = float("-inf")
+        await executor.check_rules()
+        await executor.after_event(portfolio, MARKS)  # not replaced while paused
+        await executor.protect(portfolio, MARKS)
+        return [o["status"] for o in fake.orders if o["type"] == "STOP_LOSS_LIMIT"]
+
+    assert run(fake, tmp_path, action) == ["NEW"]  # neither cancelled nor placed again
+
+
+def test_a_stop_never_asks_for_more_than_is_free(tmp_path: Path) -> None:
+    doge = "DOGEUSDT"
+    fake = FakeSpot(
+        balances={"USDT": 0.0, "DOGE": 99.99999999},
+        prices={doge: 0.1},
+        rules={
+            **fake_rules(),
+            doge: {"tick": "0.00001", "step": "1", "minQty": "1", "minNotional": "1"},
+        },
+    )
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> set[str]:
+        await executor.spot.load_rules([doge])
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, doge, 100.0, 0.1, 0.0))
+        await executor.after_event(portfolio, {doge: 0.1})
+        return executor.unprotected
+
+    assert run(fake, tmp_path, action) == set()
+    [stop] = [o for o in fake.orders if o["type"] == "STOP_LOSS_LIMIT"]
+    assert float(stop["origQty"]) == 99.0
+
+
+def test_a_paper_quote_lost_to_a_blip_is_asked_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+
+    async def no_wait(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr("tbot.live.executor.asyncio.sleep", no_wait)
+    answers: list[httpx.Response | Exception] = [httpx.ConnectError("down"), httpx.Response(503)]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        answer = answers.pop(0) if answers else None
+        if isinstance(answer, Exception):
+            raise answer
+        return answer or httpx.Response(200, json={"askPrice": "101.5", "bidPrice": "101.0"})
+
+    async def quote() -> float:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            return await BinanceBookTicker(client).price(BTC, 1)
+
+    assert asyncio.run(quote()) == 101.5
+    assert waits == [1, 2]

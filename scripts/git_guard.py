@@ -46,7 +46,12 @@ HANGUL = re.compile("[" + "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in HANGUL_RA
 
 SECRETS = {
     "private key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    "telegram bot token": re.compile(r"(?<!\d)\d{8,10}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
+    "telegram bot token": re.compile(r"(?<!\d)\d{8,12}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
+    # Anyone holding a monitor's ping URL can report a dead bot as alive.
+    "monitor ping url": re.compile(
+        r"https?://\S*(?:hc-ping\.com|/api/push)/[A-Za-z0-9_-]{8,}"
+        r"|HEARTBEAT_URL\s*=\s*[\"']?https?://"
+    ),
     "api key": re.compile(
         r"(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*\d)"
         r"[A-Za-z0-9]{64}(?![A-Za-z0-9])"
@@ -91,7 +96,10 @@ def blob_text(data: bytes) -> str | None:
         if data.startswith(bom):
             return data[len(bom) :].decode(codec, errors="replace")
     if len(data) >= 2 and data[1::2].count(0) > len(data) // 4:  # ASCII as UTF-16-LE
-        return data.decode("utf-16-le", errors="replace")
+        text = data.decode("utf-16-le", errors="replace")
+        printable = sum(char.isprintable() or char in "\t\r\n" for char in text)
+        if "\x00" not in text and printable >= 0.95 * len(text):  # not an icon or bitmap
+            return text
     return None
 
 

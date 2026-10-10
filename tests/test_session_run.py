@@ -290,7 +290,11 @@ def test_a_ledger_keeps_its_mode(tmp_path: Path, offline: tuple[Collect, list[Li
 
 @pytest.mark.parametrize(
     "error",
-    [StartRefused("set the keys"), BinanceError(INVALID_SYMBOL, "unknown symbols: ['X']")],
+    [
+        StartRefused("set the keys"),
+        BinanceError(INVALID_SYMBOL, "unknown symbols: ['X']"),
+        BinanceError(-1022, "Signature for this request is not valid."),
+    ],
 )
 def test_a_start_that_fails_the_same_way_each_time_ends_for_good(
     tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], error: Exception
@@ -304,4 +308,38 @@ def test_a_start_that_fails_the_same_way_each_time_ends_for_good(
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     code = asyncio.run(run_session(config, settings, tmp_path / "data", label="paper", setup=setup))
     assert code == 4  # the supervisor gives up instead of retrying every 15 minutes
-    assert notifier.messages == [f"[paper] cannot start: {error}; fix the config, then start"]
+    [message] = notifier.messages
+    assert message.startswith(f"[paper] cannot start: {error}")
+
+
+def test_the_heartbeat_and_stream_alerts_follow_the_feed(
+    tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notifier, feeds = offline
+    config, _, _ = setup_store(tmp_path)
+    problems: list[Callable[[], str]] = []
+
+    async def heartbeat(url: str, every: float, client: object, problem: Callable[[], str]) -> None:
+        problems.append(problem)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "heartbeat_loop", heartbeat)
+    settings = Settings(_env_file=None, heartbeat_url="https://monitor.example/ping")  # type: ignore[call-arg]
+
+    async def scenario() -> list[str]:
+        stop = asyncio.Event()
+        session = asyncio.create_task(run_paper(config, settings, tmp_path / "data", stop=stop))
+        await until(lambda: bool(feeds) and bool(problems))
+        feed, problem = feeds[0], problems[0]
+        seen = [problem()]
+        feed._stale_reported.add(KEY)
+        seen.append(problem())
+        assert feed.on_fresh is not None
+        feed.on_fresh(KEY)
+        await until(lambda: any("is back" in m for m in notifier.messages))
+        stop.set()
+        await session
+        return seen
+
+    assert asyncio.run(scenario()) == ["", "stale streams: BTCUSDT 4h"]
+    assert "[paper] stream BTCUSDT 4h is back: bars arrive again" in notifier.messages

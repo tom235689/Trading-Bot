@@ -1,6 +1,7 @@
 """One backtest per parameter combination."""
 
 import math
+import multiprocessing
 import sys
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
@@ -57,7 +58,9 @@ def run_sweep(
     if sys.platform == "win32":
         workers = min(workers, 61)  # the most a process pool takes on Windows
     if workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        # Spawn everywhere: forking a process whose polars threads run can deadlock (Linux).
+        spawn = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=spawn) as pool:
             raw = list(pool.map(_evaluate_job, jobs))
     else:
         raw = [_evaluate_job(job) for job in jobs]

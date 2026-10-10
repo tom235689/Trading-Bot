@@ -3,12 +3,14 @@
 import argparse
 import asyncio
 import io
+import logging
 import os
+import secrets
 import sys
 import webbrowser
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from time import monotonic, sleep
@@ -51,6 +53,7 @@ from tbot.live.runner import (
     run_paper,
     status_text,
     stop_path,
+    supervised,
 )
 from tbot.monitoring.dashboard import DashboardData, from_backtest, from_ledger, render
 from tbot.monitoring.logging import configure_logging
@@ -94,7 +97,9 @@ DEFAULT_START = "2017-08-01"
 MAX_LISTED = 10
 CONFIG_DIR = Path("config")
 CONFIG_SUFFIXES = (".yaml", ".yml")
-CHAT_WAIT_SECONDS = 120  # `tbot notify` waits this long for a first message to the bot
+CHAT_WAIT_SECONDS = 120  # `tbot notify` waits this long for the code to reach the bot
+ROOT = Path(__file__).resolve().parents[2]  # the repository, when tbot runs from a clone
+DATA_HELP = "bar store and trial log (default: data)"
 
 
 def config_arg(value: str) -> Path:
@@ -114,6 +119,31 @@ def config_files() -> list[Path]:
 
 def config_names() -> list[str]:
     return sorted(path.stem for path in config_files())
+
+
+def ledger_sharers(path: Path, config: SessionConfig) -> list[Path]:
+    """Other session configs in config/ that name this config's ledger: one book for two."""
+    others = []
+    for other in config_files():
+        if other.resolve() == path.resolve():
+            continue
+        try:
+            raw = read_yaml(other)
+            if ("ledger" in raw or "mode" in raw) and (
+                load_session_config(other).ledger.resolve() == config.ledger.resolve()
+            ):
+                others.append(other)
+        except ConfigError:
+            continue
+    return others
+
+
+def sharing_note(path: Path, config: SessionConfig) -> str:
+    others = ledger_sharers(path, config)
+    if not others:
+        return ""
+    names = ", ".join(str(other) for other in others)
+    return f"{names} also use {config.ledger}: one book for two configs; give each its own ledger:"
 
 
 def short_name(path: Path) -> str:
@@ -339,25 +369,27 @@ def build_parser() -> argparse.ArgumentParser:
         "every session at a glance; with a config, that one in detail",
         "every session",
     )
-    status.add_argument("--data-dir", type=Path, default=Path("data"))
+    status.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
 
     paper = command("paper", "paper trade on live Binance data until stopped")
     paper.add_argument(
         "config", nargs="?", type=config_arg, default="paper", help="default: config/paper.yaml"
     )
-    paper.add_argument("--data-dir", type=Path, default=Path("data"))
+    paper.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
     paper.add_argument("--log-file", type=Path, help="default: logs/<config name>.jsonl")
 
     live = command("live", "trade on Binance testnet or live until stopped")
     live.add_argument("config", type=config_arg, help="testnet, live, or a config file")
     live.add_argument("--live", action="store_true", help="required when the config mode is live")
-    live.add_argument("--data-dir", type=Path, default=Path("data"))
+    live.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
     live.add_argument("--log-file", type=Path, help="default: logs/<config name>.jsonl")
 
     stop_cmd = session(
         "stop", "ask a running session to stop after the event in progress", "the running one"
     )
-    stop_cmd.add_argument("--timeout", type=float, default=90.0, help="seconds to wait")
+    stop_cmd.add_argument(
+        "--timeout", type=float, default=90.0, help="seconds to wait (default: %(default)s)"
+    )
     stop_cmd.add_argument(
         "--cancel", action="store_true", help="withdraw a request no session has taken yet"
     )
@@ -371,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     log_cmd.add_argument("--file", type=Path, help="a log file to read instead, such as a .1")
 
     doctor = session("doctor", "check keys, alerts, network, and the ledger before a session")
-    doctor.add_argument("--data-dir", type=Path, default=Path("data"))
+    doctor.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
     doctor.add_argument(
         "--offline",
         action="store_true",
@@ -381,12 +413,12 @@ def build_parser() -> argparse.ArgumentParser:
     command("notify", "set up Telegram alerts (guided) and send a test message")
 
     dashboard = session("dashboard", "write an HTML dashboard of a session and open it")
-    dashboard.add_argument("--data-dir", type=Path, default=Path("data"))
+    dashboard.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
     dashboard.add_argument("--out", default=None, help="a file or folder (default: reports/)")
     dashboard.add_argument("--no-open", action="store_true", help="do not open it in a browser")
 
     compare = session("compare", "compare a session with a backtest of the same period")
-    compare.add_argument("--data-dir", type=Path, default=Path("data"))
+    compare.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
 
     backup = session("backup", "copy a session ledger, also while it runs")
     backup.add_argument(
@@ -430,7 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     backtest = command("backtest", "run a backtest from a YAML config")
     backtest.add_argument("config", type=config_arg, help=CONFIG_HELP)
-    backtest.add_argument("--data-dir", type=Path, default=Path("data"))
+    backtest.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
     backtest.add_argument(
         "--attribution", action="store_true", help="also run each strategy alone and compare"
     )
@@ -445,8 +477,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=config_arg,
         help="a validation config, or its name from config/ such as donchian_voltarget_validation",
     )
-    validate.add_argument("--data-dir", type=Path, default=Path("data"))
-    validate.add_argument("--workers", type=int, default=os.cpu_count() or 1)
+    validate.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
+    validate.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="backtests run at once (default: the number of CPUs, %(default)s)",
+    )
     return parser
 
 
@@ -512,7 +549,7 @@ def run_check(args: argparse.Namespace) -> int:
         for timeframe in args.timeframes:
             bars = store.read(symbol, timeframe)
             if bars.is_empty():
-                print(f"{symbol} {timeframe}: FAIL, no data")
+                print(f"{symbol} {timeframe}: FAIL, no data (`tbot download` fetches it)")
                 failed = True
                 continue
             report = check_bars(bars, timeframe, now)
@@ -620,7 +657,7 @@ def write_dashboard(data: DashboardData, out: Path, *, show: bool = False) -> No
 
 def run_dashboard_command(args: argparse.Namespace) -> int:
     path = args.config or pick_config("dashboard")
-    config = existing_ledger(load_session_config(path))
+    config = existing_ledger(load_session_config(path), path)
     out = output_file(args.out, Path("reports"), f"{path.stem}.html")
     kind = config.mode.capitalize() if isinstance(config, LiveConfig) else "Paper"
     title = f"{kind} session {path.stem}"
@@ -652,7 +689,7 @@ def run_paper_command(args: argparse.Namespace) -> int:
     not_running(config)
     log_file = args.log_file or log_path(args.config)
     announce("paper", args.config, config, log_file)
-    configure_logging(log_file)
+    session_logging(log_file)
     return asyncio.run(run_paper(config, Settings(), args.data_dir))
 
 
@@ -669,21 +706,30 @@ def run_live_command(args: argparse.Namespace) -> int:
     not_running(config)
     log_file = args.log_file or log_path(args.config)
     announce(config.mode, args.config, config, log_file)
-    configure_logging(log_file)
+    session_logging(log_file)
     return asyncio.run(run_live(config, settings, args.data_dir, confirmed=args.live))
 
 
+def session_logging(log_file: Path) -> None:
+    """Everything to the log file; under a supervisor, whose console file is never rotated,
+    only warnings and errors to the console."""
+    configure_logging(log_file, console_level=logging.WARNING if supervised() else logging.INFO)
+
+
 def not_running(config: SessionConfig) -> None:
-    if config.ledger.is_file() and is_running(config.ledger):
+    # Waits as the session's own lock does: `tbot status` may hold it for a moment.
+    if config.ledger.is_file() and is_running(config.ledger, wait=3.0):
         raise AlreadyRunning(f"a session already runs on {config.ledger}: `tbot status` shows it")
 
 
 def announce(kind: str, path: Path, config: SessionConfig, log_file: Path) -> None:
     """What runs and how to stop it, before the log takes over the console."""
     name = short_name(path)
+    shared = sharing_note(path, config)
     print(
-        f"{kind} session {name}: ledger {config.ledger}, log {log_file}\n"
-        f"stop it with Ctrl+C here, or `tbot stop {name}` from another terminal",
+        f"{kind} session {name} (tbot {__version__}): ledger {config.ledger}, log {log_file}\n"
+        f"stop it with Ctrl+C here, or `tbot stop {name}` from another terminal"
+        + (f"\nnote: {shared}" if shared else ""),
         file=sys.stderr,
         flush=True,
     )
@@ -698,11 +744,17 @@ def run_status_command(args: argparse.Namespace) -> int:
     store = BarStore(args.data_dir)
     if args.config is None:
         sessions, broken = scan_configs()
-        rows = [session_row(path.stem, config, store) for path, config in sessions]
+        rows = []
+        for path, config in sessions:
+            row = session_row(path.stem, config, store)
+            shared = sharing_note(path, config)
+            rows.append(replace(row, notes=(*row.notes, shared)) if shared else row)
         rows += [broken_row(b.path.stem, b.problem, b.ledger) for b in broken]
+        print(f"tbot {__version__}")
         print(overview_text(rows))
         return 0
-    print(status_text(existing_ledger(load_session_config(args.config)), store))
+    config = existing_ledger(load_session_config(args.config), args.config)
+    print(status_text(config, store))
     return 0
 
 
@@ -731,7 +783,8 @@ def run_log_command(args: argparse.Namespace) -> int:
 
 
 def run_doctor_command(args: argparse.Namespace) -> int:
-    config = load_session_config(args.config or pick_config("doctor"))
+    path = args.config or pick_config("doctor")
+    config = load_session_config(path)
 
     async def check() -> list[Check]:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -739,6 +792,9 @@ def run_doctor_command(args: argparse.Namespace) -> int:
             return await run_checks(config, Settings(), client, store, offline=args.offline)
 
     checks = asyncio.run(check())
+    shared = sharing_note(path, config)
+    if shared:
+        checks.insert(1, Check("warn", "ledger", shared))
     print(checks_text(checks))
     return 1 if any(c.status == "fail" for c in checks) else 0
 
@@ -800,7 +856,8 @@ def run_stop_command(args: argparse.Namespace) -> int:
 
 
 def run_compare_command(args: argparse.Namespace) -> int:
-    config = existing_ledger(load_session_config(args.config or pick_config("compare")))
+    path = args.config or pick_config("compare")
+    config = existing_ledger(load_session_config(path), path)
     with Ledger(config.ledger) as ledger:
         try:
             comparison = compare_session(config, ledger, BarStore(args.data_dir))
@@ -812,7 +869,8 @@ def run_compare_command(args: argparse.Namespace) -> int:
 
 
 def run_backup_command(args: argparse.Namespace) -> int:
-    config = existing_ledger(load_session_config(args.config or pick_config("backup")))
+    path = args.config or pick_config("backup")
+    config = existing_ledger(load_session_config(path), path)
     name = f"{config.ledger.stem}-{datetime.now(UTC):%Y%m%d-%H%M%S}.sqlite"
     out = output_file(args.out, backup_dir(config.ledger), name)  # a folder: a synced one
     with Ledger(config.ledger) as ledger:
@@ -841,7 +899,7 @@ def run_resume_command(args: argparse.Namespace) -> int:
                 f"tbot resume {short_name(halted[0])}"
             )
         path = picked(halted[0])
-    print(resume(existing_ledger(load_session_config(path))))
+    print(resume(existing_ledger(load_session_config(path), path)))
     return 0
 
 
@@ -853,10 +911,11 @@ def is_halted(config: SessionConfig) -> bool:
         return False
 
 
-def existing_ledger[C: SessionConfig](config: C) -> C:
+def existing_ledger[C: SessionConfig](config: C, path: Path) -> C:
     """Opening a ledger creates it; commands that only read must not leave one behind."""
     if not config.ledger.is_file():
-        start = "tbot live <config>" if isinstance(config, LiveConfig) else "tbot paper"
+        name = short_name(path)
+        start = f"tbot live {name}" if isinstance(config, LiveConfig) else f"tbot paper {name}"
         raise ConfigError(
             f"no ledger at {config.ledger}: nothing has run with this config yet "
             f"(`{start}` starts it; `tbot status` lists every session)"
@@ -866,7 +925,10 @@ def existing_ledger[C: SessionConfig](config: C) -> C:
 
 def run_account_command(args: argparse.Namespace) -> int:
     config = load_live_config(args.config or pick_config("account", live=True))
-    print(asyncio.run(account_text(config, Settings())))
+    settings = Settings()
+    if not settings.binance_api_key or not settings.binance_api_secret:
+        raise ConfigError(KEYS_MISSING)
+    print(asyncio.run(account_text(config, settings)))
     return 0
 
 
@@ -930,15 +992,32 @@ async def set_up_telegram(token: str, chat_id: str | None, new_token: bool, env:
         return EXIT_ERROR
 
 
+def one_time_code() -> str:
+    """Letters first: in a group it goes as a command, the only text bots there receive."""
+    return f"tb{secrets.randbelow(900_000) + 100_000}"
+
+
 async def find_chat(bot: Telegram, name: str) -> str | None:
-    """The chat that wrote to the bot; waits for a first message when someone can send it."""
+    """The chat that sends the bot a one-time code. Bot names are public: a stranger who
+    wrote to the bot first must not end up with the alerts."""
+    if not interactive():
+        print("run `tbot notify` in a terminal to pick the chat, or set TBOT_TELEGRAM_CHAT_ID")
+        return None
+    code = one_time_code()
+    print(f"Now send this code to @{name} in Telegram: {code} (waiting up to 2 minutes)")
+    print(f"For alerts in a group, add the bot to it and send /{code}@{name} there.")
+    deadline = monotonic() + CHAT_WAIT_SECONDS
+    offset: int | None = None  # past what was read: the next long poll waits for news
     try:
-        chats = await chats_of(bot, 0)
-        if not chats and interactive():
-            print(f"Now send any message to @{name} in Telegram. Waiting up to 2 minutes...")
-            deadline = monotonic() + CHAT_WAIT_SECONDS
-            while not chats and monotonic() < deadline:
-                chats = await chats_of(bot, 10)  # long poll: answers as soon as one arrives
+        while monotonic() < deadline:
+            for update in await bot.updates(offset, 10):
+                offset = int(update["update_id"]) + 1
+                message = update.get("message") or {}
+                chat = message.get("chat") or {}
+                if "id" in chat and code in str(message.get("text", "")):
+                    title = chat.get("title") or chat.get("first_name") or chat.get("username")
+                    print(f"found chat {chat['id']} {title or ''}".rstrip())
+                    return str(chat["id"])
     except httpx.HTTPError as exc:
         busy = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 409
         print(
@@ -951,38 +1030,8 @@ async def find_chat(bot: Telegram, name: str) -> str | None:
             )
         )
         return None
-    if not chats:
-        print(f"no message to @{name} yet: send it any message, then run `tbot notify` again")
-        return None
-    ids = list(chats)
-    if len(ids) == 1:
-        print(f"found chat {ids[0]} {chats[ids[0]]}".rstrip())
-        if not interactive():
-            return ids[0]
-        answer = input("Send the alerts to this chat? [Y/n] ").strip().lower()
-        if answer in ("", "y", "yes"):
-            return ids[0]
-        print("not saved: send the bot a message from the chat you want, then run it again")
-        return None
-    for number, chat in enumerate(ids, 1):
-        print(f"{number}. chat {chat} {chats[chat]}".rstrip())
-    if interactive():
-        answer = input(f"Which one gets the alerts (1-{len(ids)})? ").strip()
-        if answer.isdigit() and 1 <= int(answer) <= len(ids):
-            return ids[int(answer) - 1]
-    print("put the chat id in TBOT_TELEGRAM_CHAT_ID in .env, then run `tbot notify` again")
+    print(f"the code did not reach @{name}: run `tbot notify` again and send the new code")
     return None
-
-
-async def chats_of(bot: Telegram, timeout: int) -> dict[str, str]:
-    """Chat id to name for every chat that wrote to the bot lately."""
-    chats: dict[str, str] = {}
-    for update in await bot.updates(None, timeout):
-        chat = (update.get("message") or {}).get("chat") or {}
-        if "id" in chat:
-            name = chat.get("title") or chat.get("first_name") or chat.get("username") or ""
-            chats[str(chat["id"])] = str(name)
-    return chats
 
 
 COMMANDS = {
@@ -1029,9 +1078,20 @@ def main(argv: list[str] | None = None) -> int:
         print("interrupted", file=sys.stderr)
         return EXIT_ERROR
     except Exception as exc:  # one line; TBOT_DEBUG=1 shows the traceback
-        if os.environ.get("TBOT_DEBUG"):
+        if os.environ.get("TBOT_DEBUG", "").lower() in ("1", "true", "yes"):
             raise
         return _fail(f"error: {brief(exc)}", EXIT_ERROR, alert=False)
+
+
+def run() -> int:
+    """`tbot` and `python -m tbot`: run in the repository, wherever the command is typed.
+
+    .env, config/, data/, and logs/ are relative paths; from another folder a session would
+    start a new book there. tbot.cmd does the same on Windows.
+    """
+    if (ROOT / "pyproject.toml").is_file() and (ROOT / "config").is_dir():
+        os.chdir(ROOT)
+    return main()
 
 
 def _fail(message: str, code: int, *, alert: bool) -> int:

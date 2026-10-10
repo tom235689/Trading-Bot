@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from tbot.live.commands import command_loop
+from tbot.monitoring.heartbeat import heartbeat_loop
 from tbot.monitoring.telegram import LogNotifier, QueuedNotifier, Telegram
 
 
@@ -166,3 +167,84 @@ def test_me_reads_the_bot_name_and_survives_an_odd_answer() -> None:
             return [await bot.me(), await bot.me()]
 
     assert asyncio.run(scenario()) == ["tbot_bot", ""]
+
+
+def send_through_queue(answers: list[httpx.Response | Exception]) -> int:
+    """Send one alert through the queue; return how many tries it took."""
+    tries = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        answer = answers.pop(0) if answers else httpx.Response(200, json={"ok": True})
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            queued = QueuedNotifier(Telegram("token", "42", client))
+            sender = asyncio.create_task(queued.run())
+            await queued.send("stale stream BTCUSDT 4h")
+            await queued.flush(5.0)
+            sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+
+    asyncio.run(run())
+    return tries
+
+
+@pytest.fixture
+def fast_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tbot.monitoring.telegram.RETRY_FIRST", 0.0)
+
+
+@pytest.mark.usefixtures("fast_retries")
+def test_an_alert_is_sent_once_telegram_can_be_reached_again() -> None:
+    down: list[httpx.Response | Exception] = [
+        httpx.ConnectError("down"),
+        httpx.Response(502),
+        httpx.ConnectError("down"),
+    ]
+    assert send_through_queue(down) == 4
+
+
+@pytest.mark.usefixtures("fast_retries")
+def test_telegram_rate_limits_are_waited_out_and_refusals_dropped() -> None:
+    busy = {"ok": False, "parameters": {"retry_after": 0.01}}
+    assert send_through_queue([httpx.Response(429, json=busy)]) == 2
+    assert send_through_queue([httpx.Response(400, json={"ok": False})]) == 1  # chat not found
+
+
+@pytest.mark.usefixtures("fast_retries")
+def test_an_alert_not_sent_for_a_day_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tbot.monitoring.telegram.MAX_AGE", -1.0)
+    assert send_through_queue([httpx.ConnectError("down")] * 5) == 1
+
+
+def test_the_heartbeat_stops_while_the_bot_cannot_trade() -> None:
+    pings = 0
+    problems = ["stale streams: BTCUSDT 4h"]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal pings
+        pings += 1
+        return httpx.Response(200)
+
+    async def run() -> int:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            beat = asyncio.create_task(
+                heartbeat_loop(
+                    "https://monitor.example/ping", 0.01, client, lambda: "".join(problems)
+                )
+            )
+            await asyncio.sleep(0.1)
+            skipped = pings
+            problems.clear()  # the stream is back
+            await asyncio.sleep(0.1)
+            beat.cancel()
+            await asyncio.gather(beat, return_exceptions=True)
+            return skipped
+
+    assert asyncio.run(run()) == 0  # no ping while it cannot trade: the monitor reports it
+    assert pings > 0

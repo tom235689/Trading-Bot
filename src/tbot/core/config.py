@@ -20,6 +20,8 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 def _unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode) -> dict[Any, Any]:
     seen: set[str] = set()
     for key_node, _ in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            continue  # `<<: *defaults`: the keys given here override the merged ones
         key = loader.construct_object(key_node)
         if not isinstance(key, str):
             continue

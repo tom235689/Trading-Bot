@@ -54,6 +54,7 @@ class LiveFeed:
         poll_seconds: float = 30.0,
         batch_wait: float = 5.0,
         on_stale: Callable[[StreamKey, datetime], None] | None = None,
+        on_fresh: Callable[[StreamKey], None] | None = None,
         last: Mapping[StreamKey, datetime | None] | None = None,
     ) -> None:
         self.keys = list(keys)
@@ -65,6 +66,7 @@ class LiveFeed:
         self.poll_seconds = poll_seconds
         self.batch_wait = batch_wait
         self.on_stale = on_stale
+        self.on_fresh = on_fresh  # a stream reported stale has bars again
         self.last: dict[StreamKey, datetime | None] = {
             key: last[key] if last is not None else store.last_open_time(*key) for key in self.keys
         }
@@ -103,8 +105,15 @@ class LiveFeed:
         bars = bars.sort("open_time")
         self.store.write(*key, bars)
         self.last[key] = bars["open_time"][-1]
-        self._stale_reported.discard(key)
+        if key in self._stale_reported:
+            self._stale_reported.discard(key)
+            if self.on_fresh is not None:
+                self.on_fresh(key)
         return bars
+
+    def stale(self) -> list[StreamKey]:
+        """Streams reported stale that have not delivered a bar since."""
+        return [key for key in self.keys if key in self._stale_reported]
 
     async def catch_up(self, keys: Sequence[StreamKey] | None = None) -> int:
         """Fetch bars closed since the last emitted one via REST.

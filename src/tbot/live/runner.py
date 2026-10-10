@@ -17,6 +17,7 @@ import httpx
 import polars as pl
 import structlog
 
+from tbot import __version__
 from tbot.backtest.runner import WARMUP_MARGIN, history_bars
 from tbot.core.config import TradingConfig
 from tbot.core.models import Fill
@@ -26,6 +27,7 @@ from tbot.data.downloader import NotListed, sync
 from tbot.data.store import BarStore
 from tbot.exchange.binance import (
     INVALID_SYMBOL,
+    KEY_ERRORS,
     PRODUCTION_URL,
     TESTNET_URL,
     BinanceError,
@@ -63,9 +65,17 @@ BUDGET_META = "initial_cash"  # the budget the guard levels refer to
 BASE_META = "base_cash"  # what the book started with
 SUPERVISED_ENV = "TBOT_SUPERVISED"  # set by scripts/run_bot.ps1
 BUDGET_NOTE = "initial_cash changed"  # adjustments that book a changed budget
+OWED_META = "budget_owed"  # what a lowered budget took beyond the book's cash (<= 0)
 MODE_META = "mode"  # paper, testnet, or live: what the book is
 EXIT_REFUSED = 4  # as the command line's config error: the supervisor gives up
-KEYS_MISSING = "set TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET in .env (`tbot setup`)"
+KEYS_MISSING = (
+    "set TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET in .env: testnet keys from "
+    "testnet.binance.vision, live keys from API Management on binance.com"
+)
+KEY_REJECTED = (
+    "check TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET in .env; tbot signs with HMAC, so "
+    "the key must be a system-generated (HMAC) one, not Ed25519 or RSA"
+)
 TARGETS_META = "targets"
 OPERATIONAL = {"ledger", "backup_days", "telegram_commands"}  # not in the config hash
 _background: set[asyncio.Task[bool]] = set()
@@ -263,8 +273,10 @@ def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard, now: d
             ledger.set_meta(BASE_META, stored if stored is not None else repr(config.initial_cash))
         if stored is not None and float(stored) != config.initial_cash:
             change = config.initial_cash - float(stored)
+            cash = restore_portfolio(config, ledger).cash + change
             note = f"{BUDGET_NOTE} from {float(stored):,.2f} to {config.initial_cash:,.2f}"
             ledger.add_adjustment(Adjustment(now, "", 0.0, change, note))
+            ledger.set_meta(OWED_META, repr(min(0.0, cash)))
             guard.shift(change)
             ledger.set_meta(GUARD_META, guard.state.model_dump_json())
             ledger.add_event(now, "warning", f"{note}; booked as a transfer")
@@ -289,10 +301,22 @@ def price_at(config: TradingConfig, store: BarStore, symbol: str, moment: dateti
 
 
 def budget_owed(ledger: Ledger) -> float:
-    """What lowered budgets took out, as a negative amount: cash below zero up to this is
-    owed to the owner and repaid by sales, not an error for reconciliation to undo."""
-    budget = [a for a in ledger.adjustments() if a.note.startswith(BUDGET_NOTE)]
-    return sum(a.cash for a in budget if a.cash < 0)
+    """What lowered budgets took beyond the book's cash and sales have not repaid, as a
+    negative amount: cash below zero up to this is owed to the owner, not an error for
+    reconciliation to undo."""
+    raw = ledger.get_meta(OWED_META)
+    if raw is not None:
+        return float(raw)
+    budget = [a for a in ledger.adjustments() if a.note.startswith(BUDGET_NOTE)]  # 0.4.2
+    return min(0.0, sum(a.cash for a in budget))
+
+
+def note_repaid(ledger: Ledger, cash: float) -> None:
+    """Sales repay what a lowered budget left owing; the book never owes more again."""
+    owed = budget_owed(ledger)
+    left = max(owed, min(0.0, cash))
+    if left != owed or ledger.get_meta(OWED_META) is None:
+        ledger.set_meta(OWED_META, repr(left))
 
 
 def base_cash(config: SessionConfig, ledger: Ledger) -> float:
@@ -547,7 +571,7 @@ def permanent(exc: Exception) -> bool:
     """Whether a failed start would fail again: a supervisor should give up, not retry."""
     if isinstance(exc, StartRefused | NotListed):
         return True
-    return isinstance(exc, BinanceError) and exc.code == INVALID_SYMBOL
+    return isinstance(exc, BinanceError) and (exc.code == INVALID_SYMBOL or exc.code in KEY_ERRORS)
 
 
 class LedgerModeError(ValueError):
@@ -606,9 +630,9 @@ def supervised() -> bool:
     return os.environ.get(SUPERVISED_ENV) == "1"
 
 
-def is_running(ledger: Path) -> bool:
+def is_running(ledger: Path, wait: float = 0.0) -> bool:
     try:
-        with instance_lock(ledger):
+        with instance_lock(ledger, wait):
             return False
     except AlreadyRunning:
         return True
@@ -824,7 +848,10 @@ async def _trade(
             log.error("start_failed", error=repr(exc))
             ledger.add_event(utc_now(), "error", f"failed to start: {exc!r}")
             if permanent(exc):  # the same at every try: say so, and let the supervisor stop
-                await notifier.send(f"[{label}] cannot start: {exc}; fix the config, then start")
+                hint = f"; {KEY_REJECTED}" if getattr(exc, "code", None) in KEY_ERRORS else ""
+                await notifier.send(
+                    f"[{label}] cannot start: {exc}{hint}; fix the config, then start"
+                )
                 return EXIT_REFUSED
             await notifier.send(f"[{label}] failed to start: {start_problem(exc)}")
             return 1
@@ -851,14 +878,16 @@ async def _trade(
             stale_after=config.stale_after_seconds,
             batch_wait=config.batch_wait_seconds,
             on_stale=lambda key, last: _report_stale(ledger, notifier, label, key, last),
+            on_fresh=lambda key: _report_fresh(ledger, notifier, label, key),
         )
         point = session.snapshot(now)
         where = config.ledger.resolve()
-        ledger.add_event(now, "info", f"started ({label}), ledger {where}")
+        ledger.add_event(now, "info", f"started ({label}), tbot {__version__}, ledger {where}")
         halted = f", HALTED: {guard.state.halt_reason}" if guard.state.halted else ""
         fresh = " (new)" if new_ledger else ""
         await notifier.send(
-            f"[{label}] started: {len(keys)} streams, equity {point.equity:,.2f}, "
+            f"[{label}] started (tbot {__version__}): {len(keys)} streams, "
+            f"equity {point.equity:,.2f}, "
             f"positions {len(portfolio.positions)}, fills so far {len(portfolio.fills)}, "
             f"ledger {where}{fresh}{halted}"
         )
@@ -868,6 +897,12 @@ async def _trade(
             unprotected = sorted(getattr(executor, "unprotected", ()))
             if unprotected:
                 found.append(f"NO EXCHANGE STOP: {', '.join(unprotected)}")
+            partial = sorted(getattr(executor, "partial", {}).items())
+            if partial:
+                found.append(
+                    "PART WITHOUT A STOP: "
+                    + ", ".join(f"{symbol} {qty:.6f}" for symbol, qty in partial)
+                )
             return found
 
         hour = config.summary_hour_utc
@@ -895,12 +930,14 @@ async def _trade(
         elif config.telegram_commands:
             log.warning("telegram_commands_off", hint="Telegram is not configured")
         if settings.heartbeat_url and valid_url(settings.heartbeat_url):
-            tasks.append(
-                asyncio.create_task(
-                    heartbeat_loop(settings.heartbeat_url, config.heartbeat_seconds, aclient),
-                    name="heartbeat",
-                )
-            )
+
+            def problem() -> str:
+                stale = ", ".join(f"{symbol} {timeframe}" for symbol, timeframe in feed.stale())
+                return f"stale streams: {stale}" if stale else health.blocked
+
+            url, every = settings.heartbeat_url, config.heartbeat_seconds
+            beat = heartbeat_loop(url, every, aclient, problem)
+            tasks.append(asyncio.create_task(beat, name="heartbeat"))
         stopper = asyncio.create_task(stop.wait(), name="stop")
         done, _ = await asyncio.wait([*tasks, stopper], return_when=asyncio.FIRST_COMPLETED)
         code = 0
@@ -994,6 +1031,7 @@ async def reconcile_round(
     stops are replaced to fit it, as after an event.
     """
     spot = executor.spot
+    await executor.check_rules()
     booked = await executor.settle(portfolio)
     balances = await spot.balances()
     if await executor.settle(portfolio):
@@ -1024,6 +1062,7 @@ async def reconcile_round(
         on_adjust=shift_guard,
         cash_floor=budget_owed(ledger),
     )
+    note_repaid(ledger, portfolio.cash)
     if adjustments or booked:
         await executor.after_event(portfolio, marks)
     elif executor.unprotected:
@@ -1107,7 +1146,7 @@ async def run_live(
             )
 
         async with ctx.lock:
-            await reconcile_once()
+            await reconcile_once()  # a key Binance rejects for good ends the start (permanent)
             await executor.after_event(portfolio, ctx.session.marks)  # stops for held positions
 
         loop = reconcile_loop(
@@ -1189,6 +1228,19 @@ def _report_stale(
     message = f"[{label}] stale stream {symbol} {timeframe}: {seen}"
     log.warning("stale_stream", symbol=symbol, timeframe=str(timeframe), last=last.isoformat())
     ledger.add_event(utc_now(), "warning", message)
+    _send_later(notifier, message)
+
+
+def _report_fresh(ledger: Ledger, notifier: Notifier, label: str, key: StreamKey) -> None:
+    symbol, timeframe = key
+    message = f"[{label}] stream {symbol} {timeframe} is back: bars arrive again"
+    log.warning("stream_back", symbol=symbol, timeframe=str(timeframe))
+    ledger.add_event(utc_now(), "info", message)
+    _send_later(notifier, message)
+
+
+def _send_later(notifier: Notifier, message: str) -> None:
+    """Send from code that cannot wait, such as a feed callback."""
     task = asyncio.get_running_loop().create_task(notifier.send(message))
     _background.add(task)  # a bare task can be collected before it runs
     task.add_done_callback(_background.discard)

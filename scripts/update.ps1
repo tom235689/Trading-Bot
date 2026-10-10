@@ -14,6 +14,15 @@ pull and put back; if the update changes the same lines, or any step fails, ever
 at the old version with your changes. Exit code 1 means the update was not applied or a task
 was not started again. A bot started by hand in a console must be stopped by hand first.
 
+.PARAMETER DryRun
+Only show the tasks and what would be done; changes nothing and asks for no rights.
+
+.PARAMETER StopTimeoutSeconds
+How long a running session gets to finish its event and stop.
+
+.PARAMETER Elevated
+Internal: set when the script restarted itself with administrator rights.
+
 .EXAMPLE
 tbot update -DryRun
 tbot update
@@ -21,9 +30,9 @@ powershell -ExecutionPolicy Bypass -File scripts\update.ps1
 #>
 [CmdletBinding()]
 param(
-    [switch] $DryRun,  # only show the tasks and what would be done
+    [switch] $DryRun,
     [int] $StopTimeoutSeconds = 120,
-    [switch] $Elevated  # set when the script elevated itself
+    [switch] $Elevated
 )
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")

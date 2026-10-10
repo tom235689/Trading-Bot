@@ -1,6 +1,6 @@
 [project]
 name = "tbot"
-version = "0.4.2"
+version = "0.5.0"
 description = "Multi-strategy crypto trading bot for Binance"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,8 +16,12 @@ dependencies = [
     "websockets>=17.1",
 ]
 
+[project.urls]
+Repository = "https://github.com/tom235689/Trading-Bot"
+Changelog = "https://github.com/tom235689/Trading-Bot/blob/main/CHANGELOG.md"
+
 [project.scripts]
-tbot = "tbot.cli:main"
+tbot = "tbot.cli:run"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

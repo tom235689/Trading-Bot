@@ -8,6 +8,7 @@ import pytest
 
 from binance_spot_fake import DEFAULT_RULES, FakeSpot, symbol_info
 from tbot.exchange.binance import (
+    RULES_MAX_AGE,
     TESTNET_URL,
     BinanceError,
     BinanceSpot,
@@ -187,3 +188,65 @@ def test_a_long_ban_fails_at_once_instead_of_stalling_the_bot() -> None:
         run(fake, lambda spot: spot.balances())
     assert exc.value.status == 418
     assert len(fake.requests) == 1
+
+
+def test_a_lost_connection_is_retried_for_reads_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+
+    async def no_wait(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr("tbot.exchange.binance.asyncio.sleep", no_wait)
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={"BTCUSDT": 50000.0})
+    fake.raise_next = [httpx.ReadError("reset"), httpx.ConnectError("down")]
+    assert run(fake, lambda spot: spot.balances())["USDT"].free == 1000.0
+    assert waits == [1, 2]
+
+    async def order(spot: BinanceSpot) -> None:
+        fake.raise_next = [httpx.ConnectError("down")]
+        await spot.market_order("BTCUSDT", 0.01, "tb-1")
+
+    with pytest.raises(httpx.ConnectError):  # an order is looked up by its id, never resent
+        run(fake, order)
+    assert waits == [1, 2]
+
+
+def test_a_ban_is_waited_out_without_a_request() -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={"BTCUSDT": 50000.0})
+
+    async def twice(spot: BinanceSpot) -> BinanceError:
+        fake.fail_next = [httpx.Response(418, headers={"Retry-After": "7200"})]
+        with pytest.raises(BinanceError):
+            await spot.balances()
+        sent = len(fake.requests)
+        with pytest.raises(BinanceError) as again:
+            await spot.balances()
+        assert len(fake.requests) == sent  # asking during a ban makes it longer
+        return again.value
+
+    error = run(fake, twice)
+    assert error.status == 429
+    assert "Binance asked to wait" in error.message
+
+
+def test_paused_symbols_load_and_rules_reload_after_a_filter_failure() -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={"BTCUSDT": 50000.0})
+    fake.statuses["ETHUSDT"] = "BREAK"
+
+    async def go(spot: BinanceSpot) -> None:
+        assert spot.trading("BTCUSDT")
+        assert not spot.trading("ETHUSDT")
+        assert spot.status["ETHUSDT"] == "BREAK"
+        assert not await spot.refresh_rules()  # fresh
+        fake.rules["BTCUSDT"] = {**fake.rules["BTCUSDT"], "step": "0.001", "minQty": "0.001"}
+        fake.fail_next = [httpx.Response(400, json={"code": -1013, "msg": "LOT_SIZE"})]
+        with pytest.raises(BinanceError):
+            await spot.market_order("BTCUSDT", 0.01234, "tb-1")
+        assert await spot.refresh_rules()  # a filter failure: the rules may be out of date
+        assert spot.rules["BTCUSDT"].step_size == Decimal("0.001")
+        fake.statuses.clear()
+        spot.rules_time -= RULES_MAX_AGE  # an hour later
+        assert await spot.refresh_rules()
+        assert spot.trading("ETHUSDT")
+
+    run(fake, go)

@@ -16,6 +16,7 @@ from tbot.core.text import price_text
 from tbot.core.timeframe import to_millis
 from tbot.exchange.binance import (
     NOTHING_TO_CANCEL,
+    TRADING,
     BinanceError,
     BinanceSpot,
     Order,
@@ -36,6 +37,7 @@ TAG_META = "order_tag"
 BUY_MARGIN = 0.002  # keep this much quote free for price movement between quote and fill
 STOP_LIMIT_GAP = 0.005  # limit price below the stop price so a triggered stop fills
 LOOKUP_DELAYS = (0.5, 1.0, 2.0, 4.0)  # seconds between lookups of an order in doubt
+PRICE_ATTEMPTS = 3  # a paper quote lost to a network blip is asked again
 
 
 class OrderUnknown(Exception):
@@ -173,6 +175,8 @@ class LiveExecutor:
         self.label = label
         self.unprotected: set[str] = set()  # held symbols whose stop is missing
         self.alerted: set[str] = set()  # stop failures already sent, until one works
+        self.statuses: dict[str, str] = {}  # each symbol's Binance status as last reported
+        self.partial: dict[str, float] = {}  # held beyond a stop: other orders lock it
         self.tag = session_tag(ledger)
         self.stop_prefix = f"{STOP_PREFIX}{self.tag}"
 
@@ -255,6 +259,10 @@ class LiveExecutor:
     async def _execute_one(
         self, symbol: str, quantity: float, now: datetime, portfolio: Portfolio, client_id: str
     ) -> Fill | None:
+        if not self.spot.trading(symbol):
+            status = self.spot.status[symbol]
+            self.ledger.add_order(now, symbol, quantity, "skipped", f"not trading ({status})")
+            return None
         rules = self.spot.rules[symbol]
         if quantity < 0:
             await self.cancel_stops(symbol, portfolio)  # stops lock the base balance
@@ -273,7 +281,8 @@ class LiveExecutor:
             # Never sell more than the book holds: in budget mode the rest is the owner's,
             # and a stop booked by cancel_stops above may have sold part of it already.
             free = balances[rules.base].free if rules.base in balances else 0.0
-            quantity = max(quantity, -max(portfolio.position(symbol), 0.0), -free)
+            quantity = max(quantity, -max(portfolio.position(symbol), 0.0))
+            quantity = max(rules.round_quantity(quantity), -rules.floor_quantity(free))
         quantity = rules.round_quantity(quantity)
         if quantity == 0 or not rules.acceptable(quantity, reference):
             self.ledger.add_order(now, symbol, quantity, "skipped", "below exchange minimum")
@@ -367,6 +376,33 @@ class LiveExecutor:
         if order.side == "BUY":
             return TradeFill(0.0, 0.0, order.executed_qty * self.fee_rate, rules.base)
         return TradeFill(0.0, 0.0, order.quote_qty * self.fee_rate, rules.quote)
+
+    # symbol rules and status
+
+    async def check_rules(self) -> None:
+        """Reload the symbol rules when due, and say when Binance pauses or resumes a pair."""
+        try:
+            await self.spot.refresh_rules()
+        except (BinanceError, httpx.HTTPError) as exc:  # the old rules stay; tried next round
+            log.warning("rules_refresh_failed", error=repr(exc))
+        await self.report_status()
+
+    async def report_status(self) -> None:
+        for symbol in sorted(self.spot.rules):
+            status = self.spot.status.get(symbol, TRADING)
+            if status == self.statuses.get(symbol, TRADING):
+                continue
+            self.statuses[symbol] = status
+            if status == TRADING:
+                text = f"[{self.label}] Binance trades {symbol} again; its orders and stops resume"
+            else:
+                text = (
+                    f"[{self.label}] Binance does not trade {symbol} now ({status}): no orders "
+                    "or stops for it until it does"
+                )
+            log.warning("symbol_status", symbol=symbol, status=status)
+            self.ledger.add_event(self.clock(), "warning", text)
+            await self.notifier.send(text)
 
     # outside events: orders in doubt and stops that executed
 
@@ -536,7 +572,10 @@ class LiveExecutor:
     async def _protect(self, symbol: str, portfolio: Portfolio, marks: Mapping[str, float]) -> None:
         if not self.protective_stop_pct:
             self.unprotected.discard(symbol)
+            self.partial.pop(symbol, None)
             return
+        if not self.spot.trading(symbol):
+            return  # no orders until Binance trades it again; a stop in place stays
         rules = self.spot.rules[symbol]
         state = self._stop_state(symbol)
         if state is not None and state["qty"] > 0:
@@ -554,6 +593,7 @@ class LiveExecutor:
             if position <= 0 or symbol not in marks:
                 self.unprotected.discard(symbol)
                 self.alerted.discard(symbol)
+                self.partial.pop(symbol, None)
                 return
             balances = await self.spot.balances()
             free = balances[rules.base].free if rules.base in balances else 0.0
@@ -562,19 +602,19 @@ class LiveExecutor:
             if not self._stoppable(rules, position, limit):
                 self.unprotected.discard(symbol)  # dust: nothing an exchange stop can hold
                 self.alerted.discard(symbol)
+                self.partial.pop(symbol, None)
                 return
-            quantity = rules.round_quantity(min(position, free))
+            quantity = min(rules.round_quantity(position), rules.floor_quantity(free))
             if not self._stoppable(rules, quantity, limit):
                 raise ValueError(
                     f"only {free:.8f} of the {position:.8f} held is free; other orders lock "
                     "the rest"
                 )
-            if self._stoppable(rules, position - quantity, limit):
-                log.warning("stop_partial", symbol=symbol, quantity=quantity, position=position)
             client_id = f"{self.stop_prefix}{symbol}{uuid4().hex[:12]}"
             self._set_stop_state(symbol, StopState(id=client_id, qty=0.0, quote=0.0))
             await self.spot.stop_loss_order(symbol, quantity, stop, limit, client_id)
             self.unprotected.discard(symbol)
+            await self._note_partial(symbol, position, quantity, limit)
             if symbol in self.alerted:
                 self.alerted.discard(symbol)
                 await self.notifier.send(f"[{self.label}] protective stop for {symbol} placed")
@@ -589,6 +629,22 @@ class LiveExecutor:
                     f"has no exchange stop; retrying at every reconciliation"
                 )
 
+    async def _note_partial(
+        self, symbol: str, position: float, quantity: float, price: float
+    ) -> None:
+        """Flag coins beyond a placed stop; it is not replaced for them between events."""
+        uncovered = position - quantity
+        if not self._stoppable(self.spot.rules[symbol], uncovered, price):
+            self.partial.pop(symbol, None)
+            return
+        log.warning("stop_partial", symbol=symbol, quantity=quantity, position=position)
+        if symbol not in self.partial:
+            await self.notifier.send(
+                f"[{self.label}] {symbol}: the stop covers {quantity:.6f} of {position:.6f}; "
+                f"other orders lock the rest, which has no exchange stop"
+            )
+        self.partial[symbol] = uncovered
+
 
 class BinanceBookTicker:
     """Paper price source: the public book ticker."""
@@ -599,7 +655,15 @@ class BinanceBookTicker:
         self.client = client
 
     async def price(self, symbol: str, side: int) -> float:
-        response = await self.client.get(self.URL, params={"symbol": symbol}, timeout=10.0)
+        for attempt in range(PRICE_ATTEMPTS):
+            try:
+                response = await self.client.get(self.URL, params={"symbol": symbol}, timeout=10.0)
+                if response.status_code < 500 or attempt == PRICE_ATTEMPTS - 1:
+                    break
+            except httpx.TransportError:
+                if attempt == PRICE_ATTEMPTS - 1:
+                    raise
+            await asyncio.sleep(2**attempt)
         response.raise_for_status()
         data = response.json()
         return float(data["askPrice"] if side > 0 else data["bidPrice"])

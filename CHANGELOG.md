@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.5.0 (2026-10-10)
+
+Product readiness: five reviews of 0.4.2 (new users, months of unattended running, security, packaging and portability, and the 0.4.2 changes themselves). Upgrade notes:
+- `tbot update` works from 0.4.2 on.
+- `tbot doctor` now fails a `mode: live` config without Telegram, so `tbot autostart` refuses it until `tbot notify` has set alerts up. Testnet and paper only warn, as before.
+- `tbot notify` now picks the chat by a one-time code you send to the bot (in a group as a command, `/<code>@<bot name>`), and only at a terminal. A chat id already in `.env` stays.
+- The heartbeat now pauses while a stream is stale or new orders wait for reconciliation, so your monitor reports the bot down then; a halted bot still pings.
+- A supervised session (autostart) writes only warnings and errors to `logs\<config>.console.txt`; the JSON log keeps everything.
+
+**Live trading**
+- A connection lost while reading (balances, prices, order lookups, open orders) is retried instead of costing the bar's orders until the next 4h bar. Orders are still never sent twice.
+- A rate limit or IP ban Binance asks to wait out is waited out without further requests, which made bans longer.
+- Symbol rules (price and lot steps, minimums) are read again every hour and right after Binance refuses an order for them; before, a changed filter failed every order and stop until a restart by hand.
+- A pair Binance pauses (`BREAK`) no longer stops the start, or every other pair, for good: its orders and stops wait, the rest trades, and Telegram says when it stops and starts trading.
+- A key whose signature Binance rejects (a wrong secret, or an Ed25519 or RSA key; tbot signs with HMAC) ends the start with exit 4 and a hint, instead of a retry every 15 minutes forever.
+- A sale or stop never asks for more than the free balance: a balance a hair under a lot step (99.99999999 of 100) was rounded up and refused at every bar since 0.4.2.
+- A stop that covers only part of a position, because other orders lock the rest, is alerted once and named in the summary.
+- A lowered `initial_cash` that the bot's cash covered owes nothing: since 0.4.2 every cut set a floor below zero for the book's cash, and a book that went negative for another reason was no longer set back to zero. What a cut still owes now shrinks as sales repay it.
+
+**Alerts and monitoring**
+- An alert Telegram cannot take (no network, Telegram down or busy) is sent again until it goes through, for up to a day; it was dropped, and the alert about an outage is the one most likely to meet one. A stream reported stale is reported back when its bars arrive.
+- `tbot notify` takes only the chat that sends the code it shows: bot names are public, and the first chat that had written to the bot, possibly a stranger's, could be saved with Enter or without a terminal.
+- `tbot doctor` no longer prints the heartbeat URL when a ping fails, names paused and unknown symbols, and says which key type a rejected key must be.
+- The start alert and event, `tbot status`, `tbot doctor`, and the session's first console line name the version.
+
+**Command line**
+- `tbot` and `python -m tbot` run in the repository folder wherever they are typed, as `tbot.cmd` always did: a session started from another folder began a second book there.
+- `tbot status` and `tbot doctor` point out two configs that name one ledger (a copied config without its own `ledger:`).
+- A supervised restart that meets `tbot status` or another command reading the ledger at that moment waits for it instead of ending the supervisor without an alert (since 0.4.2).
+- YAML merge keys (`<<: *defaults`) load again; 0.4.2 refused them.
+- `tbot account` without keys says so before any request; the missing-keys message says where keys come from; `tbot check` with no data points at `tbot download`; a missing ledger names the command that starts it; `--data-dir`, `--workers`, and `stop --timeout` explain themselves; `TBOT_DEBUG=0` no longer turns on tracebacks; a config that does not load fits on its `tbot status` line.
+
+**Windows scripts**
+- `tbot setup -h`, `tbot update -h`, and `tbot autostart -h` show each description at its own parameter; they were shifted by one.
+- `tbot autostart` replaces, and `-Remove` removes, a task whose repository folder was moved or renamed, instead of refusing it as another folder's task; a mistyped config name says how to remove a task only an administrator sees.
+
+**Research**
+- Parallel sweeps (`tbot validate`) start their workers fresh on every system: on Linux, forking a process that runs polars threads can deadlock.
+
+**Project**
+- GitHub Actions run the git guard's audit, ruff, mypy, the tests, and a package build on Windows and Linux for every push, and every Monday against the newest dependencies.
+- The git guard catches heartbeat ping URLs and Telegram tokens of longer bot ids, and no longer reads icons and bitmaps as UTF-16 text (it reported Hangul in them since 0.4.2).
+- New: [docs/CONFIG.md](docs/CONFIG.md) (every setting), [SECURITY.md](SECURITY.md), and README sections on Linux and macOS (a systemd unit), moving to another PC, uninstalling, troubleshooting, and security.
+
+**Tests**
+- 34 new tests (448 in all). Undoing any of 46 fixes makes a test fail; the sweep's start method shows only on Linux, in CI.
+
 ## 0.4.2 (2026-10-10)
 
 Fixes from five reviews of 0.4.1 (live orders, the session loop and monitoring, the backtest, data and research, the command line and scripts). Upgrade notes:

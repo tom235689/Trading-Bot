@@ -12,7 +12,11 @@ MAX_BYTES = 20 * 1024 * 1024
 BACKUPS = 5
 
 
-def configure_logging(log_file: Path | None = None, level: int = logging.INFO) -> None:
+def configure_logging(
+    log_file: Path | None = None, level: int = logging.INFO, console_level: int = logging.NOTSET
+) -> None:
+    """Console lines plus JSON lines in log_file; console_level can show less on the console,
+    such as a supervisor's console file that would otherwise grow for as long as the bot runs."""
     shared: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
@@ -31,6 +35,7 @@ def configure_logging(log_file: Path | None = None, level: int = logging.INFO) -
     root.setLevel(level)
 
     console = logging.StreamHandler(sys.stderr)
+    console.setLevel(console_level)
     console.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             processors=[

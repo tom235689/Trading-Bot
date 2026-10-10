@@ -228,3 +228,58 @@ def test_a_ledger_of_another_mode_and_a_waiting_stop_are_named(tmp_path: Path) -
     assert found["ledger"][0][0] == "fail"
     assert "keeps a live book, not a paper one" in found["ledger"][0][1]
     assert found["stop"][0][0] == "warn"
+
+
+def test_real_money_needs_alerts_and_a_failed_ping_keeps_its_url_secret(tmp_path: Path) -> None:
+    found = by_name(check(live(tmp_path), settings(**KEYS), fake()))
+    assert found["telegram"][0][0] == "fail"  # nobody would hear that it failed
+    testnet = by_name(check(live(tmp_path, mode="testnet"), settings(**KEYS), fake()))
+    assert testnet["telegram"][0][0] == "warn"
+
+    secret = "https://hc-ping.com/" + "0f3e9a1c-" * 4
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, request=request)
+
+    async def ping() -> list[Check]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as client:
+            config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+            return await run_checks(config, settings(heartbeat_url=secret), client)
+
+    [beat] = [c for c in asyncio.run(ping()) if c.name == "heartbeat"]
+    assert beat.status == "fail"
+    assert "hc-ping" not in beat.detail
+
+
+def test_paused_and_unknown_symbols_are_named(tmp_path: Path) -> None:
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    found = by_name(check(config, settings(**ALERTS), fake(statuses={"ETHUSDT": "BREAK"})))
+    assert found["symbols"] == [
+        ("warn", "Binance does not trade ETHUSDT BREAK now; its orders wait until it does")
+    ]
+    gone = fake(rules={"BTCUSDT": fake().rules["BTCUSDT"]})
+    assert by_name(check(config, settings(**ALERTS), gone))["symbols"] == [
+        ("fail", "unknown symbols: ETHUSDT")
+    ]
+
+
+def test_doctor_names_its_version(tmp_path: Path) -> None:
+    from tbot import __version__
+
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    text = checks_text(check(config, settings(**ALERTS), fake()))
+    assert text.splitlines()[0] == f"tbot {__version__}"
+
+
+def test_a_symbol_binance_does_not_list_is_named_among_those_asked(tmp_path: Path) -> None:
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    spot = fake()
+    answers = [
+        httpx.Response(200),  # the heartbeat ping
+        httpx.Response(200, json={"serverTime": int(time.time() * 1000)}),
+        httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."}),
+    ]
+    spot.fail_next = answers
+    assert by_name(check(config, settings(**ALERTS), spot))["symbols"] == [
+        ("fail", "Binance lists not all of BTCUSDT, ETHUSDT")
+    ]
