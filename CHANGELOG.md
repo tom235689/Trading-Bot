@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1 (2026-10-10)
+
+- Linux and macOS: an `--out` or `--html` value ending in a backslash names a folder, as on Windows; it named a file such as `new\/a.html`. The new CI found it on its first Linux run.
+- CI: failed tests also show as annotations on the commit page.
+
 ## 0.5.0 (2026-10-10)
 
 Product readiness: five reviews of 0.4.2 (new users, months of unattended running, security, packaging and portability, and the 0.4.2 changes themselves). Upgrade notes:
