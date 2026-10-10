@@ -3,11 +3,10 @@
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from tbot.core.config import TradingConfig
+from tbot.core.config import TradingConfig, load_yaml
 from tbot.risk.guard import GuardConfig
 
 
@@ -47,11 +46,11 @@ class LiveConfig(SessionConfig):
 
 
 def load_paper_config(path: Path) -> PaperConfig:
-    return PaperConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    return PaperConfig.model_validate(load_yaml(path.read_text(encoding="utf-8")))
 
 
 def load_live_config(path: Path) -> LiveConfig:
-    return LiveConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    return LiveConfig.model_validate(load_yaml(path.read_text(encoding="utf-8")))
 
 
 class Settings(BaseSettings):

@@ -4,10 +4,9 @@ from datetime import date
 from pathlib import Path
 from typing import Self
 
-import yaml
 from pydantic import model_validator
 
-from tbot.core.config import StrategyConfig, TradingConfig
+from tbot.core.config import StrategyConfig, TradingConfig, load_yaml
 from tbot.risk.guard import GuardConfig
 
 __all__ = ["BacktestConfig", "StrategyConfig", "load_config"]
@@ -31,4 +30,4 @@ class BacktestConfig(TradingConfig):
 
 
 def load_config(path: Path) -> BacktestConfig:
-    return BacktestConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    return BacktestConfig.model_validate(load_yaml(path.read_text(encoding="utf-8")))

@@ -21,9 +21,24 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+$named = [bool] $Name  # a task named outright may belong to no config here
 if (-not $Name) { $Name = "tbot " + [IO.Path]::GetFileNameWithoutExtension($Config) }
 
 $task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+$runner = Join-Path $PSScriptRoot "run_bot.ps1"
+if ($task) {
+    $other = Get-TaskRunner $task
+    if (-not $other -or -not (Test-SameFile $other $runner)) {
+        $owner = if ($other) { "the bot of another folder ($other)" } else { "no tbot task" }
+        Write-Output "'$Name' is $($owner): remove it from there, or in Task Scheduler"
+        exit 1
+    }
+} elseif (-not $named) {
+    try { $null = Resolve-Config $repo $Config } catch {
+        Write-Output "no task '$Name' here, and $($_.Exception.Message)"  # a typo: no prompt for it
+        exit 1
+    }
+}
 if ($DryRun) {
     if ($task) {
         Write-Output "would stop the bot gracefully and remove '$Name' ($($task.State))"

@@ -3,7 +3,7 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
-from tbot.data.http import describe_error, get_bytes
+from tbot.data.http import describe_error, get_bytes, retry_after
 
 URL = "https://example.test/x"
 
@@ -76,3 +76,15 @@ def test_a_long_retry_after_fails_at_once(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(httpx.HTTPStatusError):
         get_bytes(client, URL)
     assert (calls, waits) == ([1], [])  # banned for two hours: say so now, do not sleep
+
+
+def test_a_retry_after_date_falls_back_to_the_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("tbot.data.http.time.sleep", waits.append)
+    date = {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+    client, calls = client_for([httpx.Response(429, headers=date), httpx.Response(200)])
+    assert get_bytes(client, URL, backoff=2.0) == b""
+    assert (calls, waits) == ([2], [2.0])
+    limited = httpx.Response(429, headers=date, request=httpx.Request("GET", URL))
+    error = httpx.HTTPStatusError("x", request=limited.request, response=limited)
+    assert retry_after(error) == 60.0

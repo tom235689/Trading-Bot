@@ -109,3 +109,15 @@ def test_a_midnight_close_ends_the_day_before() -> None:
     daily = _dated_returns(result, "r")
     assert daily["day"].to_list() == [date(2024, 1, 1)]
     assert daily["r"].to_list() == pytest.approx([0.1])
+
+
+def test_every_row_covers_the_same_period(store: BarStore) -> None:
+    # A 4h stream that runs on after the 1h one: no row may go on after the 1h one ends.
+    closes = [100.0 * (1.02 if (i // 10) % 2 else 0.98) ** (i % 10) for i in range(600)]
+    store.write("ETHUSDT", Timeframe.H4, price_bars(T0, Timeframe.H4, closes, closes))
+    base = BacktestConfig.model_validate(CONFIG)
+    eth = base.strategies[1].model_copy(update={"symbols": ["ETHUSDT"], "timeframe": Timeframe.H4})
+    config = base.model_copy(update={"strategies": [base.strategies[0], eth]})
+    attribution = run_attribution(config, store)
+    ends = {row.label: row.metrics.end for row in attribution.rows}
+    assert len(set(ends.values())) == 1, ends

@@ -43,9 +43,12 @@ def history_bars(slots: Sequence[StrategySlot], risk: RiskLimits) -> dict[Stream
     return lookback
 
 
-def run_backtest(config: BacktestConfig, store: BarStore) -> BacktestResult:
-    end = _utc(config.end) if config.end else None
-    return run_period(config, store, _utc(config.start), end, config.guard)
+def run_backtest(
+    config: BacktestConfig, store: BarStore, *, until: datetime | None = None
+) -> BacktestResult:
+    """Backtest config's period; until, if earlier than its end, stops the run there."""
+    ends = [end for end in (_utc(config.end) if config.end else None, until) if end is not None]
+    return run_period(config, store, _utc(config.start), min(ends, default=None), config.guard)
 
 
 def run_period(
@@ -55,9 +58,9 @@ def run_period(
     end: datetime | None,
     guard: GuardConfig | None = None,
 ) -> BacktestResult:
-    """Trade config's settings from the first bar close at or after start; end excludes bars
-    opening at or after it. Every stream stops at the earliest last close among them, so none
-    is valued at a stale price while the others move on (`data_ends` tells which)."""
+    """Trade config's settings from the first bar close at or after start to end, if given.
+    Every stream stops at the earliest last close among them, so none is valued at a stale
+    price while the others move on (`data_ends` tells which)."""
     slots = build_slots(config.strategies)
 
     bars: dict[StreamKey, pl.DataFrame] = {}
@@ -67,6 +70,8 @@ def run_period(
             raise ValueError(f"no stored bars for {symbol} {timeframe}; run `tbot download`")
         bars[(symbol, timeframe)] = frame
     common = min(_last_close(key, frame) for key, frame in bars.items())
+    if end is not None:  # a bar opening before end may close after it
+        common = min(common, end)
     bars = {
         key: frame.filter(pl.col("open_time") + key[1].delta <= common)
         for key, frame in bars.items()

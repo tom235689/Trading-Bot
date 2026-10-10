@@ -136,7 +136,7 @@ class FakeSpot:
         if path == "/sapi/v1/account/apiRestrictions":
             return httpx.Response(200, json=self.restrictions)
         if path == "/api/v3/order" and request.method == "POST":
-            response = self._place(params)
+            response = _answer(self._place(params), params)
             if self.lose_next_order_response and response.status_code == 200:
                 self.lose_next_order_response = False
                 raise httpx.ConnectError("response lost")
@@ -285,6 +285,21 @@ class FakeSpot:
 
     def _fee_price(self, asset: str, quote: str) -> float:
         return self.prices[f"{asset}{quote}"]
+
+
+def _answer(response: httpx.Response, params: dict[str, str]) -> httpx.Response:
+    """The order answer Binance gives: FULL by default for MARKET and LIMIT, else ACK."""
+    if response.status_code != 200:
+        return response
+    order = response.json()
+    default = "FULL" if order["type"] in ("MARKET", "LIMIT") else "ACK"
+    kind = params.get("newOrderRespType", default)
+    if kind == "ACK":
+        keys = ("symbol", "orderId", "clientOrderId")
+        return httpx.Response(200, json={**{k: order[k] for k in keys}, "orderListId": -1})
+    if kind == "RESULT":
+        return httpx.Response(200, json={k: v for k, v in order.items() if k != "fills"})
+    return response
 
 
 def _error(status: int, code: int, message: str) -> httpx.Response:

@@ -20,11 +20,11 @@ from pydantic import ValidationError
 
 from tbot import __version__
 from tbot.backtest.attribution import format_attribution, run_attribution
-from tbot.backtest.config import load_config
+from tbot.backtest.config import BacktestConfig, load_config
 from tbot.backtest.metrics import compute_metrics
 from tbot.backtest.report import format_metrics
-from tbot.backtest.runner import data_ends, run_backtest
-from tbot.core.config import TradingConfig
+from tbot.backtest.runner import data_ends, history_bars, run_backtest
+from tbot.core.config import TradingConfig, load_yaml
 from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.http import describe_error, retry_after
@@ -38,8 +38,11 @@ from tbot.live.doctor import Check, checks_text, run_checks
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.overview import broken_row, overview_text, session_row
 from tbot.live.runner import (
+    KEYS_MISSING,
     STOP_REQUEST_SECONDS,
     AlreadyRunning,
+    LedgerModeError,
+    StartRefused,
     account_text,
     is_running,
     load_guard,
@@ -90,6 +93,7 @@ DEFAULT_TIMEFRAMES = [Timeframe.H1, Timeframe.H4]
 DEFAULT_START = "2017-08-01"
 MAX_LISTED = 10
 CONFIG_DIR = Path("config")
+CONFIG_SUFFIXES = (".yaml", ".yml")
 CHAT_WAIT_SECONDS = 120  # `tbot notify` waits this long for a first message to the bot
 
 
@@ -97,14 +101,19 @@ def config_arg(value: str) -> Path:
     """A config file, or the name of one in config/: `paper` is config/paper.yaml."""
     path = Path(value)
     if not path.exists() and not path.suffix and path.name == value:
-        named = CONFIG_DIR / f"{value}.yaml"
-        if named.is_file():
-            return named
+        for suffix in CONFIG_SUFFIXES:
+            named = CONFIG_DIR / f"{value}{suffix}"
+            if named.is_file():
+                return named
     return path
 
 
+def config_files() -> list[Path]:
+    return sorted(path for suffix in CONFIG_SUFFIXES for path in CONFIG_DIR.glob(f"*{suffix}"))
+
+
 def config_names() -> list[str]:
-    return sorted(path.stem for path in CONFIG_DIR.glob("*.yaml"))
+    return sorted(path.stem for path in config_files())
 
 
 def short_name(path: Path) -> str:
@@ -139,7 +148,7 @@ def config_kind(raw: dict[str, Any]) -> str:
 
 def read_yaml(path: Path) -> dict[str, Any]:
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        raw = load_yaml(path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
         names = ", ".join(config_names()) or "none"
         raise ConfigError(f"{path}: no such config (names in {CONFIG_DIR}/: {names})") from None
@@ -167,7 +176,7 @@ def load[T](path: Path, loader: Callable[[Path], T]) -> T:
         raise ConfigError(f"{path}: {exc}") from None
 
 
-def check_strategies(path: Path, config: SessionConfig) -> None:
+def check_strategies(path: Path, config: TradingConfig) -> None:
     """Strategy names and params are checked when slots are built; do it before starting."""
     try:
         build_slots(config.strategies)
@@ -209,7 +218,7 @@ def scan_configs() -> tuple[list[tuple[Path, SessionConfig]], list[Broken]]:
     order = {"paper": 0, "testnet": 1, "live": 2}
     found: dict[Path, tuple[Path, SessionConfig]] = {}
     broken: list[Broken] = []
-    for path in sorted(CONFIG_DIR.glob("*.yaml"), key=lambda p: (order.get(p.stem, 3), p.stem)):
+    for path in sorted(config_files(), key=lambda p: (order.get(p.stem, 3), p.stem)):
         try:
             raw = read_yaml(path)
         except ConfigError as exc:
@@ -373,7 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dashboard = session("dashboard", "write an HTML dashboard of a session and open it")
     dashboard.add_argument("--data-dir", type=Path, default=Path("data"))
-    dashboard.add_argument("--out", type=Path, default=None, help="default reports/<name>.html")
+    dashboard.add_argument("--out", default=None, help="a file or folder (default: reports/)")
     dashboard.add_argument("--no-open", action="store_true", help="do not open it in a browser")
 
     compare = session("compare", "compare a session with a backtest of the same period")
@@ -381,7 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     backup = session("backup", "copy a session ledger, also while it runs")
     backup.add_argument(
-        "--out", type=Path, default=None, help="a file or folder (default: backups/ by the ledger)"
+        "--out", default=None, help="a file or folder (default: backups/ by the ledger)"
     )
 
     session("resume", "clear the kill switch of a halted session", "the halted one")
@@ -425,7 +434,9 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument(
         "--attribution", action="store_true", help="also run each strategy alone and compare"
     )
-    backtest.add_argument("--html", type=Path, default=None, help="write an HTML dashboard")
+    backtest.add_argument(
+        "--html", default=None, help="write an HTML dashboard to this file or folder"
+    )
     backtest.add_argument("--no-open", action="store_true", help="do not open the HTML file")
 
     validate = command("validate", "run the validation pipeline")
@@ -477,7 +488,7 @@ def print_report(symbol: str, timeframe: Timeframe, report: QualityReport) -> No
         "duplicates": report.duplicates,
         "misaligned": report.misaligned,
         "incomplete": report.incomplete,
-        "invalid prices": report.invalid_prices,
+        "invalid values": report.invalid_values,
     }
     for name, count in errors.items():
         if count:
@@ -537,8 +548,36 @@ def print_notes(config: TradingConfig, store: BarStore) -> None:
         )
 
 
+def check_period(config: BacktestConfig, store: BarStore) -> None:
+    """A period outside the stored bars would run on nothing; say what is stored."""
+    for key in history_bars(build_slots(config.strategies), config.risk):
+        first, last = store.first_open_time(*key), store.last_open_time(*key)
+        if first is None or last is None:
+            continue  # the backtest names the missing stream
+        stored = f"{key[0]} {key[1]} is stored from {first:%Y-%m-%d} to {last:%Y-%m-%d}"
+        if last + key[1].delta <= utc_day(config.start):
+            raise ValueError(f"{stored}, before the period starts: run `tbot download`")
+        if config.end is not None and utc_day(config.end) <= first:
+            raise ValueError(f"{stored}, after the period ends: no download goes back further")
+
+
+def utc_day(day: date) -> datetime:
+    return datetime.combine(day, time(), tzinfo=UTC)
+
+
+def output_file(value: str | None, folder: Path, name: str) -> Path:
+    """Where to write: the file named, or `name` in a folder (one that exists, or a path
+    ending in a slash), or `name` in folder when nothing is named."""
+    if value is None:
+        return folder / name
+    path = Path(value)
+    return path / name if path.is_dir() or value.endswith(("/", "\\")) else path
+
+
 def run_backtest_command(args: argparse.Namespace) -> int:
     config = load(args.config, load_config)
+    check_strategies(args.config, config)
+    check_period(config, BarStore(args.data_dir))
     print_notes(config, BarStore(args.data_dir))
     result = run_backtest(config, BarStore(args.data_dir))
     metrics = compute_metrics(result)
@@ -566,7 +605,8 @@ def run_backtest_command(args: argparse.Namespace) -> int:
     if args.html:
         subtitle = f"{args.config}, {config.start} to {config.end or 'latest'}"
         data = from_backtest(result, f"Backtest {args.config.stem}", subtitle)
-        write_dashboard(data, args.html, show=not args.no_open)
+        out = output_file(args.html, Path("reports"), f"{args.config.stem}.html")
+        write_dashboard(data, out, show=not args.no_open)
     return 0
 
 
@@ -581,7 +621,7 @@ def write_dashboard(data: DashboardData, out: Path, *, show: bool = False) -> No
 def run_dashboard_command(args: argparse.Namespace) -> int:
     path = args.config or pick_config("dashboard")
     config = existing_ledger(load_session_config(path))
-    out = args.out or Path("reports") / f"{path.stem}.html"
+    out = output_file(args.out, Path("reports"), f"{path.stem}.html")
     kind = config.mode.capitalize() if isinstance(config, LiveConfig) else "Paper"
     title = f"{kind} session {path.stem}"
     write_dashboard(from_ledger(config, BarStore(args.data_dir), title), out, show=not args.no_open)
@@ -590,6 +630,7 @@ def run_dashboard_command(args: argparse.Namespace) -> int:
 
 def run_validate_command(args: argparse.Namespace) -> int:
     config, base = load(args.config, load_validation_config)
+    check_period(base, BarStore(args.data_dir))
     print_notes(base, BarStore(args.data_dir))
     report = run_validation(
         config,
@@ -608,6 +649,7 @@ def run_paper_command(args: argparse.Namespace) -> int:
     if not isinstance(config, PaperConfig):
         raise ConfigError(f"this is a live config; use `tbot live {short_name(args.config)}`")
     check_strategies(args.config, config)
+    not_running(config)
     log_file = args.log_file or log_path(args.config)
     announce("paper", args.config, config, log_file)
     configure_logging(log_file)
@@ -621,10 +663,19 @@ def run_live_command(args: argparse.Namespace) -> int:
     if config.mode != "live" and args.live:
         raise ConfigError("--live is only for mode: live; this config trades on the testnet")
     check_strategies(args.config, config)
+    settings = Settings()
+    if not settings.binance_api_key or not settings.binance_api_secret:
+        raise ConfigError(KEYS_MISSING)  # every start would fail the same way
+    not_running(config)
     log_file = args.log_file or log_path(args.config)
     announce(config.mode, args.config, config, log_file)
     configure_logging(log_file)
-    return asyncio.run(run_live(config, Settings(), args.data_dir, confirmed=args.live))
+    return asyncio.run(run_live(config, settings, args.data_dir, confirmed=args.live))
+
+
+def not_running(config: SessionConfig) -> None:
+    if config.ledger.is_file() and is_running(config.ledger):
+        raise AlreadyRunning(f"a session already runs on {config.ledger}: `tbot status` shows it")
 
 
 def announce(kind: str, path: Path, config: SessionConfig, log_file: Path) -> None:
@@ -656,6 +707,8 @@ def run_status_command(args: argparse.Namespace) -> int:
 
 
 def run_log_command(args: argparse.Namespace) -> int:
+    if args.file is None and args.config is not None:
+        read_yaml(args.config)  # a typo is no config, not a log yet to come
     path = args.file or log_path(args.config or pick_config("log"))
     minimum = LEVELS.index(args.level)
     if isinstance(sys.stdout, io.TextIOWrapper):  # a console that cannot show a character
@@ -717,7 +770,7 @@ def run_stop_command(args: argparse.Namespace) -> int:
         else:
             started = [p for p, config in session_configs() if config.ledger.is_file()]
             if len(started) != 1:
-                print("no session is running")
+                print(f"no session from {CONFIG_DIR}/ is running (another file: tbot stop <file>)")
                 return 0
             path = picked(started[0])  # its supervisor may be about to start it again
     ledger = stop_ledger(path)
@@ -761,9 +814,7 @@ def run_compare_command(args: argparse.Namespace) -> int:
 def run_backup_command(args: argparse.Namespace) -> int:
     config = existing_ledger(load_session_config(args.config or pick_config("backup")))
     name = f"{config.ledger.stem}-{datetime.now(UTC):%Y%m%d-%H%M%S}.sqlite"
-    out = args.out or backup_dir(config.ledger) / name
-    if out.is_dir():  # a folder, such as a synced one
-        out = out / name
+    out = output_file(args.out, backup_dir(config.ledger), name)  # a folder: a synced one
     with Ledger(config.ledger) as ledger:
         ledger.backup(out)
     print(f"wrote {out}")
@@ -850,7 +901,13 @@ async def set_up_telegram(token: str, chat_id: str | None, new_token: bool, env:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in (401, 404):
                 print("Telegram does not know this token: copy it again from @BotFather")
-                return EXIT_ERROR
+                if new_token or not interactive():
+                    print(f"(it is TBOT_TELEGRAM_TOKEN in {env})")
+                    return EXIT_ERROR
+                token = input("Paste the new token here, or press Enter to stop: ").strip()
+                if not token:
+                    return EXIT_ERROR
+                return await set_up_telegram(token, chat_id, True, env)
             print(f"cannot reach Telegram ({describe_error(exc)})")
             return EXIT_ERROR
         except httpx.HTTPError as exc:
@@ -964,6 +1021,8 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(str(exc.code), EXIT_CONFIG, alert=session)
     except (LedgerUnavailable, AlreadyRunning) as exc:
         return _fail(str(exc), EXIT_LEDGER, alert=session and isinstance(exc, LedgerUnavailable))
+    except (LedgerModeError, StartRefused) as exc:
+        return _fail(f"error: {exc}", EXIT_CONFIG, alert=session)
     except UnicodeDecodeError as exc:  # .env or a config saved as UTF-16: fix the file
         return _fail(f"error: {brief(exc)}", EXIT_CONFIG, alert=False)
     except KeyboardInterrupt:

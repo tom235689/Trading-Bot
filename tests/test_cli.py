@@ -21,8 +21,10 @@ from tbot.cli import (
     announce,
     build_parser,
     config_arg,
+    config_names,
     load_session_config,
     main,
+    output_file,
     parse_symbol,
     pick_config,
     print_notes,
@@ -30,7 +32,7 @@ from tbot.cli import (
 )
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
-from tbot.live.config import save_settings
+from tbot.live.config import Settings, save_settings
 from tbot.live.ledger import EquityPoint, Ledger
 from tbot.live.runner import (
     GUARD_META,
@@ -129,7 +131,7 @@ def test_errors_end_in_one_line(tmp_path: Path, capsys: pytest.CaptureFixture[st
         "  - {name: nope, symbols: [BTCUSDT], timeframe: 4h, allocation: 1.0}\n",
         encoding="utf-8",
     )
-    assert main(["backtest", str(unknown), "--data-dir", empty]) == EXIT_ERROR
+    assert main(["backtest", str(unknown), "--data-dir", empty]) == EXIT_CONFIG  # before it runs
     assert "unknown strategy 'nope'" in capsys.readouterr().err
 
     paper = tmp_path / "paper.yaml"
@@ -277,7 +279,9 @@ def test_session_commands_find_the_config_they_mean(
         assert main(["stop", "--timeout", "0"]) == EXIT_ERROR  # asked; it did not react
         assert "still running: `tbot log testnet`" in capsys.readouterr().err
     assert main(["stop"]) == 0
-    assert capsys.readouterr().out == "no session is running\n"
+    assert capsys.readouterr().out == (
+        "no session from config/ is running (another file: tbot stop <file>)\n"
+    )
     assert main(["stop", "--cancel"]) == 0
     assert capsys.readouterr().out == "stop request for testnet withdrawn\n"
 
@@ -335,6 +339,9 @@ def test_log_shows_readable_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    assert main(["log", "papr"]) == EXIT_CONFIG  # a typo: no log to wait for
+    assert capsys.readouterr().err.startswith("papr: no such config")
     assert main(["log", "paper"]) == EXIT_ERROR
     assert (
         capsys.readouterr().out
@@ -599,3 +606,107 @@ def test_backtest_notes_symbols_that_trade_on_different_bars(
     )
     print_notes(config, BarStore(tmp_path))
     assert "symbols trade on different bars (BTCUSDT 1h, ETHUSDT 4h)" in capsys.readouterr().out
+
+
+def test_a_key_given_twice_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    paper = tmp_path / "config" / "paper.yaml"
+    paper.write_text(paper.read_text("utf-8") + "initial_cash: 500\ninitial_cash: 50000\n", "utf-8")
+    assert main(["status", "paper"]) == EXIT_CONFIG
+    assert "key 'initial_cash' given twice" in capsys.readouterr().err
+
+
+def test_a_start_without_keys_ends_for_good(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    monkeypatch.setattr("tbot.cli.Settings", lambda: Settings(_env_file=None))  # type: ignore[call-arg]
+    for name in ("TBOT_BINANCE_API_KEY", "TBOT_BINANCE_API_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+    assert main(["live", "testnet"]) == EXIT_CONFIG  # the supervisor gives up: no retry helps
+    assert "set TBOT_BINANCE_API_KEY" in capsys.readouterr().err
+    assert not (tmp_path / "testnet.sqlite").exists()  # no ledger left for nothing
+
+
+def test_a_grid_typo_fails_before_any_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "base.yaml").write_text(f"start: 2020-01-01\nstrategies:\n{STRATEGY}", "utf-8")
+    validation = tmp_path / "validation.yaml"
+    for grid in ("{entri: [20, 30]}", "{entry: []}"):
+        validation.write_text(
+            f"backtest: base.yaml\nholdout_start: 2024-01-01\ngrid: {grid}\n", "utf-8"
+        )
+        assert main(["validate", str(validation), "--data-dir", str(tmp_path)]) == EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "entri" in err
+    assert "grid: no values for entry" in err
+    assert not (tmp_path / "trials.jsonl").exists()  # nothing ran, nothing was logged
+
+
+def test_a_period_outside_the_stored_bars_is_named(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = BarStore(tmp_path)
+    store.write(
+        "BTCUSDT", Timeframe.H4, make_bars(datetime(2024, 1, 1, tzinfo=UTC), 30, Timeframe.H4)
+    )
+    config = tmp_path / "late.yaml"
+    config.write_text(f"start: 2025-01-01\nstrategies:\n{STRATEGY}", "utf-8")
+    assert main(["backtest", str(config), "--data-dir", str(tmp_path)]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "BTCUSDT 4h is stored from 2024-01-01 to 2024-01-05, before the period starts" in err
+    assert not (tmp_path / "trials.jsonl").exists()
+
+
+def test_output_can_be_a_folder(tmp_path: Path) -> None:
+    assert output_file(None, Path("reports"), "a.html") == Path("reports") / "a.html"
+    assert output_file(str(tmp_path), Path("reports"), "a.html") == tmp_path / "a.html"
+    assert output_file("new/", Path("reports"), "a.html") == Path("new") / "a.html"
+    assert output_file("new\\", Path("reports"), "a.html") == Path("new") / "a.html"
+    assert output_file("x.html", Path("reports"), "a.html") == Path("x.html")
+
+
+def test_yml_configs_have_names_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    (tmp_path / "config" / "mine.yml").write_text(
+        f"ledger: mine.sqlite\nstrategies:\n{STRATEGY}", "utf-8"
+    )
+    assert config_arg("mine") == Path("config/mine.yml")
+    assert "mine" in config_names()
+
+
+def test_a_second_start_is_refused_before_it_says_how_to_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    with instance_lock(tmp_path / "paper.sqlite"):
+        Ledger(tmp_path / "paper.sqlite").close()
+        assert main(["paper"]) == EXIT_LEDGER
+    err = capsys.readouterr().err
+    assert "a session already runs on paper.sqlite" in err
+    assert "stop it with Ctrl+C" not in err
+
+
+def test_notify_takes_a_new_token_for_a_revoked_one(
+    no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    telegram = FakeTelegram(monkeypatch, [[message(42, "Tom")]])
+    telegram.status = 401  # the token in .env was revoked
+    save_settings(no_telegram, {"TBOT_TELEGRAM_TOKEN": "111:old"})
+    answers = iter(["222:new", ""])  # a new token, then Enter: yes, this chat
+
+    def answer(prompt: str = "") -> str:
+        telegram.status = 200  # Telegram knows the new one
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", answer)
+    monkeypatch.setattr("tbot.cli.interactive", lambda: True)
+    assert main(["notify"]) == 0
+    assert "TBOT_TELEGRAM_TOKEN=222:new\n" in no_telegram.read_text("utf-8")

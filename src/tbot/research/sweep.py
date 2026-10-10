@@ -124,7 +124,10 @@ def neighborhood_mean(
 ) -> float:
     """Mean objective over grid points within one step of center in every parameter.
 
-    A robust parameter set sits on a plateau: its neighbors do nearly as well.
+    A robust parameter set sits on a plateau: its neighbors do nearly as well. A neighbor
+    beyond the grid's edge was never tested and counts as the worst one tested, so a point
+    at the edge averages as many cells as one inside: else the center would weigh more
+    there, and a lone peak in a corner would outscore a plateau.
     """
     index = {name: {value: i for i, value in enumerate(values)} for name, values in grid.items()}
 
@@ -136,15 +139,18 @@ def neighborhood_mean(
     # result, break-even, or the worst qualifying run: else a lone peak among failing
     # neighbors would look like a plateau.
     floor = min((score for score in scores if math.isfinite(score)), default=0.0)
-    values = []
+    tested = []
     for run, score in zip(runs, scores, strict=True):
         if not near(run.params):
             continue
         if not math.isfinite(score):
             raw = float(getattr(run.metrics, objective))
             score = min(raw if math.isfinite(raw) else 0.0, 0.0, floor)
-        values.append(score)
-    return sum(values) / len(values) if values else math.nan
+        tested.append(score)
+    if not tested:
+        return math.nan
+    cells = math.prod(min(3, len(values)) for values in grid.values())  # 9 inside a 2-D grid
+    return (sum(tested) + (cells - len(tested)) * min(tested)) / cells
 
 
 def rank_of(runs: Sequence[SweepRun], params: Mapping[str, Any], objective: str) -> int:

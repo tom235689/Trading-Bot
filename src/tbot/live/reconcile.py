@@ -37,12 +37,15 @@ async def reconcile(
     label: str = "live",
     balances: Mapping[str, Balance] | None = None,
     on_adjust: Callable[[list[Adjustment]], None] | None = None,
+    cash_floor: float = 0.0,
 ) -> list[Adjustment]:
     """Move the book to the exchange where they differ beyond tolerance; record why.
 
     In budget mode the book only moves down to the exchange, never below zero: a book
-    that went negative (a fill booked twice) is set back to zero. on_adjust runs in the
-    same ledger transaction as the adjustments (the guard shift), so a crash splits neither.
+    that went negative (a fill booked twice) is set back to zero. Cash may stay down to
+    cash_floor: a budget lowered by more than the cash held leaves the book owing the rest
+    until sales repay it. on_adjust runs in the same ledger transaction as the adjustments
+    (the guard shift), so a crash splits neither.
     """
     if balances is None:
         balances = await spot.balances()
@@ -65,7 +68,7 @@ async def reconcile(
 
     # Locked quote counts too: an open buy order of the owner's does not shrink the book.
     cash = balances[quote].total if quote in balances else 0.0
-    target = _target(portfolio.cash, cash, ownership)
+    target = _target(portfolio.cash, cash, ownership, min(cash_floor, 0.0))
     if abs(target - portfolio.cash) > max(
         CASH_TOLERANCE, tolerance * max(abs(target), abs(portfolio.cash))
     ):
@@ -89,7 +92,7 @@ async def reconcile(
     return adjustments
 
 
-def _target(booked: float, held: float, ownership: Ownership) -> float:
+def _target(booked: float, held: float, ownership: Ownership, floor: float = 0.0) -> float:
     if ownership == "account":
         return held
-    return max(0.0, min(booked, held))
+    return max(floor, min(booked, held))

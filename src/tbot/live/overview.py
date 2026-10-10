@@ -5,10 +5,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from tbot.data.store import BarStore
-from tbot.live.compare import price_at
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Ledger
-from tbot.live.runner import GUARD_META, base_cash, is_running, restore_portfolio
+from tbot.live.runner import GUARD_META, base_cash, is_running, price_at, restore_portfolio
 from tbot.risk.guard import GuardState
 
 

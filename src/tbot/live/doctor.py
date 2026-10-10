@@ -16,11 +16,15 @@ from tbot.live.backup import daily_backups
 from tbot.live.config import LiveConfig, SessionConfig, Settings
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.runner import (
+    KEYS_MISSING,
     AlreadyRunning,
+    StartRefused,
     instance_lock,
     load_guard,
     make_spot,
+    mode_problem,
     restore_portfolio,
+    stop_path,
     symbols_of,
     unbooked_budget,
     valid_url,
@@ -51,6 +55,10 @@ async def run_checks(
 ) -> list[Check]:
     """Offline leaves out what depends on the network, which a running bot retries."""
     checks = strategy_checks(config) + ledger_checks(config) + alert_checks(settings)
+    if isinstance(config, LiveConfig) and not (
+        settings.binance_api_key and settings.binance_api_secret
+    ):
+        checks.append(Check("fail", "api key", KEYS_MISSING))
     if checks[0].status == "fail":
         return checks  # nothing below means much for a config that cannot start
     if settings.heartbeat_url and valid_url(settings.heartbeat_url) and not offline:
@@ -170,7 +178,11 @@ def ledger_checks(config: SessionConfig) -> list[Check]:
         summary = f"{len(ledger.fills())} fills"
         if point is not None:
             summary = f"equity {point.equity:,.2f} at {point.time:%Y-%m-%d %H:%M} UTC, " + summary
-        checks.append(Check("ok", "ledger", f"{config.ledger}: {summary}"))
+        problem = mode_problem(config, ledger)
+        if problem:
+            checks.append(Check("fail", "ledger", problem))
+        else:
+            checks.append(Check("ok", "ledger", f"{config.ledger}: {summary}"))
         if guard.state.halted:
             reason = guard.state.halt_reason
             checks.append(Check("fail", "kill switch", f"halted: {reason}; run `tbot resume`"))
@@ -184,6 +196,16 @@ def ledger_checks(config: SessionConfig) -> list[Check]:
             pass
     except AlreadyRunning:
         checks.append(Check("warn", "process", "a session is running on this ledger now"))
+    else:
+        if stop_path(config.ledger).exists():
+            checks.append(
+                Check(
+                    "warn",
+                    "stop",
+                    "a `tbot stop` request waits: a supervised start within 20 minutes of it "
+                    "stops at once (`tbot stop --cancel` withdraws it)",
+                )
+            )
     return [*checks, backup]
 
 
@@ -243,10 +265,10 @@ async def account_checks(
         spot = make_spot(
             config, settings, client, lambda: datetime.now(UTC) + timedelta(seconds=offset)
         )
-    except ValueError as exc:
+    except StartRefused:
         url = TESTNET_URL if config.mode == "testnet" else PRODUCTION_URL
         symbols = await symbol_checks(config, BinanceSpot(client, "", "", base_url=url))
-        return [*symbols, Check("fail", "api key", str(exc))]
+        return symbols  # the missing keys are reported above
     checks = await symbol_checks(config, spot)
     try:
         account = await spot.account()

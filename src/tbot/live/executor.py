@@ -12,6 +12,7 @@ import httpx
 import structlog
 
 from tbot.core.models import Fill
+from tbot.core.text import price_text
 from tbot.core.timeframe import to_millis
 from tbot.exchange.binance import (
     NOTHING_TO_CANCEL,
@@ -31,6 +32,7 @@ log = structlog.get_logger(__name__)
 
 STOP_PREFIX = "tbs"
 STOP_META = "stop:"  # + symbol: the protective stop in force and how much of it is booked
+TAG_META = "order_tag"
 BUY_MARGIN = 0.002  # keep this much quote free for price movement between quote and fill
 STOP_LIMIT_GAP = 0.005  # limit price below the stop price so a triggered stop fills
 LOOKUP_DELAYS = (0.5, 1.0, 2.0, 4.0)  # seconds between lookups of an order in doubt
@@ -64,11 +66,22 @@ class Executor(Protocol):
         """Housekeeping once an event's orders are done (exchange-side stops)."""
 
 
-def order_id(now: datetime, symbol: str, quantity: float, attempt: int = 1) -> str:
-    """Client order id from the bar event, symbol, and side; a repeat decision adds `r<n>`."""
+def order_id(now: datetime, symbol: str, quantity: float, attempt: int = 1, tag: str = "") -> str:
+    """Client order id from the session tag, bar event, symbol, and side; a repeat decision
+    adds `r<n>`."""
     suffix = "" if attempt == 1 else f"r{attempt}"
-    head = f"tb{to_millis(now)}{symbol}"[: 35 - len(suffix)]
+    head = f"tb{tag}{to_millis(now)}{symbol}"[: 35 - len(suffix)]
     return f"{head}{'B' if quantity > 0 else 'S'}{suffix}"
+
+
+def session_tag(ledger: Ledger) -> str:
+    """Four hex digits kept in the ledger: two sessions on one account tell their orders
+    apart by it, and neither cancels the other's stops."""
+    tag = ledger.get_meta(TAG_META)
+    if tag is None:
+        tag = uuid4().hex[:4]
+        ledger.set_meta(TAG_META, tag)
+    return tag
 
 
 def _sorted(orders: Mapping[str, float]) -> list[tuple[str, float]]:
@@ -160,6 +173,8 @@ class LiveExecutor:
         self.label = label
         self.unprotected: set[str] = set()  # held symbols whose stop is missing
         self.alerted: set[str] = set()  # stop failures already sent, until one works
+        self.tag = session_tag(ledger)
+        self.stop_prefix = f"{STOP_PREFIX}{self.tag}"
 
     async def execute(
         self,
@@ -231,7 +246,9 @@ class LiveExecutor:
     def _new_id(self, now: datetime, symbol: str, quantity: float) -> str:
         """A second decision at the same close (a late stream) must not reuse an id."""
         attempt = 1
-        while self.ledger.client_id_used(client_id := order_id(now, symbol, quantity, attempt)):
+        while self.ledger.client_id_used(
+            client_id := order_id(now, symbol, quantity, attempt, self.tag)
+        ):
             attempt += 1
         return client_id
 
@@ -437,7 +454,8 @@ class LiveExecutor:
             return 0
         log.warning("stop_executed", symbol=symbol, quantity=quantity, price=fill.price)
         await self.notifier.send(
-            f"[{self.label}] protective stop sold {quantity:.6f} {symbol} @ {fill.price:,.2f}"
+            f"[{self.label}] protective stop sold {quantity:.6f} {symbol} "
+            f"@ {price_text(fill.price)}"
         )
         return 1
 
@@ -459,9 +477,12 @@ class LiveExecutor:
     async def cancel_stops(self, symbol: str, portfolio: Portfolio) -> int:
         """Cancel this bot's stop orders, then book whatever of them executed first."""
         count = 0
+        state = self._stop_state(symbol)
+        tracked = state["id"] if state is not None else None  # also one from before tags
         for order in await self.spot.open_orders(symbol):
-            if not order.client_order_id.startswith(STOP_PREFIX):
-                continue
+            own = order.client_order_id
+            if not (own.startswith(self.stop_prefix) or own == tracked):
+                continue  # another session's stop, or the owner's order
             try:
                 await self.spot.cancel_order(symbol, order.order_id)
             except BinanceError as exc:
@@ -483,6 +504,35 @@ class LiveExecutor:
         for symbol in sorted(self.unprotected):
             await self._protect(symbol, portfolio, marks)
 
+    @staticmethod
+    def _stoppable(rules: SymbolRules, quantity: float, price: float) -> bool:
+        """Whether a stop for this quantity passes the exchange's minimums."""
+        rounded = rules.round_quantity(quantity)
+        return rounded > 0 and rules.acceptable(rounded, price)
+
+    async def _check_cover(
+        self, symbol: str, state: StopState, portfolio: Portfolio, marks: Mapping[str, float]
+    ) -> None:
+        """Flag coins beyond what a triggered, still working stop is going to sell."""
+        try:
+            order = await self.spot.get_order(symbol, state["id"])
+        except (BinanceError, httpx.HTTPError) as exc:
+            log.warning("stop_lookup_failed", symbol=symbol, error=repr(exc))
+            return
+        if order is None or order.done:
+            return  # settle books it, and a new stop covers the whole position
+        uncovered = portfolio.position(symbol) - (order.orig_qty - state["qty"])
+        price = order.stop_price or marks.get(symbol, 0.0)
+        if not self._stoppable(self.spot.rules[symbol], uncovered, price):
+            return
+        self.unprotected.add(symbol)
+        if symbol not in self.alerted:
+            self.alerted.add(symbol)
+            await self.notifier.send(
+                f"[{self.label}] {symbol}: a triggered stop is still filling; the "
+                f"{uncovered:.6f} bought since has no exchange stop until it is done"
+            )
+
     async def _protect(self, symbol: str, portfolio: Portfolio, marks: Mapping[str, float]) -> None:
         if not self.protective_stop_pct:
             self.unprotected.discard(symbol)
@@ -490,7 +540,10 @@ class LiveExecutor:
         rules = self.spot.rules[symbol]
         state = self._stop_state(symbol)
         if state is not None and state["qty"] > 0:
-            return  # triggered and partly filled: the rest is still working; leave it
+            # Triggered and partly filled: the rest is still working; leave it. Coins
+            # bought since then are beyond it, without a stop until it is done.
+            await self._check_cover(symbol, state, portfolio, marks)
+            return
         if any(r.symbol == symbol and r.quantity < 0 for r in self.ledger.unresolved_orders()):
             # A sell in doubt may have sold the book's coins: free coins can be the owner's.
             self.unprotected.add(symbol)  # placed once reconciliation settles it
@@ -504,14 +557,21 @@ class LiveExecutor:
                 return
             balances = await self.spot.balances()
             free = balances[rules.base].free if rules.base in balances else 0.0
-            quantity = rules.round_quantity(min(position, free))
             stop = rules.round_price(marks[symbol] * (1 - self.protective_stop_pct))
             limit = rules.round_price(stop * (1 - STOP_LIMIT_GAP))
-            if quantity == 0 or not rules.acceptable(quantity, limit):
+            if not self._stoppable(rules, position, limit):
                 self.unprotected.discard(symbol)  # dust: nothing an exchange stop can hold
                 self.alerted.discard(symbol)
                 return
-            client_id = f"{STOP_PREFIX}{symbol}{uuid4().hex[:12]}"
+            quantity = rules.round_quantity(min(position, free))
+            if not self._stoppable(rules, quantity, limit):
+                raise ValueError(
+                    f"only {free:.8f} of the {position:.8f} held is free; other orders lock "
+                    "the rest"
+                )
+            if self._stoppable(rules, position - quantity, limit):
+                log.warning("stop_partial", symbol=symbol, quantity=quantity, position=position)
+            client_id = f"{self.stop_prefix}{symbol}{uuid4().hex[:12]}"
             self._set_stop_state(symbol, StopState(id=client_id, qty=0.0, quote=0.0))
             await self.spot.stop_loss_order(symbol, quantity, stop, limit, client_id)
             self.unprotected.discard(symbol)
@@ -547,7 +607,8 @@ class BinanceBookTicker:
 
 def _fill_summary(fill: Fill) -> str:
     side = "BUY" if fill.quantity > 0 else "SELL"
-    return f"{side} {abs(fill.quantity):.6f} {fill.symbol} @ {fill.price:,.2f} fee {fill.fee:.2f}"
+    price = price_text(fill.price)
+    return f"{side} {abs(fill.quantity):.6f} {fill.symbol} @ {price} fee {fill.fee:.2f}"
 
 
 def _fill_text(label: str, fill: Fill, equity: float) -> str:

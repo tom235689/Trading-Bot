@@ -12,7 +12,8 @@ class CostModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     fee_rate: float = Field(default=0.001, ge=0, lt=1)  # Binance spot taker, VIP 0
-    slippage_bps: float = Field(default=5.0, ge=0)  # adverse move from the reference price
+    # Adverse move from the reference price; 10000 would sell for nothing.
+    slippage_bps: float = Field(default=5.0, ge=0, lt=10_000)
 
 
 class SimulatedBroker:

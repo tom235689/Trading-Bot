@@ -30,6 +30,7 @@ DIFF_OPTS = (
     "--src-prefix=a/",  # user diff config must not change how paths are read
     "--dst-prefix=b/",
 )
+BINARY_OPTS = ("--numstat", "-z", "--no-renames", "--no-textconv", "--diff-filter=ACMRT")
 
 # Built from code points so this file stays ASCII.
 HANGUL_RANGES = (
@@ -57,6 +58,7 @@ SECRETS = {
 }
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+ASCII_RUN = re.compile(rb"[\x20-\x7e]{16,}")  # the strings in a binary file
 SCISSORS = re.compile(r"^# -+ >8 -+$")
 
 
@@ -80,6 +82,27 @@ def scan_line(where: str, text: str) -> Iterator[Finding]:
 def scan_text(where: str, text: str) -> Iterator[Finding]:
     for number, line in enumerate(text.split("\n"), start=1):
         yield from scan_line(f"{where}:{number}", line.rstrip("\r"))
+
+
+def blob_text(data: bytes) -> str | None:
+    """The text of a file git treats as binary, when it is UTF-16 (PowerShell 5.1 writes
+    it with `>` and Out-File); None for other binary files."""
+    for bom, codec in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+        if data.startswith(bom):
+            return data[len(bom) :].decode(codec, errors="replace")
+    if len(data) >= 2 and data[1::2].count(0) > len(data) // 4:  # ASCII as UTF-16-LE
+        return data.decode("utf-16-le", errors="replace")
+    return None
+
+
+def scan_blob(where: str, data: bytes) -> Iterator[Finding]:
+    """Scan a file a diff shows only as "Binary files differ"."""
+    text = blob_text(data)
+    if text is not None:
+        yield from scan_text(where, text)
+        return
+    for run in ASCII_RUN.findall(data):
+        yield from scan_line(where, run.decode("ascii"))
 
 
 def is_blocked_path(path: str) -> bool:
@@ -128,6 +151,20 @@ def git(*args: str, cwd: Path | None = None) -> str:
     return result.stdout.decode("utf-8", errors="replace")
 
 
+def git_bytes(*args: str, cwd: Path | None = None) -> bytes:
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=True).stdout
+
+
+def binary_paths(numstat: str) -> list[str]:
+    """Paths `git ... --numstat -z --no-renames` counts as binary ("-" lines)."""
+    paths = []
+    for entry in split_z(numstat):
+        added, deleted, path = entry.split("\t", 2)
+        if added == "-" and deleted == "-":
+            paths.append(path)
+    return paths
+
+
 def git_ok(*args: str, cwd: Path | None = None) -> bool:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True).returncode == 0
 
@@ -140,6 +177,9 @@ def check_staged(cwd: Path | None = None) -> Iterator[Finding]:
     names = git("diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRT", cwd=cwd)
     yield from scan_paths(split_z(names), "staged ")
     yield from scan_diff(git("diff", "--cached", *DIFF_OPTS, cwd=cwd), "staged ")
+    numstat = git("diff", "--cached", *BINARY_OPTS, cwd=cwd)
+    for path in binary_paths(numstat):
+        yield from scan_blob(f"staged {path}", git_bytes("cat-file", "blob", f":{path}", cwd=cwd))
     for var in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
         yield from scan_line(var, git("var", var, cwd=cwd))
 
@@ -170,6 +210,9 @@ def check_commit(sha: str, cwd: Path | None = None) -> Iterator[Finding]:
     names = git(*show, "--name-only", "-z", "--diff-filter=ACMRT", sha, cwd=cwd)
     yield from scan_paths(split_z(names), f"{label} ")
     yield from scan_diff(git(*show, *DIFF_OPTS, sha, cwd=cwd), f"{label} ")
+    for path in binary_paths(git(*show, *BINARY_OPTS, sha, cwd=cwd)):
+        data = git_bytes("cat-file", "blob", f"{sha}:{path}", cwd=cwd)
+        yield from scan_blob(f"{label} {path}", data)
 
 
 def check_tag(sha: str, cwd: Path | None = None) -> Iterator[Finding]:
@@ -209,7 +252,9 @@ def audit(cwd: Path | None = None) -> Iterator[Finding]:
         if not file.is_file():
             continue
         data = file.read_bytes()
-        if b"\0" not in data:
+        if b"\0" in data:
+            yield from scan_blob(path, data)
+        else:
             yield from scan_text(path, data.decode("utf-8", errors="replace"))
     for ref in git("for-each-ref", "--format=%(refname) %(objectname)", cwd=cwd).splitlines():
         name, sha = ref.rsplit(" ", 1)

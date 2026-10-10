@@ -55,6 +55,21 @@ function Get-VenvProcesses {
     })
 }
 
+function Get-OtherProcesses([string[]] $configs) {
+    # .venv processes that no running task's bot accounts for: a bot started by hand,
+    # `tbot log -f`. They would make the update fail after the tasks were stopped.
+    @(Get-VenvProcesses | Where-Object {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -ErrorAction SilentlyContinue
+        $line = if ($process) { [string] $process.CommandLine } else { "" }
+        -not ($configs | Where-Object { $_ -and $line.ToLowerInvariant().Contains($_.ToLowerInvariant()) })
+    })
+}
+
+function Format-Busy($processes) {
+    "a bot or tool still runs from .venv (process $($processes[0].Id)): stop it first " +
+        "(tbot stop, or Ctrl+C in its window), or run this as administrator if a scheduled task runs it"
+}
+
 $exitCode = 0
 try {
     $uv = (Get-Command uv -ErrorAction Stop).Source
@@ -80,13 +95,16 @@ try {
     }
     $status = @(git status --porcelain --untracked-files=no)
     if ($status) { Write-Output "local changes, kept across the update:`n$($status -join "`n")" }
+    $others = Get-OtherProcesses @($running | ForEach-Object { $_.Config })
     if ($DryRun) {
         git fetch --quiet
+        if ($others) { Write-Output "would refuse: $(Format-Busy $others)" }
         Write-Output "would stop: $(($running | ForEach-Object { $_.Name }) -join ', ')"
         Write-Output "would pull:"
         git log --oneline "HEAD..@{u}"
         return
     }
+    if ($others) { throw (Format-Busy $others) }  # before any task is stopped for nothing
 
     $failed = $false
     $notStarted = @()
@@ -111,10 +129,7 @@ try {
             }
         }
         $busy = Get-VenvProcesses
-        if ($busy) {
-            throw "a bot or tool still runs from .venv (process $($busy[0].Id)): stop it first " +
-                "(tbot stop), or run this as administrator if a scheduled task runs it"
-        }
+        if ($busy) { throw (Format-Busy $busy) }
 
         $stashed = $false
         if ($status) {  # set aside for the pull, put back last

@@ -37,10 +37,10 @@ def test_duplicates_fail() -> None:
     assert (report.ok, report.duplicates) == (False, 1)
 
 
-def test_invalid_prices_fail() -> None:
+def test_invalid_values_fail() -> None:
     bars = BARS.with_columns(high=pl.when(ROW == 5).then(0.5).otherwise(pl.col("high")))
     report = check_bars(bars, H1, LATER)
-    assert (report.ok, report.invalid_prices) == (False, 1)
+    assert (report.ok, report.invalid_values) == (False, 1)
 
 
 def test_misaligned_bars_fail() -> None:
@@ -63,3 +63,13 @@ def test_zero_volume_and_large_moves_are_warnings() -> None:
     assert report.ok
     assert report.zero_volume == 2
     assert report.large_moves == (at(20), at(21))
+
+
+def test_nan_and_negative_values_fail() -> None:
+    bars = BARS.with_columns(
+        close=pl.when(ROW == 2).then(float("nan")).otherwise(pl.col("close")),
+        high=pl.when(ROW == 3).then(float("inf")).otherwise(pl.col("high")),
+        volume=pl.when(ROW == 4).then(-10.0).otherwise(pl.col("volume")),
+    )
+    report = check_bars(bars, H1, LATER)
+    assert (report.ok, report.invalid_values) == (False, 3)

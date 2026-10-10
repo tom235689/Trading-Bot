@@ -4,6 +4,7 @@ import codecs
 import hashlib
 import io
 import zipfile
+import zlib
 
 import httpx
 import polars as pl
@@ -15,7 +16,7 @@ from tbot.data.schema import RAW_COLUMNS, empty_bars, from_raw
 ARCHIVE_URL = "https://data.binance.vision/data/spot/monthly/klines"
 
 
-class ChecksumError(Exception):
+class ChecksumError(ValueError):
     """Archive content does not match its published checksum."""
 
 
@@ -36,7 +37,10 @@ def fetch_month(
         raise ChecksumError(f"checksum missing: {url}")
     if hashlib.sha256(archive).hexdigest() != checksum.split()[0].decode().lower():
         raise ChecksumError(f"checksum mismatch: {url}")
-    return parse_archive(archive)
+    try:
+        return parse_archive(archive)
+    except (zipfile.BadZipFile, zlib.error, EOFError, pl.exceptions.PolarsError) as exc:
+        raise ValueError(f"unreadable archive {url}: {exc}") from exc  # one stream fails
 
 
 def parse_archive(archive: bytes) -> pl.DataFrame:

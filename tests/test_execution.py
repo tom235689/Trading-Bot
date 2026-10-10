@@ -66,8 +66,8 @@ def test_risk_limits() -> None:
         "A": pytest.approx(0.3),
         "B": pytest.approx(0.3),
     }
-    short = RiskLimits(long_only=False, max_symbol_weight=0.5)
-    assert short.apply({"A": -0.9}) == {"A": -0.5}
+    with pytest.raises(ValueError, match="cannot sell short"):
+        RiskLimits(long_only=False)  # a negative weight would only eat the gross cap
 
 
 def test_plan_sells_everything_rather_than_leave_an_unsellable_rest() -> None:
@@ -81,3 +81,19 @@ def test_plan_and_broker_skip_broken_prices() -> None:
     broker = SimulatedBroker(COSTS)
     assert broker.fill(T0, "A", math.nan, 100.0, 1000.0, 0.0) is None
     assert broker.fill(T0, "A", 1.0, math.nan, 1000.0, 0.0) is None
+
+
+def test_configs_a_session_could_not_trade_are_refused() -> None:
+    from tbot.core.config import StrategyConfig
+    from tbot.core.timeframe import Timeframe
+    from tbot.execution.sim_broker import CostModel
+
+    with pytest.raises(ValueError, match="listed twice"):  # half its share would go unused
+        StrategyConfig(
+            name="donchian_trend",
+            symbols=["BTC/USDT", "BTCUSDT"],
+            timeframe=Timeframe.H4,
+            allocation=1,
+        )
+    with pytest.raises(ValueError, match="less than 10000"):  # a sale would pay for itself
+        CostModel(slippage_bps=10_000)

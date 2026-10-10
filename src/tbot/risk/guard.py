@@ -13,7 +13,7 @@ class GuardConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    daily_loss_limit: float = Field(default=0.03, ge=0, lt=1)  # below day open: no new entries
+    daily_loss_limit: float = Field(default=0.03, ge=0, lt=1)  # while below day open: no entries
     # Below the peak by this much: flatten and halt. Set it beyond the strategy's normal
     # drawdowns (validation's Monte Carlo); 0.45 suits the shipped Donchian settings.
     max_drawdown: float = Field(default=0.45, ge=0, lt=1)

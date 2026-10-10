@@ -21,10 +21,14 @@ log = structlog.get_logger(__name__)
 
 
 class ServerClock:
+    """Server time from the last sync onward, on the monotonic clock: a step of the local
+    wall clock (Windows time sync) moves nothing until the next sync measures it."""
+
     def __init__(self, client: httpx.Client) -> None:
         self.client = client
-        self.offset = timedelta(0)  # server minus local
+        self.offset = timedelta(0)  # server minus local wall clock, as last measured
         self.synced = False
+        self.anchor: tuple[float, float] | None = None  # server time at a monotonic time
 
     def sync(self) -> float:
         """Measure the offset with one quick round trip; return it in seconds.
@@ -32,9 +36,10 @@ class ServerClock:
         Each attempt is timed on its own, so retry backoff never counts as latency. When
         every round trip is slow, a clock synced before keeps its offset.
         """
-        best: tuple[float, float, float] | None = None  # round trip, server, local midpoint
+        # Round trip, server time, and the monotonic and wall clocks at the midpoint.
+        best: tuple[float, float, float, float] | None = None
         for attempt in range(ATTEMPTS):
-            before = time.time()
+            before, wall_before = time.monotonic(), time.time()
             try:
                 body = get_bytes(self.client, SERVER_TIME_URL, retries=1)
             except httpx.HTTPError:
@@ -42,10 +47,11 @@ class ServerClock:
                     raise
                 time.sleep(2**attempt)
                 continue
-            after = time.time()
+            after, wall_after = time.monotonic(), time.time()
             if body is None:
                 raise LookupError(f"not found: {SERVER_TIME_URL}")
-            sample = (after - before, json.loads(body)["serverTime"] / 1000, (before + after) / 2)
+            server = json.loads(body)["serverTime"] / 1000
+            sample = (after - before, server, (before + after) / 2, (wall_before + wall_after) / 2)
             if best is None or sample[0] < best[0]:
                 best = sample
             if sample[0] <= MAX_ROUND_TRIP:
@@ -54,7 +60,8 @@ class ServerClock:
         if best[0] > MAX_ROUND_TRIP and self.synced:
             log.warning("clock_sync_slow", round_trip=round(best[0], 3), hint="offset kept")
             return self.offset.total_seconds()
-        self.offset = timedelta(seconds=best[1] - best[2])
+        self.anchor = (best[1], best[2])
+        self.offset = timedelta(seconds=best[1] - best[3])
         self.synced = True
         seconds = self.offset.total_seconds()
         level = log.warning if abs(seconds) > WARN_OFFSET else log.info
@@ -62,4 +69,7 @@ class ServerClock:
         return seconds
 
     def now(self) -> datetime:
-        return datetime.now(UTC) + self.offset
+        if self.anchor is None:
+            return datetime.now(UTC)
+        server, at = self.anchor
+        return datetime.fromtimestamp(server + time.monotonic() - at, UTC)

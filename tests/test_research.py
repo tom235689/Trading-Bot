@@ -125,7 +125,7 @@ def test_neighborhood_selection_prefers_a_plateau(data_dir: Path) -> None:
         ]
 
     assert select_run(scored({}), grid, "sharpe", 1, "best").params == {"entry": 5}
-    # Neighborhood means: 1.25, 1.30, 1.13, 1.37, 1.35.
+    # Neighborhood means, beyond the edges the worst one tested: 1.00, 1.30, 1.13, 1.37, 1.30.
     assert select_run(scored({}), grid, "sharpe", 1, "neighborhood").params == {"entry": 20}
     # A point that does not qualify itself is never picked, whatever its neighbors do.
     assert select_run(scored({3: 0}), grid, "sharpe", 1, "neighborhood").params != {"entry": 20}
@@ -150,17 +150,21 @@ def test_month_arithmetic_and_windows() -> None:
 
 
 def test_stitch_chains_segments() -> None:
-    def segment(equities: list[float], pnl: float) -> BacktestResult:
+    def segment(equities: list[float], pnl: float, first: int) -> BacktestResult:
+        times = [datetime(2024, 1, first + i, tzinfo=UTC) for i in range(len(equities))]
         return BacktestResult(
             initial_cash=100.0,
-            equity=pl.DataFrame({"equity": equities, "cash": [0.0] * len(equities)}),
+            equity=pl.DataFrame({"time": times, "equity": equities, "cash": [0.0] * len(equities)}),
             fills=pl.DataFrame({"quantity": [1.0], "fee": [0.1]}),
             trades=pl.DataFrame({"pnl": [pnl], "fees": [0.1], "cost": [50.0]}),
             positions={"BTCUSDT": 1.0},
         )
 
-    stitched = stitch([segment([110.0, 120.0], 20.0), segment([100.0, 90.0], -10.0)], 100.0)
-    assert stitched.equity["equity"].to_list() == pytest.approx([110, 120, 120, 108])
+    first, second = segment([110.0, 120.0], 20.0, 1), segment([100.0, 90.0], -10.0, 2)
+    stitched = stitch([first, second], 100.0)
+    # The second segment starts on Jan 2 with 100, the first one's 120 then: one record.
+    assert stitched.equity["equity"].to_list() == pytest.approx([110, 120, 108])
+    assert stitched.equity["time"].is_unique().all()
     assert stitched.fills["quantity"].to_list() == pytest.approx([1.0, 1.2])
     assert stitched.trades["pnl"].to_list() == pytest.approx([20.0, -12.0])
 
@@ -176,7 +180,8 @@ def test_walk_forward_uses_train_choice_on_test(data_dir: Path) -> None:
         assert window.test_result.equity["time"][0] >= datetime.combine(
             window.window.train_end, datetime.min.time(), tzinfo=UTC
         )
-    assert result.stitched.equity.height == sum(w.test_result.equity.height for w in result.windows)
+    heights = sum(w.test_result.equity.height for w in result.windows)
+    assert result.stitched.equity.height == heights - 1  # one boundary, recorded once
 
 
 def write_validation(tmp_path: Path) -> Path:
@@ -267,11 +272,30 @@ def test_validation_rejects_a_guard(tmp_path: Path) -> None:
 def test_a_lone_peak_among_failing_neighbors_is_no_plateau(data_dir: Path) -> None:
     grid = {"entry": [5, 10, 15, 20, 25]}
     runs = run_sweep(BASE, grid, data_dir)
-    scores = [1.5, -1.0, 2.0, -1.0, 1.5]  # 10 and 20 trade too little to qualify
-    trades = [40, 5, 40, 5, 40]
+    scores = [1.3, 1.4, 1.3, -1.0, 2.0]  # 20 trades too little to qualify
+    trades = [40, 40, 40, 5, 40]
     scored = [
         replace(run, metrics=replace(run.metrics, sharpe=score, trades=count))
         for run, score, count in zip(runs, scores, trades, strict=True)
     ]
-    assert select_run(scored, grid, "sharpe", 30, "neighborhood").params != {"entry": 15}
-    assert neighborhood_mean(scored, grid, {"entry": 15}, "sharpe", 30) == pytest.approx(0.0)
+    assert select_run(scored, grid, "sharpe", 30, "neighborhood").params != {"entry": 25}
+    assert neighborhood_mean(scored, grid, {"entry": 25}, "sharpe", 30) == pytest.approx(0.0)
+
+
+def test_a_lone_peak_in_a_corner_is_no_plateau(data_dir: Path) -> None:
+    grid = {"entry": [5, 10, 15, 20], "exit": [3, 5, 7, 9]}
+    runs = run_sweep(BASE, grid, data_dir)
+
+    def score(params: dict[str, int]) -> float:
+        if params == {"entry": 5, "exit": 3}:
+            return 2.3  # the corner
+        plateau = params["entry"] >= 10 and params["exit"] >= 5
+        return 1.3 if plateau else 1.0
+
+    scored = [replace(r, metrics=replace(r.metrics, sharpe=score(r.params))) for r in runs]
+    # Four tested cells would give the corner (2.3 + 1.0 + 1.0 + 1.3) / 4 = 1.4; beyond the
+    # edge counts as its worst tested neighbor, so it scores as the same peak inside would.
+    corner = neighborhood_mean(scored, grid, {"entry": 5, "exit": 3}, "sharpe", 1)
+    assert corner == pytest.approx((2.3 + 1.0 + 1.0 + 1.3 + 5 * 1.0) / 9)
+    pick = select_run(scored, grid, "sharpe", 1, "neighborhood")
+    assert pick.params == {"entry": 15, "exit": 7}

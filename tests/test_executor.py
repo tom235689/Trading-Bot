@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -10,11 +11,18 @@ from binance_spot_fake import FakeSpot
 from tbot.core.config import StrategyConfig
 from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
-from tbot.exchange.binance import NOTHING_TO_CANCEL, TESTNET_URL, BinanceError, BinanceSpot, Order
+from tbot.exchange.binance import (
+    NOTHING_TO_CANCEL,
+    TESTNET_URL,
+    BinanceError,
+    BinanceSpot,
+    Order,
+    SymbolRules,
+)
 from tbot.live.config import LiveConfig
-from tbot.live.executor import LiveExecutor, order_id
-from tbot.live.ledger import Ledger
-from tbot.live.runner import GUARD_META, reconcile_round
+from tbot.live.executor import TAG_META, LiveExecutor, order_id
+from tbot.live.ledger import Adjustment, Ledger
+from tbot.live.runner import BUDGET_NOTE, GUARD_META, reconcile_round
 from tbot.portfolio.portfolio import Portfolio
 from tbot.risk.guard import GuardConfig, GuardState, Mode, RiskGuard
 
@@ -74,6 +82,7 @@ def test_order_id_is_deterministic() -> None:
     assert order_id(T0, BTC, 1.0, attempt=2) == "tb1704067200000BTCUSDTBr2"
     assert len(order_id(T0, "A" * 40, 1.0)) == 36
     assert len(order_id(T0, "A" * 40, 1.0, attempt=12)) == 36
+    assert order_id(T0, BTC, 1.0, tag="a1b2") == "tba1b21704067200000BTCUSDTB"
 
 
 def test_buy_shrinks_by_base_commission_and_places_stop(tmp_path: Path) -> None:
@@ -142,8 +151,9 @@ def test_lost_response_is_recovered_by_client_order_id(tmp_path: Path) -> None:
         return portfolio
 
     portfolio = run(fake, tmp_path, action, stop_pct=0.0)
+    tag = fake.orders[0]["clientOrderId"][2:6]  # the session's own
     ids = [o["clientOrderId"] for o in fake.orders]
-    assert ids == ["tb1704067200000BTCUSDTB", "tb1704067200000BTCUSDTBr2"]
+    assert ids == [f"tb{tag}1704067200000BTCUSDTB", f"tb{tag}1704067200000BTCUSDTBr2"]
     assert portfolio.position(BTC) == pytest.approx(fake.balances["BTC"])  # none twice
 
 
@@ -703,3 +713,101 @@ def test_an_order_whose_trades_are_not_listed_yet_is_booked_at_the_usual_commiss
     portfolio = run(fake, tmp_path, action, stop_pct=0.0)
     # A buy pays its commission in the coin bought: the book holds what the account holds.
     assert portfolio.position(BTC) == pytest.approx(fake.balances["BTC"])
+
+
+def test_two_sessions_on_one_account_keep_their_stops(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.2}, prices={BTC: 50000.0})
+
+    async def go() -> None:
+        async with fake.client() as client:
+            spot = BinanceSpot(
+                client, fake.api_key, fake.secret, base_url=TESTNET_URL, clock=lambda: T0
+            )
+            await spot.load_rules([BTC])
+            sessions = []
+            for tag in ("aaaa", "bbbb"):
+                ledger = Ledger(tmp_path / f"{tag}.sqlite")
+                ledger.set_meta(TAG_META, tag)
+                executor = LiveExecutor(
+                    spot, ledger, Collect(), lambda: T0, fee_rate=0.001, protective_stop_pct=0.2
+                )
+                portfolio = Portfolio(0.0)
+                portfolio.apply(Fill(T0, BTC, 0.1, 50000.0, 0.0))
+                sessions.append((executor, portfolio, ledger))
+            for executor, portfolio, _ in sessions * 2:  # each replaces its stop twice
+                await executor.after_event(portfolio, MARKS)
+                assert not executor.unprotected
+            for _, _, ledger in sessions:
+                ledger.close()
+
+    asyncio.run(go())
+    stops = [o for o in fake.orders if o["type"] == "STOP_LOSS_LIMIT" and o["status"] == "NEW"]
+    assert sorted(o["clientOrderId"][:7] for o in stops) == ["tbsaaaa", "tbsbbbb"]
+
+
+def test_a_float_a_hair_below_a_step_rounds_to_it() -> None:
+    step = Decimal("0.0001")
+    rules = SymbolRules("ETH", "USDT", Decimal("0.01"), step, step, Decimal("5"))
+    assert rules.round_quantity(0.7 + 0.1) == 0.8  # 0.7999999999999999
+    assert rules.round_quantity(-(0.7 + 0.1)) == -0.8
+    assert rules.round_quantity(0.79995) == 0.7999  # a real remainder is still cut
+    assert rules.round_quantity(0.00009) == 0.0
+
+
+def test_coins_bought_while_a_stop_fills_are_flagged(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.1}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> set[str]:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.1, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)  # stop 40000 for 0.1 BTC
+        stop = next(o for o in fake.orders if o["type"] == "STOP_LOSS_LIMIT")
+        stop.update(executedQty="0.03000000", cummulativeQuoteQty=f"{0.03 * 39800:.8f}")
+        fake.locked["BTC"] -= 0.03
+        fake.balances["USDT"] = 0.03 * 39800
+        assert await executor.settle(portfolio) == 1
+        portfolio.apply(Fill(T0, BTC, 0.05, 39800.0, 0.0))  # bought while it still fills
+        fake.balances["BTC"] += 0.05
+        await executor.after_event(portfolio, MARKS)
+        assert stop["status"] == "NEW"
+        assert "0.050000 bought since has no exchange stop" in notifier.messages[-1]
+        return executor.unprotected
+
+    assert run(fake, tmp_path, action) == {BTC}
+
+
+def test_a_position_whose_coins_are_locked_is_not_dust(tmp_path: Path) -> None:
+    # The owner's limit order locks all but 0.00005 BTC of the 0.5 the bot holds.
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.00005}, prices={BTC: 50000.0})
+    fake.locked["BTC"] = 0.49995
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> set[str]:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.5, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)
+        assert "only 0.00005000 of the 0.50000000 held is free" in notifier.messages[-1]
+        return executor.unprotected
+
+    assert run(fake, tmp_path, action) == {BTC}
+    assert fake.order_count("STOP_LOSS_LIMIT") == 0
+
+
+def test_a_lowered_budget_stays_lowered(tmp_path: Path) -> None:
+    # Budget 1000 with 996 in BTC, lowered to 500: the book owes 496 until it sells.
+    fake = FakeSpot(balances={"USDT": 4.0, "BTC": 0.01992}, prices={BTC: 50000.0})
+    config = _live_config(tmp_path)
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        note = f"{BUDGET_NOTE} from 1,000.00 to 500.00"
+        ledger.add_adjustment(Adjustment(T0, "", 0.0, -500.0, note))
+        portfolio = Portfolio(1000.0)
+        portfolio.apply(Fill(T0, BTC, 0.01992, 50000.0, 0.0))
+        portfolio.adjust("", 0.0, -500.0)
+        guard = RiskGuard(GuardConfig())
+        await reconcile_round(
+            executor, portfolio, MARKS, ledger, notifier, guard, config, lambda: T0
+        )
+        return portfolio
+
+    portfolio = run(fake, tmp_path, action, stop_pct=0.0)
+    assert portfolio.cash == pytest.approx(-496.0)  # not handed back as a deposit

@@ -17,6 +17,7 @@ from tbot.core.config import StrategyConfig
 from tbot.core.timeframe import Timeframe
 from tbot.data.schema import empty_bars
 from tbot.data.store import BarStore
+from tbot.exchange.binance import INVALID_SYMBOL, BinanceError
 from tbot.execution.sim_broker import SimulatedBroker
 from tbot.live import runner
 from tbot.live.clock import ServerClock
@@ -24,7 +25,17 @@ from tbot.live.config import PaperConfig, Settings
 from tbot.live.executor import Executor, PaperExecutor
 from tbot.live.feed import LiveFeed
 from tbot.live.ledger import Ledger
-from tbot.live.runner import Context, Health, reconcile_loop, run_paper, run_session, stop_path
+from tbot.live.runner import (
+    MODE_META,
+    Context,
+    Health,
+    LedgerModeError,
+    StartRefused,
+    reconcile_loop,
+    run_paper,
+    run_session,
+    stop_path,
+)
 from tbot.risk.guard import GuardConfig
 
 H4 = Timeframe.H4
@@ -249,3 +260,48 @@ def test_a_network_error_at_start_is_told_in_one_line() -> None:
         "network error ConnectError; often brief"
     )
     assert runner.start_problem(ValueError("no keys")) == "no keys"
+
+
+def test_a_ledger_keeps_its_mode(tmp_path: Path, offline: tuple[Collect, list[LiveFeed]]) -> None:
+    notifier, _ = offline
+    config, _, _ = setup_store(tmp_path)
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    with Ledger(config.ledger) as ledger:  # a testnet book from before modes were kept
+        ledger.add_event(datetime(2026, 10, 1, tzinfo=UTC), "info", "started (testnet), ledger x")
+
+    async def start() -> int:
+        stop = asyncio.Event()
+        stop.set()  # a session that starts all the same ends at once
+        return await run_paper(config, settings, tmp_path / "data", stop=stop)
+
+    with pytest.raises(LedgerModeError, match="keeps a testnet book, not a paper one"):
+        asyncio.run(start())
+    assert notifier.messages == []  # refused before anything ran
+
+    config.ledger.unlink()
+
+    async def setup(ctx: Context) -> tuple[Executor, list[Coroutine[Any, Any, None]]]:
+        raise ValueError("enough")
+
+    asyncio.run(run_session(config, settings, tmp_path / "data", label="paper", setup=setup))
+    with Ledger(config.ledger) as ledger:
+        assert ledger.get_meta(MODE_META) == "paper"  # a new ledger keeps its mode
+
+
+@pytest.mark.parametrize(
+    "error",
+    [StartRefused("set the keys"), BinanceError(INVALID_SYMBOL, "unknown symbols: ['X']")],
+)
+def test_a_start_that_fails_the_same_way_each_time_ends_for_good(
+    tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], error: Exception
+) -> None:
+    notifier, _ = offline
+    config, _, _ = setup_store(tmp_path)
+
+    async def setup(ctx: Context) -> tuple[Executor, list[Coroutine[Any, Any, None]]]:
+        raise error
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    code = asyncio.run(run_session(config, settings, tmp_path / "data", label="paper", setup=setup))
+    assert code == 4  # the supervisor gives up instead of retrying every 15 minutes
+    assert notifier.messages == [f"[paper] cannot start: {error}; fix the config, then start"]

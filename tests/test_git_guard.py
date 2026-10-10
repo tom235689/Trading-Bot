@@ -211,3 +211,17 @@ def test_audit_scans_tree_and_history(repo: Path) -> None:
     sha = commit(repo, "a.txt", "clean\n", "Fix file")
     wheres = [f.where for f in gg.audit(repo)]
     assert wheres == [f"commit {run(repo, 'rev-parse', f'{sha}~1')[:10]} a.txt:1"]
+
+
+def test_utf16_files_are_scanned_as_text(repo: Path) -> None:
+    # PowerShell 5.1 writes UTF-16 with `>`; git shows such a file as binary.
+    token = "123456789:" + "A" * 35
+    (repo / "out.txt").write_bytes(f"note\r\n{SYLLABLE} {token}\r\n".encode("utf-16"))
+    (repo / "plain.bin").write_bytes(b"\0\x01" + token.encode() + b"\0")  # a binary with a string
+    run(repo, "add", ".")
+    found = [(f.where, f.kind) for f in gg.check_staged(repo)]
+    assert ("staged out.txt:2", "Hangul at column 1") in found
+    assert ("staged out.txt:2", "possible secret (telegram bot token)") in found
+    assert ("staged plain.bin", "possible secret (telegram bot token)") in found
+    run(repo, "commit", "-q", "-m", "Add files")
+    assert ("out.txt:2", "Hangul at column 1") in [(f.where, f.kind) for f in gg.audit(repo)]

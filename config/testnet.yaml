@@ -15,7 +15,7 @@ rebalance:
   min_notional: 10
   rebalance_threshold: 0.02
 guard:
-  daily_loss_limit: 0.03   # reduce-only for the rest of a bad day; no 2018-2026 fill changes
+  daily_loss_limit: 0.03   # reduce-only while 3% below the day's open; no 2018-2026 fill changes
   # The kill switch stops a broken strategy, not a normal drawdown. Monte Carlo of this
   # strategy's 4h returns goes past 45% in 5% of in-sample paths and in 17% of 4-year
   # out-of-sample paths (55%: 0.5% and 5.5%). At 0.15 the backtest halts in Nov 2018 for good.

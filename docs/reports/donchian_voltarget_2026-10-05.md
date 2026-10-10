@@ -98,9 +98,11 @@ A review found that step 5 resampled the in-sample baseline only: the returns of
 | Candidate | Returns | Days | Max drawdown median | 5th percentile | P(beyond 25%) | P(beyond 45%) | P(beyond 55%) |
 |---|---|---|---|---|---|---|---|
 | volatility targeting 0.4 | in-sample | 2554 | -29.2% | -44.8% | 75.2% | 5.0% | 0.5% |
-| volatility targeting 0.4 | out-of-sample | 1462 | -33.9% | -55.4% | 85.5% | 17.2% | 5.5% |
+| volatility targeting 0.4 | out-of-sample | 1461 | -33.9% | -55.5% | 84.5% | 17.2% | 5.5% |
 | full exposure | in-sample | 2554 | -48.4% | -69.3% | 100% | 65.2% | 28.9% |
-| full exposure | out-of-sample | 1462 | -40.9% | -63.0% | 97.4% | 36.4% | 14.1% |
+| full exposure | out-of-sample | 1461 | -40.8% | -63.1% | 97.5% | 35.9% | 13.6% |
+
+(Out-of-sample rows corrected 2026-10-10: the stitched curve repeated one record at each of its three segment boundaries; without them the figures move by at most a point. They were 1462 days, -33.9%, -55.4%, 85.5%, 17.2%, 5.5% and -40.9%, -63.0%, 97.4%, 36.4%, 14.1%.)
 
 The out-of-sample paths are four years long against seven, and still draw down further. Corrections to the text above: the expected pain is a worst drawdown around 34% over four years and about 55% in a bad stretch, not 28% and 44%; and the 45% kill switch is not beyond the 5th percentile out of sample: it trips in 17% of four-year paths of what the strategy did on unseen data. The configs keep 45% as the owner's trade-off between stopping a broken strategy early and halting an ordinary bad stretch; 55% would trip in 5.5% of those paths and lose ten more points before it stops a broken one. The full-exposure candidate stays the riskier one on both measures.
 

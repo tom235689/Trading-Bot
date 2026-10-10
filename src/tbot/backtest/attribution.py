@@ -8,7 +8,7 @@ import polars as pl
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.engine import BacktestResult
 from tbot.backtest.metrics import Metrics, compute_metrics
-from tbot.backtest.runner import run_backtest
+from tbot.backtest.runner import data_ends, run_backtest
 from tbot.data.store import BarStore
 
 
@@ -27,16 +27,18 @@ class Attribution:
 
 def run_attribution(config: BacktestConfig, store: BarStore) -> Attribution:
     """Run every strategy on its own with full capital, then the configured combination."""
+    # Every row ends where the combination does: at the earliest last close of its streams.
+    until = min(data_ends(config, store).values(), default=None)
     rows = []
     solo_returns: list[pl.DataFrame] = []
     for strategy in config.strategies:
         solo = config.model_copy(
             update={"strategies": [strategy.model_copy(update={"allocation": 1.0})]}
         )
-        result = run_backtest(solo, store)
+        result = run_backtest(solo, store, until=until)
         rows.append(AttributionRow(strategy.name, strategy.allocation, compute_metrics(result)))
         solo_returns.append(_dated_returns(result, f"r{len(solo_returns)}"))
-    combined = run_backtest(config, store)
+    combined = run_backtest(config, store, until=until)
     rows.append(AttributionRow("combined", 1.0, compute_metrics(combined)))
 
     matrix = np.ones((1, 1))

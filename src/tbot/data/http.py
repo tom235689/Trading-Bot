@@ -30,7 +30,7 @@ def get_bytes(
             continue
         if response.status_code == 404:
             return None
-        wait = float(response.headers.get("Retry-After", delay))
+        wait = retry_seconds(response.headers.get("Retry-After"), delay)
         if response.status_code in RETRY_STATUS and not last and wait <= MAX_RETRY_WAIT:
             time.sleep(wait)  # waiting longer would stall the live feed without a word
             continue
@@ -43,10 +43,16 @@ def retry_after(exc: BaseException) -> float | None:
     """Seconds a rate-limited client must wait, or None if this is no rate limit."""
     if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code not in (418, 429):
         return None
+    return retry_seconds(exc.response.headers.get("Retry-After"), 60.0)
+
+
+def retry_seconds(value: str | None, default: float) -> float:
+    """A Retry-After in seconds; the HTTP-date form, which Binance does not send, or junk
+    falls back to default."""
     try:
-        return float(exc.response.headers.get("Retry-After", 60))
+        return float(value) if value is not None else default
     except ValueError:
-        return 60.0
+        return default
 
 
 def describe_error(exc: httpx.HTTPError) -> str:

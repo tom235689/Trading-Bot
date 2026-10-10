@@ -9,7 +9,6 @@ from typing import Any, Literal, Self
 
 import numpy as np
 import numpy.typing as npt
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from tbot.backtest.config import BacktestConfig, load_config
@@ -21,6 +20,8 @@ from tbot.backtest.metrics import (
     compute_metrics,
     daily_returns,
 )
+from tbot.core.config import load_yaml
+from tbot.portfolio.allocation import build_slots
 from tbot.research.montecarlo import MonteCarloSummary, simulate
 from tbot.research.statistics import daily_sharpe, deflated_sharpe, expected_max_sharpe, moments
 from tbot.research.sweep import (
@@ -29,6 +30,7 @@ from tbot.research.sweep import (
     SweepRun,
     best_run,
     evaluate,
+    grid_points,
     neighborhood_mean,
     rank_of,
     run_sweep,
@@ -96,7 +98,7 @@ class ValidationConfig(BaseModel):
 
 
 def load_validation_config(path: Path) -> tuple[ValidationConfig, BacktestConfig]:
-    config = ValidationConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    config = ValidationConfig.model_validate(load_yaml(path.read_text(encoding="utf-8")))
     base = load_config(path.parent / config.backtest)
     if len(base.strategies) != 1:
         raise ValueError("validation targets exactly one strategy")
@@ -108,6 +110,11 @@ def load_validation_config(path: Path) -> tuple[ValidationConfig, BacktestConfig
         raise ValueError("holdout_start must be after the backtest start")
     if base.end is not None and config.holdout_start >= base.end:
         raise ValueError("holdout_start must be before the backtest end")
+    empty = [name for name, values in config.grid.items() if not values]
+    if empty:
+        raise ValueError(f"grid: no values for {', '.join(empty)}")
+    for point in grid_points(config.grid):  # a typo in a grid key fails now, not mid-run
+        build_slots(base.with_params(point).strategies)
     return config, base
 
 

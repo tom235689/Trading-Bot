@@ -3,12 +3,40 @@
 from collections.abc import Mapping
 from typing import Any, Self
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from tbot.core.timeframe import Timeframe
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel
 from tbot.risk.limits import RiskLimits
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML in which a key given twice is an error: else the last copy silently wins,
+    and the `initial_cash: 500` in view is not the one in force."""
+
+
+def _unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode) -> dict[Any, Any]:
+    seen: set[str] = set()
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node)
+        if not isinstance(key, str):
+            continue
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                "in a mapping", node.start_mark, f"key {key!r} given twice", key_node.start_mark
+            )
+        seen.add(key)
+    return loader.construct_mapping(node)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _unique_mapping)
+
+
+def load_yaml(text: str) -> Any:
+    """Parse a config file: safe YAML, every key once."""
+    return yaml.load(text, Loader=_UniqueKeyLoader)
 
 
 class StrategyConfig(BaseModel):
@@ -23,7 +51,10 @@ class StrategyConfig(BaseModel):
     @field_validator("symbols")
     @classmethod
     def normalize_symbols(cls, symbols: list[str]) -> list[str]:
-        return [symbol.replace("/", "").upper() for symbol in symbols]
+        normalized = [symbol.replace("/", "").upper() for symbol in symbols]
+        if len(set(normalized)) < len(normalized):  # a repeat would take a share it never uses
+            raise ValueError(f"a symbol is listed twice: {symbols}")
+        return normalized
 
 
 class TradingConfig(BaseModel):

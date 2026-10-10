@@ -1,20 +1,16 @@
 import math
 
 import numpy as np
-import pytest
 
 from tbot.research.montecarlo import simulate
 
 
-def test_one_block_of_every_day_reproduces_the_curve() -> None:
-    # Up 10%, down 20% while a trade is open, up 50%: the dip is in the daily path.
-    returns = np.array([0.1, -0.2, 0.5])
-    summary = simulate(returns, runs=50, seed=3, block_days=3, drawdown_limit=0.15)
-    assert summary.days == 3
-    assert summary.drawdown_p5 == pytest.approx(-0.2)
-    assert summary.drawdown_p95 == pytest.approx(-0.2)
-    assert summary.return_p50 == pytest.approx(1.1 * 0.8 * 1.5 - 1)
-    assert summary.prob_drawdown_beyond == 1.0
+def test_blocks_shrink_so_paths_differ() -> None:
+    # Five days against 20-day blocks: one block as long as the series only repeats it.
+    returns = np.array([0.1, -0.2, 0.5, -0.1, 0.05])
+    summary = simulate(returns, runs=200, seed=3, block_days=20)
+    assert (summary.days, summary.block_days) == (5, 2)
+    assert summary.drawdown_p5 < summary.drawdown_p95
 
 
 def test_blocks_keep_streaks_together() -> None:

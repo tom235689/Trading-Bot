@@ -15,7 +15,7 @@ from tbot.live.backup import backup_ledger, daily_backups
 from tbot.live.config import LiveConfig, PaperConfig, Settings
 from tbot.live.doctor import Check, backup_check, checks_text, guard_check, run_checks
 from tbot.live.ledger import Ledger
-from tbot.live.runner import GUARD_META
+from tbot.live.runner import GUARD_META, KEYS_MISSING, MODE_META, stop_path
 from tbot.risk.guard import GuardConfig, GuardState
 
 STRATEGIES = [
@@ -114,7 +114,7 @@ def test_testnet_skips_permissions_and_flags_a_wrong_key(tmp_path: Path) -> None
     assert wrong["api key"][0][0] == "fail"
     assert "-2015" in wrong["api key"][0][1]
     missing = by_name(check(config, settings(**ALERTS), fake()))
-    assert missing["api key"] == [("fail", "set TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET")]
+    assert missing["api key"] == [("fail", KEYS_MISSING)]
 
 
 def test_paper_ledger_alerts_and_network(tmp_path: Path) -> None:
@@ -207,10 +207,24 @@ def test_ledger_backups_are_checked(tmp_path: Path) -> None:
 
 
 def test_offline_doctor_skips_what_the_bot_retries(tmp_path: Path) -> None:
-    async def run() -> list[Check]:
+    async def run(found: Settings) -> list[Check]:
         async with fake().client() as client:
-            return await run_checks(live(tmp_path), settings(**ALERTS), client, offline=True)
+            return await run_checks(live(tmp_path), found, client, offline=True)
 
-    names = set(by_name(asyncio.run(run())))
+    names = set(by_name(asyncio.run(run(settings(**ALERTS, **KEYS)))))
     assert {"strategies", "ledger", "telegram"} <= names
     assert not names & {"heartbeat", "binance", "clock", "symbols", "api key"}  # no network
+    # Keys that are not set at all fail every start: no network needed to say so.
+    missing = by_name(asyncio.run(run(settings(**ALERTS))))
+    assert missing["api key"] == [("fail", KEYS_MISSING)]
+
+
+def test_a_ledger_of_another_mode_and_a_waiting_stop_are_named(tmp_path: Path) -> None:
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "live.sqlite")
+    with Ledger(config.ledger) as ledger:
+        ledger.set_meta(MODE_META, "live")
+    stop_path(config.ledger).write_text("stop\n", encoding="utf-8")
+    found = by_name(check(config, settings(**ALERTS), fake()))
+    assert found["ledger"][0][0] == "fail"
+    assert "keeps a live book, not a paper one" in found["ledger"][0][1]
+    assert found["stop"][0][0] == "warn"

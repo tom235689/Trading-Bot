@@ -17,6 +17,7 @@ import structlog
 
 from tbot.core.models import Fill
 from tbot.core.timeframe import to_millis
+from tbot.data.http import retry_seconds
 
 log = structlog.get_logger(__name__)
 
@@ -28,6 +29,8 @@ ORDER_NOT_FOUND = -2013
 NOTHING_TO_CANCEL = -2011
 TIMESTAMP_OUTSIDE_WINDOW = -1021
 SEND_STATUS_UNKNOWN = -1007
+INVALID_SYMBOL = -1121
+NOISE = Decimal("1e-6")  # of a step: closer than this to it is float rounding, not a remainder
 Params = Mapping[str, str | int | float]
 
 
@@ -56,9 +59,16 @@ class SymbolRules:
     min_notional: Decimal
 
     def round_quantity(self, quantity: float) -> float:
-        """Round the magnitude down to the step size; the sign is kept."""
-        magnitude = Decimal(str(abs(quantity))).quantize(self.step_size, rounding=ROUND_DOWN)
-        return math.copysign(float(magnitude), quantity) if magnitude else 0.0
+        """Round the magnitude down to the step size; the sign is kept.
+
+        A float a hair below a step (0.7 + 0.1 = 0.7999999999999999) counts as that step:
+        else selling a whole position would leave one step behind.
+        """
+        exact = Decimal(str(abs(quantity)))
+        nearest = exact.quantize(self.step_size)
+        if abs(nearest - exact) > self.step_size * NOISE:
+            nearest = exact.quantize(self.step_size, rounding=ROUND_DOWN)
+        return math.copysign(float(nearest), quantity) if nearest else 0.0
 
     def round_price(self, price: float) -> float:
         return float(Decimal(str(price)).quantize(self.tick_size, rounding=ROUND_DOWN))
@@ -216,7 +226,7 @@ class BinanceSpot:
             query = self._sign(params) if signed else urlencode(params)
             url = f"{self.base_url}{path}?{query}" if query else f"{self.base_url}{path}"
             response = await self.client.request(method, url, headers=headers, timeout=15.0)
-            delay = float(response.headers.get("Retry-After", 2**attempt))
+            delay = retry_seconds(response.headers.get("Retry-After"), 2**attempt)
             if (
                 response.status_code in RETRY_STATUS
                 and attempt < attempts - 1
@@ -256,7 +266,7 @@ class BinanceSpot:
             self.rules[info["symbol"]] = parse_rules(info)
         missing = set(symbols) - set(self.rules)
         if missing:
-            raise BinanceError(0, f"unknown symbols: {sorted(missing)}")
+            raise BinanceError(INVALID_SYMBOL, f"unknown symbols: {sorted(missing)}")
         return self.rules
 
     async def book_price(self, symbol: str, side: int) -> float:
@@ -320,6 +330,7 @@ class BinanceSpot:
             "stopPrice": rules.format_price(stop_price),
             "price": rules.format_price(limit_price),
             "newClientOrderId": client_order_id,
+            "newOrderRespType": "RESULT",  # a stop's default answer (ACK) omits side and status
         }
         return parse_order(await self._request("POST", "/api/v3/order", params, signed=True))
 

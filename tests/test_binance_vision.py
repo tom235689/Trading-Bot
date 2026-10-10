@@ -1,3 +1,4 @@
+import zipfile
 from datetime import UTC, datetime
 
 import pytest
@@ -53,3 +54,15 @@ def test_fetch_month_rejects_bad_checksum() -> None:
 
 def test_parse_csv_ignores_a_byte_order_mark() -> None:
     assert parse_csv(b"\xef\xbb\xbf" + to_csv(ROWS)).equals(from_rows(ROWS))
+
+
+def test_a_broken_archive_is_a_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert issubclass(ChecksumError, ValueError)  # tbot download goes on with the next stream
+    monkeypatch.setattr("tbot.data.binance_vision.parse_archive", broken_zip)
+    fake = FakeBinance("BTCUSDT", Timeframe.H4, ROWS)
+    with fake.client() as client, pytest.raises(ValueError, match="unreadable archive"):
+        fetch_month(client, "BTCUSDT", Timeframe.H4, 2024, 1)
+
+
+def broken_zip(archive: bytes) -> None:
+    raise zipfile.BadZipFile("File is not a zip file")

@@ -26,6 +26,8 @@ Connector = Callable[[str], AbstractAsyncContextManager[AsyncIterator[str | byte
 Batch = dict[StreamKey, pl.DataFrame]
 
 log = structlog.get_logger(__name__)
+FETCH_ERRORS = (httpx.HTTPError, LookupError, ValueError, OSError)  # REST failures, retried
+HEALTHY_SECONDS = 60.0  # a socket open this long resets the reconnect backoff
 
 
 def utc_now() -> datetime:
@@ -107,14 +109,16 @@ class LiveFeed:
     async def catch_up(self, keys: Sequence[StreamKey] | None = None) -> int:
         """Fetch bars closed since the last emitted one via REST.
 
-        Every stream is fetched before any bar is stored or queued, so a failed fetch
-        leaves nothing half done. Then they are queued in close order with no await in
-        between: a 1h bar queued ahead of the 4h bar closing with it would release that
-        event without it.
+        Every stream is fetched before any bar is stored or queued, then they are queued
+        in close order with no await in between: a 1h bar queued ahead of the 4h bar
+        closing with it would release that event without it. A stream whose fetch fails
+        stays behind and is asked again later; the others go on, and the first failure
+        is raised once they are queued.
         """
         if self.rest_paused_until is not None and self.clock() < self.rest_paused_until:
             return 0  # the watchdog asks again; stale streams are still reported
         fetched = []
+        failure: Exception | None = None
         for key in keys or self.keys:
             symbol, timeframe = key
             last = self.last[key]
@@ -125,12 +129,17 @@ class LiveFeed:
                     bars = await asyncio.to_thread(
                         fetch_klines, self.client, symbol, timeframe, start, end
                     )
-                except httpx.HTTPError as exc:
+                except FETCH_ERRORS as exc:
+                    log.warning(
+                        "catch_up_failed", symbol=symbol, timeframe=str(timeframe), error=repr(exc)
+                    )
+                    failure = failure or exc
                     wait = retry_after(exc)
                     if wait is not None:
                         self.rest_paused_until = self.clock() + timedelta(seconds=wait)
                         log.warning("rest_rate_limited", seconds=wait)
-                    raise
+                        break  # more requests now could get the IP banned
+                    continue
                 fetched.append((key, bars))
         items: list[_Item] = []
         try:
@@ -143,30 +152,44 @@ class LiveFeed:
             items.sort(key=lambda item: (item[0], item[1][1].millis, item[1][0]))
             for _, key, row in items:
                 self.queue.put_nowait((key, row))
+        if failure is not None:
+            raise failure
         return len(items)
+
+    async def _catch_up_or_log(self, keys: Sequence[StreamKey] | None = None) -> None:
+        """Catch up; a stream REST cannot serve now is left behind for the watchdog."""
+        try:
+            await self.catch_up(keys)
+        except FETCH_ERRORS as exc:
+            log.warning("catch_up_incomplete", error=repr(exc))
 
     # tasks
 
     async def run_websocket(self) -> None:
         url = binance_ws.stream_url(self.keys)
         backoff = 1.0
+        loop = asyncio.get_running_loop()
         while True:
+            opened = loop.time()
             try:
                 async with self.connector(url) as messages:
                     log.info("websocket_connected", streams=len(self.keys))
-                    backoff = 1.0
-                    await self.catch_up()
+                    await self._catch_up_or_log()
                     async for message in messages:
                         kline = binance_ws.parse_kline(message)
                         if kline is not None and kline.closed and kline.key in self.last:
                             await self._on_socket_bar(kline.key, kline.bar)
+                error = "closed by the server"  # a clean close: reconnect as after an error
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # any transport failure: reconnect
-                self.reconnects += 1
-                log.warning("websocket_error", error=repr(exc), retry_in=backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+                error = repr(exc)
+            if loop.time() - opened > HEALTHY_SECONDS:
+                backoff = 1.0  # it worked for a while: a new failure, not the same one
+            self.reconnects += 1
+            log.warning("websocket_error", error=error, retry_in=backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
 
     async def _on_socket_bar(self, key: StreamKey, bar: pl.DataFrame) -> None:
         """Emit a socket bar only if it follows the last one; a gap is filled via REST first.
@@ -175,7 +198,7 @@ class LiveFeed:
         that no later catch-up could fill, since only bars after the last one count.
         """
         if self._gap_before(key, bar):
-            await self.catch_up([key])
+            await self._catch_up_or_log([key])
         if not self._gap_before(key, bar):
             self._emit(key, bar, exchange_closed=True)
 
@@ -190,10 +213,7 @@ class LiveFeed:
             now = self.clock()
             overdue = [key for key in self.keys if self._overdue_seconds(key, now) > 0]
             if overdue:
-                try:
-                    await self.catch_up(overdue)
-                except (httpx.HTTPError, LookupError, ValueError, OSError) as exc:  # retried
-                    log.warning("catch_up_failed", error=repr(exc))
+                await self._catch_up_or_log(overdue)  # asked again at the next poll
             if self.on_stale is None:
                 continue
             for key in self.keys:

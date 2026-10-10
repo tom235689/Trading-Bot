@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict
 
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.metrics import Metrics
+from tbot.data.store import locked
 
 # Tags whose runs count as selection attempts on a sample.
 SELECTION_TAGS = frozenset({"backtest", "baseline", "sweep", "walkforward-train"})
@@ -84,16 +85,17 @@ class TrialLog:
         if not records:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        torn = False
-        if self.path.exists() and self.path.stat().st_size:
-            with self.path.open("rb") as file:
-                file.seek(-1, 2)
-                torn = file.read(1) != b"\n"
-        with self.path.open("a", encoding="utf-8", newline="\n") as file:  # LF on every OS
-            if torn:
-                file.write("\n")  # a line cut by a crash stays alone, not glued to the next
-            for record in records:
-                file.write(record.model_dump_json() + "\n")
+        # Two validations at once would overwrite each other's lines on Windows.
+        with locked(self.path.with_name(self.path.name + ".lock")):
+            torn = False
+            if self.path.exists() and self.path.stat().st_size:
+                with self.path.open("rb") as file:
+                    file.seek(-1, 2)
+                    torn = file.read(1) != b"\n"
+            with self.path.open("a", encoding="utf-8", newline="\n") as file:  # LF on every OS
+                if torn:
+                    file.write("\n")  # a line cut by a crash stays alone, not glued to the next
+                file.write("".join(record.model_dump_json() + "\n" for record in records))
 
     def read(self) -> list[TrialRecord]:
         if not self.path.exists():

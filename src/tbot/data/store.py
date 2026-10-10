@@ -74,7 +74,7 @@ class BarStore:
         directory = self.directory(symbol, timeframe)
         directory.mkdir(parents=True, exist_ok=True)
         years = bars["open_time"].dt.year().unique().sort(descending=newest_first)
-        with _locked(directory / ".lock"):  # a merge by another process would be lost
+        with locked(directory / ".lock"):  # a merge by another process would be lost
             for year in years:
                 file = directory / f"{year}.parquet"
                 part = bars.filter(pl.col("open_time").dt.year() == year)
@@ -90,7 +90,7 @@ class BarStore:
 
 
 @contextmanager
-def _locked(path: Path) -> Iterator[None]:
+def locked(path: Path) -> Iterator[None]:
     """An exclusive lock between processes, released by the system if one dies."""
     with path.open("a+") as handle:
         deadline = time.monotonic() + LOCK_SECONDS

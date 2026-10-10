@@ -11,11 +11,11 @@ from datetime import UTC, datetime, timedelta
 from tbot.backtest.engine import BacktestResult
 from tbot.backtest.runner import run_period
 from tbot.core.models import Fill
-from tbot.core.timeframe import Timeframe
+from tbot.core.text import price_text
 from tbot.data.store import BarStore
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Ledger
-from tbot.live.runner import BUDGET_NOTE, base_cash
+from tbot.live.runner import BUDGET_NOTE, base_cash, price_at
 
 MAX_EQUITY_GAP = 0.02  # larger gaps between session and backtest equity need a look
 SHOWN_FILLS = 10
@@ -166,23 +166,6 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat()
 
 
-def price_at(config: SessionConfig, store: BarStore, symbol: str, moment: datetime) -> float:
-    """Close of the symbol's finest stream at or before moment (the next one if none)."""
-    if not symbol:
-        return 0.0  # a cash-only adjustment
-    configured = {c.timeframe for c in config.strategies if symbol in c.symbols}
-    # A symbol the config no longer trades is valued from whatever stream is stored.
-    for timeframe in sorted(configured or set(Timeframe), key=lambda t: t.millis):
-        bars = store.read(
-            symbol, timeframe, moment - timeframe.delta * 50, moment + timeframe.delta
-        )
-        if bars.is_empty():
-            continue
-        closed = bars.filter(bars["open_time"] + timeframe.delta <= moment)
-        return float(closed["close"][-1]) if not closed.is_empty() else float(bars["close"][0])
-    return 0.0
-
-
 def match_fills(
     session: Sequence[Fill], backtest: Sequence[Fill], tolerance: timedelta
 ) -> tuple[list[FillMatch], list[Fill], list[Fill]]:
@@ -263,7 +246,7 @@ def comparison_text(c: Comparison, ledger_path: str) -> str:
         for f in fills[:SHOWN_FILLS]:
             lines.append(
                 f"  {label:<14}{f.time:%Y-%m-%d %H:%M} {f.symbol} "
-                f"{f.quantity:+.6f} @ {f.price:,.2f}"
+                f"{f.quantity:+.6f} @ {price_text(f.price)}"
             )
     checks = c.checks()
     lines.extend(f"check: {text}" for text in checks)

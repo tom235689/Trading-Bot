@@ -2,7 +2,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 
 import httpx
@@ -345,22 +345,27 @@ def test_catch_up_queues_bars_in_close_order(tmp_path: Path) -> None:
     assert closes[3:5] == [(at(4), H1), (at(4), H4)]  # together, before the 5h close
 
 
-def test_a_failed_catch_up_loses_no_bar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_failing_stream_holds_back_no_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     eth = ("ETHUSDT", H1)
-    feed, _, _ = make_feed(tmp_path, [BTC1, eth], now=at(5.5), rows={BTC1: make_rows(T0, 6, H1)})
+    rows = {BTC1: make_rows(T0, 6, H1), eth: make_rows(T0, 6, H1)}
+    feed, _, _ = make_feed(tmp_path, [BTC1, eth], now=at(5.5), rows=rows)
     feed.last = {BTC1: at(1), eth: at(1)}
+    down = [True]
 
     def broken(client: httpx.Client, symbol: str, *args: object) -> pl.DataFrame:
-        if symbol == "ETHUSDT":
+        if symbol == "ETHUSDT" and down[0]:
             raise httpx.ConnectError("down")
         return fetch_klines(client, symbol, *args)  # type: ignore[arg-type]
 
     monkeypatch.setattr("tbot.live.feed.fetch_klines", broken)
-    with pytest.raises(httpx.ConnectError):
+    with pytest.raises(httpx.ConnectError):  # said once the others are queued
         asyncio.run(feed.catch_up())
-    assert feed.last[BTC1] == at(1)  # nothing was taken in, so the retry gets it all
-    assert feed.queue.empty()
-    assert asyncio.run(feed.catch_up([BTC1])) == 3
+    assert (feed.last[BTC1], feed.last[eth]) == (at(4), at(1))
+    assert feed.queue.qsize() == 3
+    down[0] = False
+    assert asyncio.run(feed.catch_up()) == 3  # the stream left behind comes later
 
 
 def test_a_bar_just_closed_by_the_clock_waits_for_the_grace(tmp_path: Path) -> None:
@@ -390,7 +395,10 @@ def test_server_clock_keeps_its_offset_when_every_sample_is_slow(
     def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"serverTime": int((now[0] + skew[0]) * 1000)})
 
-    monkeypatch.setattr("tbot.live.clock.time", SimpleNamespace(time=fake_time, sleep=lambda s: 0))
+    monkeypatch.setattr(
+        "tbot.live.clock.time",
+        SimpleNamespace(time=fake_time, monotonic=fake_time, sleep=lambda s: 0),
+    )
     clock = ServerClock(httpx.Client(transport=httpx.MockTransport(handle)))
     assert clock.sync() == pytest.approx(5.0, abs=0.1)
     step[0], skew[0] = 6.0, 9.0  # a congested network: no sample is worth trusting
@@ -424,3 +432,96 @@ def test_a_rate_limit_keeps_the_feed_away_from_rest(tmp_path: Path) -> None:
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(feed.catch_up())
     assert calls == [2]
+
+
+def test_the_socket_goes_on_when_rest_cannot_serve_a_stream(tmp_path: Path) -> None:
+    # XYZUSDT was delisted: REST refuses it. BTC's closed bar still comes on the socket.
+    xyz = ("XYZUSDT", H1)
+    btc_rows = make_rows(T0, 10, H1)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.params["symbol"] == "XYZUSDT":
+            return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+        start, end = int(request.url.params["startTime"]), int(request.url.params["endTime"])
+        return httpx.Response(200, json=[r for r in btc_rows if start <= r[0] <= end])
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    feed = LiveFeed(
+        [BTC1, xyz],
+        BarStore(tmp_path / "data"),
+        client,
+        clock=lambda: at(5) + timedelta(seconds=1),
+        last={BTC1: at(3), xyz: at(0)},
+    )
+
+    @asynccontextmanager
+    async def connect(url: str) -> AsyncIterator[AsyncIterator[str | bytes]]:
+        async def stream() -> AsyncIterator[str | bytes]:
+            yield kline_message(BTC1, at(4), closed=True)
+            await asyncio.Event().wait()
+
+        yield stream()
+
+    feed.connector = connect
+
+    async def run() -> datetime:
+        task = asyncio.create_task(feed.run_websocket())
+        _, bar = await asyncio.wait_for(feed.queue.get(), 5)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        opened: datetime = bar["open_time"][0]
+        return opened
+
+    assert asyncio.run(run()) == at(4)
+    assert feed.reconnects == 0
+
+
+def test_a_clean_close_waits_before_reconnecting(tmp_path: Path) -> None:
+    feed, _, _ = make_feed(tmp_path, [BTC1], now=at(4.5))
+    feed.last[BTC1] = at(3)
+    connects: list[str] = []
+
+    @asynccontextmanager
+    async def connect(url: str) -> AsyncIterator[AsyncIterator[str | bytes]]:
+        connects.append(url)
+        await asyncio.sleep(0.01)  # the handshake
+
+        async def stream() -> AsyncIterator[str | bytes]:
+            for _ in ():  # the server closes normally at once
+                yield ""
+
+        yield stream()
+
+    feed.connector = connect
+
+    async def run() -> None:
+        task = asyncio.create_task(feed.run_websocket())
+        await asyncio.sleep(0.3)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert (len(connects), feed.reconnects) == (1, 1)  # backing off, not a hot loop
+
+
+def test_server_clock_ignores_a_step_of_the_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+    from typing import Self
+
+    from tbot.live import clock as clock_module
+    from tbot.live.clock import ServerClock
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"serverTime": int((time.time() + 5) * 1000)})
+
+    clock = ServerClock(httpx.Client(transport=httpx.MockTransport(handle)))
+    clock.sync()
+    before = clock.now()
+
+    class Stepped(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            return cls.fromtimestamp(time.time() + 10, tz)  # Windows time sync stepped it
+
+    monkeypatch.setattr(clock_module, "datetime", Stepped)
+    assert clock.now() - before < timedelta(seconds=1)  # the server did not move

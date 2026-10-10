@@ -45,7 +45,10 @@ def simulate(
     daily closes miss within a day.
     """
     n = len(returns)
-    block = max(1, min(block_days * per_day, n))
+    # Blocks shrink so a path holds two at least: one block as long as the series would
+    # only repeat it.
+    block_days = max(1, min(block_days, n // (2 * per_day)))
+    block = max(1, min(block_days * per_day, n // 2))
     if n == 0:
         nan = float("nan")
         return MonteCarloSummary(
@@ -64,7 +67,7 @@ def simulate(
     return MonteCarloSummary(
         runs=runs,
         days=round(n / per_day),
-        block_days=block // per_day,
+        block_days=block_days,
         drawdown_p5=float(dd_p5),
         drawdown_p50=float(dd_p50),
         drawdown_p95=float(dd_p95),

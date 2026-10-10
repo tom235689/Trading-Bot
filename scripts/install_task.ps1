@@ -55,6 +55,7 @@ try {
         $report = @(& $uv --directory $repo run --quiet --frozen python -m tbot doctor $path)
         $doctorCode = $LASTEXITCODE
         $report | ForEach-Object { Write-Output $_ }
+        if ($doctorCode -eq 4) { throw "$Config is no valid session config: see the error above" }
         if ($doctorCode -ne 0) { throw "doctor found problems: fix the FAIL lines, or pass -SkipDoctor" }
         $busy = [bool] ($report | Where-Object { $_ -match "process: a session is running" })
     }
@@ -77,6 +78,13 @@ try {
         Write-Output "task '$Name' as $user at startup: powershell.exe $arguments"
     } else {
         $existing = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+        if ($existing) {
+            $other = Get-TaskRunner $existing
+            if (-not $other) { throw "a task '$Name' exists and is no tbot task: pass -Name with another name" }
+            if (-not (Test-SameFile $other $runner)) {
+                throw "'$Name' runs the bot of another folder ($other): pass -Name with another name"
+            }
+        }
         Register-ScheduledTask -TaskName $Name -InputObject $task -Force | Out-Null
         if ($existing -and $existing.State -eq "Running") {
             Write-Output "updated '$Name'; it is running, and the new settings apply at its next start"
@@ -86,6 +94,9 @@ try {
             Write-Output ("registered '$Name'. A session started by hand already runs on $stem, so the task " +
                 "starts at the next boot. To hand over now: tbot stop $stem, then Start-ScheduledTask -TaskName '$Name'")
         } else {
+            # A `tbot stop` from before would end the new start at once: withdraw it.
+            $withdrawn = @(& $uv --directory $repo run --quiet --frozen python -m tbot stop $path --cancel)
+            $withdrawn | Where-Object { $_ -match "withdrawn" } | ForEach-Object { Write-Output $_ }
             Start-ScheduledTask -TaskName $Name
             Write-Output "registered and started '$Name': it runs at every boot. Watch it: tbot status, tbot log $stem -f"
         }

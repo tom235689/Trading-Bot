@@ -13,11 +13,11 @@ from datetime import UTC, datetime
 
 from tbot.backtest.engine import BacktestResult
 from tbot.core.models import Fill
+from tbot.core.text import price_text
 from tbot.data.store import BarStore
-from tbot.live.compare import price_at
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Event, Ledger
-from tbot.live.runner import base_cash, load_guard, restore_portfolio, stream_keys
+from tbot.live.runner import base_cash, load_guard, price_at, restore_portfolio, stream_keys
 
 MAX_POINTS = 1500  # downsample longer series; the tooltip reads the drawn points
 WIDTH, HEIGHT = 880, 260
@@ -39,17 +39,26 @@ class DashboardData:
     flows: list[tuple[datetime, float]] = field(default_factory=list)
 
 
-def without_flows(
-    times: Sequence[datetime], equity: Sequence[float], flows: Sequence[tuple[datetime, float]]
+def growth(
+    times: Sequence[datetime],
+    equity: Sequence[float],
+    flows: Sequence[tuple[datetime, float]],
+    initial: float,
 ) -> list[float]:
-    """Equity minus every flow up to each time: what trading alone made of the start."""
+    """What one unit at the start grew to by each time, by trading alone: every step is
+    the change since the previous point less the money moved in, so a deposit of ten
+    times the book does not shrink every later percentage tenfold."""
     ordered = sorted(flows)
-    out, moved, k = [], 0.0, 0
+    out, previous, index, k = [], initial, 1.0, 0
     for moment, value in zip(times, equity, strict=True):
+        moved = 0.0
         while k < len(ordered) and ordered[k][0] <= moment:
             moved += ordered[k][1]
             k += 1
-        out.append(value - moved)
+        if previous > 0:
+            index *= (value - moved) / previous
+        out.append(index)
+        previous = value
     return out
 
 
@@ -94,6 +103,10 @@ def nice_ticks(low: float, high: float, count: int = 5) -> list[float]:
 
 def _fmt_money(value: float) -> str:
     return f"{value:,.0f}" if abs(value) >= 1000 else f"{value:,.2f}"
+
+
+def _fmt_price(value: float) -> str:
+    return f"{value:,.0f}" if abs(value) >= 1000 else price_text(value)
 
 
 def _fmt_pct(value: float) -> str:
@@ -182,11 +195,11 @@ def _tile(label: str, value: str, delta_class: str = "") -> str:
 def render(data: DashboardData) -> str:
     times = downsample(data.times)
     equity = downsample(data.equity)
-    traded = without_flows(data.times, data.equity, data.flows)
-    dd = downsample(drawdowns(traded, data.initial))  # peaks between kept points count
+    traded = growth(data.times, data.equity, data.flows, data.initial)
+    dd = downsample(drawdowns(traded, 1.0))  # peaks between kept points count
     final = data.equity[-1] if data.equity else data.initial
-    total_return = (traded[-1] if traded else data.initial) / data.initial - 1
-    max_dd = min(drawdowns(traded, data.initial), default=0.0)
+    total_return = (traded[-1] if traded else 1.0) - 1
+    max_dd = min(drawdowns(traded, 1.0), default=0.0)
     exposure_value = sum(q * (m or 0.0) for _, q, m in data.positions)
     exposure = exposure_value / final if final > 0 else 0.0
 
@@ -206,7 +219,7 @@ def render(data: DashboardData) -> str:
     positions = _table(
         ["Symbol", "Quantity", "Mark", "Value"],
         [
-            (s, f"{q:.6f}", _fmt_money(m) if m else "-", _fmt_money(q * m) if m else "-")
+            (s, f"{q:.6f}", _fmt_price(m) if m else "-", _fmt_money(q * m) if m else "-")
             for s, q, m in data.positions
         ],
         "no open positions",
@@ -219,7 +232,7 @@ def render(data: DashboardData) -> str:
                 "BUY" if f.quantity > 0 else "SELL",
                 f.symbol,
                 f"{abs(f.quantity):.6f}",
-                _fmt_money(f.price),
+                _fmt_price(f.price),
                 f"{f.fee:.2f}",
             )
             for f in data.fills[-20:][::-1]

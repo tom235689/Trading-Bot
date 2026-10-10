@@ -82,14 +82,14 @@ def test_write_retries_while_another_process_reads_the_file(
 def test_writers_take_turns(tmp_path: Path) -> None:
     import threading
 
-    from tbot.data.store import _locked
+    from tbot.data.store import locked
 
     store = BarStore(tmp_path)
     store.write("BTCUSDT", H4, make_bars(NEW_YEAR_EVE, 2, H4))
     other = threading.Thread(
         target=store.write, args=("BTCUSDT", H4, make_bars(NEW_YEAR_EVE, 4, H4).tail(2))
     )
-    with _locked(store.directory("BTCUSDT", H4) / ".lock"):  # another process is merging
+    with locked(store.directory("BTCUSDT", H4) / ".lock"):  # another process is merging
         other.start()
         other.join(0.3)
         assert other.is_alive()  # it waits instead of merging into a stale read

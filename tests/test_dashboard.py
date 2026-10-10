@@ -21,9 +21,9 @@ from tbot.monitoring.dashboard import (
     drawdowns,
     from_backtest,
     from_ledger,
+    growth,
     nice_ticks,
     render,
-    without_flows,
 )
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -179,9 +179,9 @@ def test_money_moved_in_or_out_is_neither_a_return_nor_a_drawdown() -> None:
     times = [T0 + timedelta(hours=4 * i) for i in range(4)]
     equity = [1000.0, 1010.0, 510.0, 520.0]  # 500 taken out before the third snapshot
     flows = [(times[2] - timedelta(hours=1), -500.0)]
-    assert without_flows(times, equity, flows) == [1000.0, 1010.0, 1010.0, 1020.0]
+    assert growth(times, equity, flows, 1000.0) == pytest.approx([1.0, 1.01, 1.01, 1.01 * 52 / 51])
     page = render(DashboardData("t", "s", times, equity, 1000.0, [], flows=flows))
-    assert "+2.0%" in page  # total return of the trading alone
+    assert "+3.0%" in page  # total return of the trading alone, chained over the flow
     assert "-49" not in page  # no drawdown from the withdrawal
 
 
@@ -191,3 +191,20 @@ def test_downtime_shows_on_the_time_axis() -> None:
     path = chart.split('class="line" d="M')[1].split('"')[0]
     xs = [float(pair.split(",")[0]) for pair in path.split(" L")]
     assert xs[1] - xs[0] < (xs[2] - xs[1]) / 5  # 4 hours, then 36 hours
+
+
+@pytest.mark.parametrize(
+    ("equity", "flow", "loss"),
+    [
+        ([1_000.0, 10_000.0, 9_500.0], 9_000.0, -0.05),  # budget raised tenfold, then -5%
+        ([10_000.0, 1_000.0, 500.0], -9_000.0, -0.5),  # budget cut to a tenth, then -50%
+    ],
+)
+def test_a_budget_change_scales_no_later_percentage(
+    equity: list[float], flow: float, loss: float
+) -> None:
+    times = [T0 + timedelta(hours=4 * i) for i in range(3)]
+    flows = [(times[1] - timedelta(hours=1), flow)]
+    traded = growth(times, equity, flows, equity[0])
+    assert min(drawdowns(traded, 1.0)) == pytest.approx(loss)
+    assert traded[-1] - 1 == pytest.approx(loss)

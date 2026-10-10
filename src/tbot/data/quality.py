@@ -1,6 +1,6 @@
 """Quality checks for stored bars.
 
-Errors (duplicates, misaligned or unclosed bars, invalid prices) mean the data is broken.
+Errors (duplicates, misaligned or unclosed bars, invalid values) mean the data is broken.
 Warnings (gaps, zero volume, large moves) are usually real market events and are only reported.
 """
 
@@ -27,14 +27,14 @@ class QualityReport:
     duplicates: int
     misaligned: int
     incomplete: int
-    invalid_prices: int
+    invalid_values: int
     gaps: tuple[Gap, ...]
     zero_volume: int
     large_moves: tuple[datetime, ...]
 
     @property
     def ok(self) -> bool:
-        return not (self.duplicates or self.misaligned or self.incomplete or self.invalid_prices)
+        return not (self.duplicates or self.misaligned or self.incomplete or self.invalid_values)
 
     @property
     def missing_bars(self) -> int:
@@ -59,6 +59,8 @@ def check_bars(
         | (pl.col("low") > pl.min_horizontal("open", "close"))
         | (pl.col("low") <= 0)
         | pl.any_horizontal(pl.all().is_null())
+        | pl.any_horizontal(pl.col(pl.Float64).is_nan() | pl.col(pl.Float64).is_infinite())
+        | pl.any_horizontal(pl.col(pl.Float64, pl.Int64) < 0)  # volumes and trade counts
     )
     gaps = unique.select(prev=pl.col("open_time").shift(1), cur=pl.col("open_time")).filter(
         pl.col("cur") - pl.col("prev") > step
@@ -72,7 +74,7 @@ def check_bars(
         duplicates=bars.height - unique.height,
         misaligned=unique.filter(~aligned(timeframe)).height,
         incomplete=unique.filter(pl.col("open_time") + step > now).height,
-        invalid_prices=bars.filter(invalid).height,
+        invalid_values=bars.filter(invalid).height,
         gaps=tuple(
             Gap(start=prev + step, end=cur - step, missing=(cur - prev) // step - 1)
             for prev, cur in gaps.iter_rows()

@@ -48,7 +48,12 @@ function Find-Uv {
     return ""
 }
 
-$text = Get-Content -Raw $Config -ErrorAction Stop
+try {
+    $text = Get-Content -Raw $Config -ErrorAction Stop
+} catch {  # renamed or deleted since the task was registered: say so where it is looked for
+    Write-Journal "cannot read $Config ($($_.Exception.Message)); not starting. Register it again: tbot autostart <config>"
+    exit 4
+}
 $command = if ($text -match '(?m)^mode:') { "live" } else { "paper" }
 $arguments = @("run", "--frozen", "python", "-m", "tbot", $command, $Config)
 if ($Live) { $arguments += "--live" }

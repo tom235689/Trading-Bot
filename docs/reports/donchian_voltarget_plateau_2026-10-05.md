@@ -14,6 +14,10 @@ The 2022 bear market hurts every parameter set that worked in the preceding bull
 - Do not try further selection rules or grids against the same data to get under the drawdown limit. Each attempt is another trial, and the holdout has been seen too often to count as unseen data.
 - The Monte Carlo and holdout lines below come from the tools before their correction; see `donchian_voltarget_2026-10-05.md` for the corrected figures.
 
+## Addendum 2026-10-10: the edge of the grid
+
+A review found that the neighborhood mean averaged only the neighbors inside the grid, so a point on the edge weighed its own result 1/6 and a corner 1/4 instead of 1/9: an edge favored lone peaks, the opposite of the rule's purpose. Since 0.4.2 a neighbor beyond the edge counts as the worst one tested. Recomputed with library calls from the same train-window sweeps (no new trials): the 2021 window picks entry 40, exit 15 instead of exit 10 (test Sharpe 1.39, +30.7%); the 2023 pick stays the corner entry 90, exit 10; stitched out of sample Sharpe 0.54, max drawdown -43.7%, 146 trades (was 0.53, -43.5%, 152). The verdict and the decision stand.
+
 ## Report
 
 ```

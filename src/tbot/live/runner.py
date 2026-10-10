@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import IO, Any
 
@@ -20,10 +20,17 @@ import structlog
 from tbot.backtest.runner import WARMUP_MARGIN, history_bars
 from tbot.core.config import TradingConfig
 from tbot.core.models import Fill
-from tbot.core.timeframe import to_millis
-from tbot.data.downloader import sync
+from tbot.core.text import price_text
+from tbot.core.timeframe import Timeframe, to_millis
+from tbot.data.downloader import NotListed, sync
 from tbot.data.store import BarStore
-from tbot.exchange.binance import PRODUCTION_URL, TESTNET_URL, BinanceSpot
+from tbot.exchange.binance import (
+    INVALID_SYMBOL,
+    PRODUCTION_URL,
+    TESTNET_URL,
+    BinanceError,
+    BinanceSpot,
+)
 from tbot.execution.sim_broker import SimulatedBroker
 from tbot.live.backup import backup_loop, daily_backups
 from tbot.live.clock import CLOSE_GRACE, ServerClock
@@ -56,6 +63,9 @@ BUDGET_META = "initial_cash"  # the budget the guard levels refer to
 BASE_META = "base_cash"  # what the book started with
 SUPERVISED_ENV = "TBOT_SUPERVISED"  # set by scripts/run_bot.ps1
 BUDGET_NOTE = "initial_cash changed"  # adjustments that book a changed budget
+MODE_META = "mode"  # paper, testnet, or live: what the book is
+EXIT_REFUSED = 4  # as the command line's config error: the supervisor gives up
+KEYS_MISSING = "set TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET in .env (`tbot setup`)"
 TARGETS_META = "targets"
 OPERATIONAL = {"ledger", "backup_days", "telegram_commands"}  # not in the config hash
 _background: set[asyncio.Task[bool]] = set()
@@ -261,6 +271,30 @@ def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard, now: d
         ledger.set_meta(BUDGET_META, repr(config.initial_cash))
 
 
+def price_at(config: TradingConfig, store: BarStore, symbol: str, moment: datetime) -> float:
+    """Close of the symbol's finest stream at or before moment (the next one if none)."""
+    if not symbol:
+        return 0.0  # a cash-only adjustment
+    configured = {c.timeframe for c in config.strategies if symbol in c.symbols}
+    # A symbol the config no longer trades is valued from whatever stream is stored.
+    for timeframe in sorted(configured or set(Timeframe), key=lambda t: t.millis):
+        bars = store.read(
+            symbol, timeframe, moment - timeframe.delta * 50, moment + timeframe.delta
+        )
+        if bars.is_empty():
+            continue
+        closed = bars.filter(bars["open_time"] + timeframe.delta <= moment)
+        return float(closed["close"][-1]) if not closed.is_empty() else float(bars["close"][0])
+    return 0.0
+
+
+def budget_owed(ledger: Ledger) -> float:
+    """What lowered budgets took out, as a negative amount: cash below zero up to this is
+    owed to the owner and repaid by sales, not an error for reconciliation to undo."""
+    budget = [a for a in ledger.adjustments() if a.note.startswith(BUDGET_NOTE)]
+    return sum(a.cash for a in budget if a.cash < 0)
+
+
 def base_cash(config: SessionConfig, ledger: Ledger) -> float:
     """Cash the book started with; later changes of initial_cash are adjustments."""
     for key in (BASE_META, BUDGET_META):  # a ledger from 0.2.0 has only the budget
@@ -353,13 +387,22 @@ def summary_text(
     label: str,
     title: str = "daily summary",
     notes: Sequence[str] = (),
+    store: BarStore | None = None,
 ) -> str:
+    """Equity, its change, positions, and fills; coins moved in or out of the book are
+    valued at their time from the store, as `tbot status` does, else at today's marks."""
     equity = session.portfolio.equity(session.marks)
     earlier = ledger.equity_before(now - timedelta(days=1))
     change = "no 24h reference"
     if earlier and earlier.equity > 0:
+
+        def price(symbol: str, moment: datetime) -> float:
+            if store is None:
+                return session.marks.get(symbol, 0.0)
+            return price_at(session.config, store, symbol, moment)
+
         moved = sum(  # deposits, withdrawals, budget changes: not a gain or a loss
-            a.cash + a.quantity * session.marks.get(a.symbol, 0.0)
+            a.cash + a.quantity * price(a.symbol, a.time)
             for a in ledger.adjustments()
             if earlier.time < a.time <= now
         )
@@ -395,7 +438,7 @@ def fills_text(ledger: Ledger, label: str, count: int = 10) -> str:
         [f"[{label}] last {len(fills)} fills (UTC)"]
         + [
             f"{f.time:%m-%d %H:%M} {'BUY' if f.quantity > 0 else 'SELL'} "
-            f"{abs(f.quantity):.6f} {f.symbol} @ {f.price:,.2f}"
+            f"{abs(f.quantity):.6f} {f.symbol} @ {price_text(f.price)}"
             for f in fills
         ]
     )
@@ -407,10 +450,11 @@ def command_answer(
     label: str,
     clock: Callable[[], datetime],
     notes: Callable[[], list[str]],
+    store: BarStore | None = None,
 ) -> Answer:
     def answer(command: str) -> str:
         if command in ("/status", "/start"):
-            return summary_text(session, ledger, clock(), label, "status", notes())
+            return summary_text(session, ledger, clock(), label, "status", notes(), store)
         if command == "/fills":
             return fills_text(ledger, label)
         return HELP
@@ -425,15 +469,21 @@ async def summary_loop(
     hour: int,
     label: str,
     notes: Callable[[], list[str]] = list,
+    store: BarStore | None = None,
 ) -> None:
+    sent: date | None = None  # a wall clock stepped back must not send a day twice
     while True:
         now = utc_now()
         target = now.replace(hour=hour, minute=5, second=0, microsecond=0)
-        if target <= now:
+        if target <= now or target.date() == sent:
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
+        if utc_now() < target:
+            continue  # the wall clock moved back while sleeping: wait the rest
+        sent = target.date()
         try:
-            await notifier.send(summary_text(session, ledger, utc_now(), label, notes=notes()))
+            text = summary_text(session, ledger, utc_now(), label, notes=notes(), store=store)
+            await notifier.send(text)
         except Exception as exc:  # a report must never stop trading
             log.error("summary_failed", error=repr(exc))
 
@@ -486,6 +536,48 @@ def start_problem(exc: Exception) -> str:
     return (
         f"{problem}; a supervised bot tries again, but if it keeps failing, check the API key, "
         "its IP restriction, and the network"
+    )
+
+
+class StartRefused(ValueError):
+    """A start that fails the same way every time: the config or .env needs a fix."""
+
+
+def permanent(exc: Exception) -> bool:
+    """Whether a failed start would fail again: a supervisor should give up, not retry."""
+    if isinstance(exc, StartRefused | NotListed):
+        return True
+    return isinstance(exc, BinanceError) and exc.code == INVALID_SYMBOL
+
+
+class LedgerModeError(ValueError):
+    """The ledger keeps the book of another mode."""
+
+
+def session_mode(config: SessionConfig) -> str:
+    return config.mode if isinstance(config, LiveConfig) else "paper"
+
+
+def ledger_mode(ledger: Ledger) -> str | None:
+    """The mode the ledger's book was kept in: recorded since 0.4.2, else its first start."""
+    mode = ledger.get_meta(MODE_META)
+    if mode is not None:
+        return mode
+    row = ledger.conn.execute(
+        "SELECT message FROM events WHERE message LIKE 'started (%' ORDER BY id LIMIT 1"
+    ).fetchone()
+    return str(row[0]).removeprefix("started (").split(")", 1)[0] if row else None
+
+
+def mode_problem(config: SessionConfig, ledger: Ledger) -> str:
+    """Why this config must not use this ledger, or "": a testnet or paper book must never
+    trade real money, and simulated fills must never enter a real-money book."""
+    mode, kept = session_mode(config), ledger_mode(ledger)
+    if kept is None or kept == mode:
+        return ""
+    return (
+        f"{config.ledger} keeps a {kept} book, not a {mode} one: give this config a ledger "
+        f"of its own (`ledger: data/{mode}.sqlite` or a new file)"
     )
 
 
@@ -615,6 +707,10 @@ async def run_session(
             log.warning("stop_request_dropped", reason="this session was started by hand")
         ledger = Ledger(config.ledger)
         try:
+            problem = mode_problem(config, ledger)
+            if problem:
+                raise LedgerModeError(problem)
+            ledger.set_meta(MODE_META, session_mode(config))
             return await _run_session(
                 config,
                 settings,
@@ -727,6 +823,9 @@ async def _trade(
         except Exception as exc:  # tell the operator; a supervisor would restart silently
             log.error("start_failed", error=repr(exc))
             ledger.add_event(utc_now(), "error", f"failed to start: {exc!r}")
+            if permanent(exc):  # the same at every try: say so, and let the supervisor stop
+                await notifier.send(f"[{label}] cannot start: {exc}; fix the config, then start")
+                return EXIT_REFUSED
             await notifier.send(f"[{label}] failed to start: {start_problem(exc)}")
             return 1
         trader = SessionTrader(
@@ -771,7 +870,8 @@ async def _trade(
                 found.append(f"NO EXCHANGE STOP: {', '.join(unprotected)}")
             return found
 
-        summary = summary_loop(session, ledger, notifier, config.summary_hour_utc, label, notes)
+        hour = config.summary_hour_utc
+        summary = summary_loop(session, ledger, notifier, hour, label, notes, store)
         tasks = [
             asyncio.create_task(clock_loop(clock, CLOCK_RESYNC_SECONDS), name="clock"),
             asyncio.create_task(feed.run_websocket(), name="websocket"),
@@ -789,7 +889,7 @@ async def _trade(
             )
             tasks.append(asyncio.create_task(backups, name="backup"))
         if config.telegram_commands and isinstance(direct, Telegram):
-            answer = command_answer(session, ledger, label, clock.now, notes)
+            answer = command_answer(session, ledger, label, clock.now, notes, store)
             commands = command_loop(direct, answer, utc_now())
             tasks.append(asyncio.create_task(commands, name="commands"))
         elif config.telegram_commands:
@@ -866,7 +966,7 @@ def make_spot(
     resync: Callable[[], Awaitable[object]] | None = None,
 ) -> BinanceSpot:
     if not settings.binance_api_key or not settings.binance_api_secret:
-        raise ValueError("set TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET")
+        raise StartRefused(KEYS_MISSING)
     return BinanceSpot(
         client,
         settings.binance_api_key,
@@ -922,6 +1022,7 @@ async def reconcile_round(
         label=config.mode,
         balances=balances,
         on_adjust=shift_guard,
+        cash_floor=budget_owed(ledger),
     )
     if adjustments or booked:
         await executor.after_event(portfolio, marks)
@@ -971,6 +1072,8 @@ async def run_live(
 ) -> int:
     if config.mode == "live" and not confirmed:
         raise ValueError("config mode is live: pass --live to trade real money")
+    if not settings.binance_api_key or not settings.binance_api_secret:
+        raise StartRefused(KEYS_MISSING)  # before a ledger exists for nothing
     label = config.mode
 
     async def setup(ctx: Context) -> tuple[Executor, list[Coroutine[Any, Any, None]]]:
@@ -1078,9 +1181,12 @@ def _report_stale(
     ledger: Ledger, notifier: Notifier, label: str, key: StreamKey, last: datetime
 ) -> None:
     symbol, timeframe = key
-    message = (
-        f"[{label}] stale stream {symbol} {timeframe}: last closed bar {last:%Y-%m-%d %H:%M} UTC"
+    seen = (  # last is the bar's open time
+        f"last bar closed {last + timeframe.delta:%Y-%m-%d %H:%M} UTC"
+        if last.year > 1
+        else "no bar yet"
     )
+    message = f"[{label}] stale stream {symbol} {timeframe}: {seen}"
     log.warning("stale_stream", symbol=symbol, timeframe=str(timeframe), last=last.isoformat())
     ledger.add_event(utc_now(), "warning", message)
     task = asyncio.get_running_loop().create_task(notifier.send(message))
@@ -1129,7 +1235,7 @@ def status_text(config: SessionConfig, store: BarStore) -> str:
             side = "BUY" if fill.quantity > 0 else "SELL"
             lines.append(
                 f"fill {fill.time:%Y-%m-%d %H:%M} {side} {abs(fill.quantity):.6f} "
-                f"{fill.symbol} @ {fill.price:,.2f}"
+                f"{fill.symbol} @ {price_text(fill.price)}"
             )
         for event in ledger.recent_events(5):
             lines.append(f"event {event.time:%Y-%m-%d %H:%M} {event.level}: {event.message}")

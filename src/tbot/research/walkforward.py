@@ -3,7 +3,7 @@
 import calendar
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -67,13 +67,16 @@ def stitch(results: Sequence[BacktestResult], initial_cash: float) -> BacktestRe
     level = initial_cash
     positions: dict[str, float] = {}
     marks: dict[str, float] = {}
+    last_time: datetime | None = None
     for result in results:
         if result.equity.is_empty():
             continue
         factor = level / result.initial_cash
-        equity.append(
-            result.equity.with_columns(pl.col("equity") * factor, pl.col("cash") * factor)
-        )
+        records = result.equity.with_columns(pl.col("equity") * factor, pl.col("cash") * factor)
+        if last_time is not None:  # a segment's first record repeats the previous one's last
+            records = records.filter(pl.col("time") > last_time)
+        last_time = result.equity["time"][-1]
+        equity.append(records)
         fills.append(result.fills.with_columns(pl.col("quantity") * factor, pl.col("fee") * factor))
         scaled = [pl.col(name) * factor for name in ("pnl", "fees", "cost")]
         trades.append(result.trades.with_columns(*scaled))

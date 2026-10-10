@@ -63,7 +63,7 @@ def format_report(r: ValidationReport) -> str:
     mc = r.monte_carlo
     lines.extend(
         [
-            f"5. Monte Carlo: {mc.runs} runs in {mc.block_days}-day blocks of bar returns",
+            f"5. Monte Carlo: {mc.runs} runs on blocks of bar returns",
             *_monte_carlo_lines("in-sample", mc),
             *_monte_carlo_lines("out-of-sample", r.monte_carlo_oos),
             "",
@@ -87,7 +87,8 @@ def format_report(r: ValidationReport) -> str:
 
 def _monte_carlo_lines(label: str, mc: MonteCarloSummary) -> list[str]:
     return [
-        f"   {label} ({mc.days} days): max drawdown p5 {mc.drawdown_p5:.1%}  "
+        f"   {label} ({mc.days} days, {mc.block_days}-day blocks): "
+        f"max drawdown p5 {mc.drawdown_p5:.1%}  "
         f"p50 {mc.drawdown_p50:.1%}  p95 {mc.drawdown_p95:.1%}",
         f"      P(drawdown beyond {mc.drawdown_limit:.0%}) = {mc.prob_drawdown_beyond:.1%}, "
         f"beyond the {mc.kill_switch:.0%} kill switch = {mc.prob_kill:.1%}; final return "

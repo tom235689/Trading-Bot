@@ -91,3 +91,19 @@ def test_a_line_cut_by_a_crash_is_skipped_and_kept_apart(tmp_path: Path) -> None
         file.write(b'{"time": "2026-10-09T08')  # the process died while appending
     log.append([make_record(CONFIG, metrics(0.5), "sweep")])
     assert [record.sharpe for record in log.read()] == [1.0, 0.5]
+
+
+def test_appends_take_turns(tmp_path: Path) -> None:
+    import threading
+
+    from tbot.data.store import locked
+
+    log = TrialLog(tmp_path / "trials.jsonl")
+    record = make_record(CONFIG, metrics(1.0), "sweep")
+    other = threading.Thread(target=log.append, args=([record],))
+    with locked(tmp_path / "trials.jsonl.lock"):  # another validation is appending
+        other.start()
+        other.join(0.3)
+        assert other.is_alive()
+    other.join(5)
+    assert len(log.read()) == 1

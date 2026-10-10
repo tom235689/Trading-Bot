@@ -21,6 +21,10 @@ log = structlog.get_logger(__name__)
 INVALID_SYMBOL = -1121  # the REST API's code for a symbol it does not list (any more)
 
 
+class NotListed(LookupError):
+    """Binance neither lists the symbol nor has archives of it: a typo, most likely."""
+
+
 def not_listed(exc: httpx.HTTPStatusError) -> bool:
     if exc.response.status_code != 400:
         return False
@@ -232,7 +236,7 @@ def _download(
                     raise
                 listed = False
                 log.warning("symbol_not_listed", symbol=symbol, after=range_start.isoformat())
-                progress(f"{symbol} {timeframe}: not listed any more; archives only")
+                progress(f"{symbol} {timeframe}: not listed now; looking in the archives")
         if not listed:  # the archives of the months around the range, if published
             bars = _archived(client, symbol, timeframe, range_start, range_end, tried)
         written, skipped = keep(bars)
@@ -241,6 +245,6 @@ def _download(
         if listed:
             progress(f"{symbol} {timeframe}: {written} bars from REST")
     if not listed and not counts[0] + counts[1] and store.last_open_time(symbol, timeframe) is None:
-        raise LookupError(f"{symbol}: Binance does not list it and has no archives of it")
+        raise NotListed(f"{symbol}: Binance does not list it and has no archives of it")
     if held:
         store.write(symbol, timeframe, pl.concat(held), newest_first=hold)

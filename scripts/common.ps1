@@ -6,13 +6,27 @@ function Resolve-Config([string] $repo, [string] $config) {
     if (-not (Test-Path $path -PathType Leaf) -and -not [IO.Path]::GetExtension($config) -and
         $config -notmatch '[\\/]') {
         $path = Join-Path $repo "config\$config.yaml"
+        if (-not (Test-Path $path -PathType Leaf)) { $path = Join-Path $repo "config\$config.yml" }
     }
     if (-not (Test-Path $path -PathType Leaf)) {
-        $names = @(Get-ChildItem (Join-Path $repo "config") -Filter "*.yaml" |
-            ForEach-Object { $_.BaseName }) -join ", "
+        $names = @(Get-ChildItem (Join-Path $repo "config") -File |
+            Where-Object { $_.Extension -in ".yaml", ".yml" } |
+            ForEach-Object { $_.BaseName } | Sort-Object) -join ", "
         throw "no config '$config' (names in config\: $names)"
     }
     return (Resolve-Path $path).Path
+}
+
+function Get-TaskRunner($task) {
+    # The run_bot.ps1 a scheduled task runs, or "" for a task that is no tbot task.
+    foreach ($action in @($task.Actions)) {
+        if ($action.Arguments -match '-File "([^"]*run_bot\.ps1)"') { return $Matches[1] }
+    }
+    return ""
+}
+
+function Test-SameFile([string] $a, [string] $b) {
+    return [IO.Path]::GetFullPath($a).TrimEnd('\') -ieq [IO.Path]::GetFullPath($b).TrimEnd('\')
 }
 
 function Test-Admin {

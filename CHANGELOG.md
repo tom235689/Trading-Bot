@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.4.2 (2026-10-10)
+
+Fixes from five reviews of 0.4.1 (live orders, the session loop and monitoring, the backtest, data and research, the command line and scripts). Upgrade notes:
+- `tbot update` works from 0.4.1 on.
+- A ledger now keeps its mode (paper, testnet, or live); one an older version started takes the mode of its first start. A config that names a ledger of another mode, such as a testnet config turned into a live one without a new `ledger:`, refuses to start (exit 4): give it a ledger of its own.
+- Configs that no longer load, with a message saying why: a key given twice, `long_only: false`, a symbol listed twice in one strategy, `slippage_bps` of 10000 or more.
+- Order and stop ids now carry a session tag; stops placed by 0.4.1 are replaced as usual at the first event.
+
+**Live**
+- Protective stops ask Binance for a full answer. For a stop, Binance's default answer leaves out side and status, so 0.4.1 took every stop it placed for a failure: it alerted "protective stop failed", showed NO EXCHANGE STOP, and cancelled and placed the stop again at every reconciliation. The test exchange now answers as Binance does.
+- Two sessions on one account no longer cancel each other's stops, and their order ids differ.
+- A lowered `initial_cash` that takes out more than the bot's cash stays lowered: reconciliation no longer books the shortfall back as a deposit; the bot buys nothing until sales repay it.
+- Fills that add up to a float a hair below the exchange amount (0.7 + 0.1) no longer leave one lot step unsold and unprotected.
+- Coins bought while a triggered stop still fills, and a position whose coins other orders lock, are flagged and alerted as without a stop instead of passing silently.
+- A start that would fail the same way again (missing API keys, a symbol Binance does not list) ends with exit 4, so the supervisor stops retrying; `tbot live` checks the keys before it creates a ledger, and `tbot doctor --offline` reports missing keys.
+- A paper or testnet book never trades real money, and simulated fills never enter a real-money book; `tbot doctor` fails on a ledger of another mode.
+
+**Session loop and monitoring**
+- One stream REST cannot serve (an outage for it, a delisted symbol) no longer stops the bars of every stream: the others are stored and traded, and it catches up later. The socket keeps reading when a catch-up fails, and one the server closes waits before reconnecting.
+- The server-synced clock runs on the monotonic clock between syncs, so a Windows time step can no longer make an open bar look closed.
+- The dashboard chains its total return and drawdowns over transfers: a budget raised tenfold no longer shows a 5% loss as 50%.
+- The daily summary values coins moved in or out at their time, as `tbot status` does, and a wall clock stepped back no longer sends it twice. Prices below a cent keep their digits in alerts, `/fills`, status, compare, and the dashboard. The stale-stream alert names the close of the last bar, not its open.
+- A `Retry-After` in the date form no longer breaks a request.
+
+**Backtest and research**
+- `selection: neighborhood` counts a neighbor beyond the grid's edge as the worst one tested, so a point on the edge no longer weighs its own result more than one inside. The plateau report's addendum has the effect: out-of-sample Sharpe 0.54 instead of 0.53, verdict unchanged.
+- The stitched walk-forward curve no longer repeats a record at every segment boundary; the report's out-of-sample Monte Carlo figures move by at most a point.
+- The Monte Carlo shortens its blocks for a series shorter than two of them instead of repeating the series in every path; the report gives each run's block length.
+- Attribution runs every row up to the same end.
+- Two runs at once no longer overwrite each other's trial-log lines.
+
+**Data**
+- A bad checksum or an unreadable archive fails that stream only; `tbot download` goes on with the others, as 0.3.0 meant.
+- The quality check fails NaN, infinite, and negative values.
+
+**Command line**
+- `tbot backtest` checks strategy names and params, and `tbot validate` every grid point, before anything runs (exit 4, nothing logged); a period outside the stored bars is named with the stored range.
+- `tbot log <typo>` says there is no such config instead of waiting for a log; `tbot stop` without a config says it looked in `config/`; a second `tbot paper` or `tbot live` on a ledger in use is refused before it says how to stop it.
+- `tbot notify` asks for a new token when Telegram no longer knows the one in `.env`.
+- `--out` and `--html` take a folder (one that exists, or a path ending in a slash); configs may end in `.yml`.
+
+**Windows scripts**
+- A `!` in a value passed to setup, update, or autostart stays, and a folder with `!` in its name works. `tbot setup -h`, `tbot update -h`, and `tbot autostart -h` show the scripts' help.
+- `tbot autostart` withdraws an earlier `tbot stop` request before it starts the task, which would otherwise end at once; `tbot doctor` warns about a waiting request.
+- `tbot autostart` refuses to overwrite a task of the same name that runs another folder's bot, and `-Remove` to remove one; a mistyped config name no longer asks for administrator rights.
+- `tbot update -DryRun` says when another program runs from `.venv`, and the update checks that before it stops any task.
+- A task whose config was renamed or deleted writes why to its journal and exits 4.
+
+**Git guard**
+- Files git shows as binary are scanned too: UTF-16 text (PowerShell 5.1 writes it with `>`) in full, other files for secrets in their strings.
+
+**Documentation**
+- The daily loss rule holds while equity is below the limit, not for the rest of the day; the holdout count covers logged runs (`tbot doctor`'s kill switch check and `tbot compare` are not logged).
+
+**Tests**
+- 34 new tests (408 in all); each fix was checked to fail its test when undone.
+
 ## 0.4.1 (2026-10-09)
 
 Fixes from five reviews of 0.4.0 (command line, Windows scripts, live path, research, documentation). Upgrade notes:
