@@ -1,13 +1,20 @@
 """Every session config on one screen: what `tbot status` shows without a config."""
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tbot.data.store import BarStore
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Ledger
-from tbot.live.runner import GUARD_META, base_cash, is_running, price_at, restore_portfolio
+from tbot.live.runner import (
+    GUARD_META,
+    base_cash,
+    is_running,
+    next_close,
+    price_at,
+    restore_portfolio,
+)
 from tbot.risk.guard import GuardState
 
 
@@ -42,8 +49,8 @@ def session_row(name: str, config: SessionConfig, store: BarStore) -> SessionRow
 
 
 def broken_row(name: str, problem: str, ledger: Path | None) -> SessionRow:
-    problem = " ".join(problem.split())  # a YAML error spans lines
     """A config that does not load; a session may still run on the ledger it names."""
+    problem = " ".join(problem.split())  # a YAML error spans lines
     running = ledger is not None and ledger.is_file() and is_running(ledger)
     return SessionRow(name, "running" if running else "invalid", notes=(problem,))
 
@@ -61,7 +68,9 @@ def _row(
         notes.append(f"{doubtful} order(s) in doubt, settled when it runs")
     point = ledger.latest_equity()
     if point is None:
-        return SessionRow(name, state, notes=(*notes, "no bar event yet"))
+        timeframe, first = next_close(config, datetime.now(UTC))
+        waiting = f"no bar event yet (the next {timeframe} close is {first:%H:%M} UTC)"
+        return SessionRow(name, state, notes=(*notes, waiting))
     # Deposits, withdrawals, and budget changes are money put in, not profit.
     flows = [
         (a.time, a.cash + a.quantity * price_at(config, store, a.symbol, a.time))

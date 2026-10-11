@@ -42,6 +42,9 @@ from tbot.live.runner import (
 from tbot.portfolio.allocation import build_slots
 
 MAX_CLOCK_OFFSET = 1.0  # seconds; the bot corrects for it, but a drifting clock needs a fix
+# Failures a session starts despite: offline they warn, so `tbot update` restarts a bot
+# that ran before it (only what stops a start keeps it down).
+STARTS_ANYWAY = frozenset({"telegram", "heartbeat", "kill switch"})
 MIN_GUARD_DAYS = 365  # history the kill switch check needs to say anything
 BACKUP_BEHIND_DAYS = 2  # a running session copies the ledger every 6 hours
 
@@ -63,13 +66,19 @@ async def run_checks(
     *,
     offline: bool = False,
 ) -> list[Check]:
-    """Offline leaves out what depends on the network, which a running bot retries."""
+    """Offline leaves out what depends on the network, which a running bot retries, and
+    fails only on what stops a session from starting."""
     real_money = isinstance(config, LiveConfig) and config.mode == "live"
     checks = strategy_checks(config) + ledger_checks(config) + alert_checks(settings, real_money)
     if isinstance(config, LiveConfig) and not (
         settings.binance_api_key and settings.binance_api_secret
     ):
         checks.append(Check("fail", "api key", KEYS_MISSING))
+    if offline:
+        checks = [
+            Check("warn", c.name, c.detail) if c.status == "fail" and c.name in STARTS_ANYWAY else c
+            for c in checks
+        ]
     if checks[0].status == "fail":
         return checks  # nothing below means much for a config that cannot start
     if settings.heartbeat_url and valid_url(settings.heartbeat_url) and not offline:
@@ -85,7 +94,14 @@ async def run_checks(
         server = await public.server_time()
         offset = server.timestamp() - (before + time.time()) / 2
     except (httpx.HTTPError, BinanceError) as exc:
-        checks.append(Check("fail", "binance", f"unreachable: {exc!r}; check the network"))
+        checks.append(
+            Check(
+                "fail",
+                "binance",
+                f"unreachable: {exc!r}; check the network (HTTP 403 or 451: Binance may not "
+                "serve this region)",
+            )
+        )
         return checks
     checks.append(
         Check(
@@ -169,7 +185,8 @@ def backup_check(config: SessionConfig) -> Check:
         return Check(
             "warn", "backup", f"{backups[-1]} is {behind:.0f} days older than the ledger's changes"
         )
-    return Check("ok", "backup", f"{len(backups)} daily copies, newest {backups[-1]}")
+    copies = "1 daily copy" if len(backups) == 1 else f"{len(backups)} daily copies"
+    return Check("ok", "backup", f"{copies}, newest {backups[-1]}")
 
 
 def ledger_checks(config: SessionConfig) -> list[Check]:
@@ -230,10 +247,18 @@ def alert_checks(settings: Settings, real_money: bool = False) -> list[Check]:
             "fail", "telegram", "set both TBOT_TELEGRAM_TOKEN and _CHAT_ID (`tbot notify` helps)"
         )
     else:
-        telegram = Check(
-            "fail" if real_money else "warn",
-            "telegram",
-            "not configured: alerts only reach the log (`tbot notify` sets it up)",
+        telegram = (
+            Check(
+                "fail",
+                "telegram",
+                "not configured: a real-money bot must be able to send alerts (`tbot notify`)",
+            )
+            if real_money
+            else Check(
+                "warn",
+                "telegram",
+                "not configured: alerts only reach the log (`tbot notify` sets it up)",
+            )
         )
     url = settings.heartbeat_url
     if not url:
@@ -255,7 +280,9 @@ async def symbol_checks(config: SessionConfig, spot: BinanceSpot) -> list[Check]
         rules = await spot.load_rules(symbols)
     except BinanceError as exc:
         if exc.code == INVALID_SYMBOL and "unknown symbols" not in exc.message:
-            return [Check("fail", "symbols", f"Binance lists not all of {', '.join(symbols)}")]
+            unknown = await unlisted(spot, symbols)  # Binance does not say which
+            named = ", ".join(unknown) or ", ".join(symbols)
+            return [Check("fail", "symbols", f"Binance does not list {named}")]
         return [Check("fail", "symbols", exc.message)]
     paused = [f"{s} {spot.status[s]}" for s in sorted(rules) if not spot.trading(s)]
     if paused:
@@ -280,6 +307,18 @@ async def symbol_checks(config: SessionConfig, spot: BinanceSpot) -> list[Check]
             )
         ]
     return [Check("ok", "symbols", f"{', '.join(sorted(rules))} trading")]
+
+
+async def unlisted(spot: BinanceSpot, symbols: list[str]) -> list[str]:
+    """The symbols Binance does not list, asked one at a time."""
+    found = []
+    for symbol in symbols:
+        try:
+            await spot.load_rules([symbol])
+        except BinanceError as exc:
+            if exc.code == INVALID_SYMBOL:
+                found.append(symbol)
+    return found
 
 
 async def account_checks(

@@ -32,15 +32,18 @@ def test_invalid_utf8_flagged() -> None:
     assert kinds(gg.scan_line("x", "bad " + chr(0xFFFD))) == ["invalid UTF-8"]
 
 
+PING_UUID = ("1f9b2c3d", "4e5f", "4a6b", "8c7d", "9e0f1a2b3c4d")  # built: no literal key
+
+
 @pytest.mark.parametrize(
     ("text", "name"),
     [
         ("-----BEGIN " + "RSA PRIVATE KEY-----", "private key"),
         ("123456789:" + "A" * 35, "telegram bot token"),
         ("12345678901:" + "A" * 35, "telegram bot token"),
-        ("https://hc-ping.com/" + "0f3e9a1c-" * 4, "monitor ping url"),
+        ("https://hc-ping.com/" + "-".join(PING_UUID), "monitor ping url"),
+        ("https://hc-ping.com/" + "aB3_x-" * 3 + "Zq9z/my-bot", "monitor ping url"),
         ("https://kuma.example/api/push/" + "Ab3" * 4 + "?status=up", "monitor ping url"),
-        ("TBOT_HEARTBEAT_URL=" + "https://monitor.example/ping", "monitor ping url"),
         ("key " + "aB3" * 21 + "x", "api key"),
         ("BINANCE_API_KEY=" + "x" * 20, "credential assignment"),
         ('"api_secret": "' + "y" * 20 + '"', "credential assignment"),
@@ -58,6 +61,10 @@ def test_secret_detected(text: str, name: str) -> None:
         "api_key = os.environ['BINANCE_API_KEY']",
         "TBOT_HEARTBEAT_URL=",
         "a monitor such as https://healthchecks.io/docs/",
+        "TBOT_HEARTBEAT_URL=https://example.com/ping",
+        "https://hc-ping.com/your-check-uuid",
+        "http://kuma.local:3001/api/push/XXXXXXXX?status=up",
+        "TBOT_HEARTBEAT_URL=https://hc-ping.com/<your-uuid>",
     ],
 )
 def test_non_secret_passes(text: str) -> None:

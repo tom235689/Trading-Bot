@@ -15,9 +15,11 @@ from tbot.core.text import price_text
 from tbot.data.store import BarStore
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Ledger
-from tbot.live.runner import BUDGET_NOTE, base_cash, price_at
+from tbot.live.runner import BUDGET_NOTE, base_cash, next_close, price_at
 
 MAX_EQUITY_GAP = 0.02  # larger gaps between session and backtest equity need a look
+# Both sides' prices already include the modeled slippage: what is left is real extra cost.
+EXTRA_COST_BPS = 1.0
 SHOWN_FILLS = 10
 
 
@@ -54,6 +56,7 @@ class Comparison:
     flows: float = 0.0  # money reconciliation moved into the book, taken out of its equity
     stop_fills: int = 0  # protective stops that executed; the backtest has none
     budget_change: datetime | None = None  # first initial_cash change in the period
+    notes: tuple[str, ...] = ()  # what makes the two differ on purpose, such as a resume
 
     @property
     def mean_extra_cost_bps(self) -> float | None:
@@ -62,7 +65,7 @@ class Comparison:
         return sum(m.extra_cost_bps for m in self.matched) / len(self.matched)
 
     def checks(self) -> list[str]:
-        found = []
+        found = list(self.notes)
         if self.budget_change:
             found.append(
                 f"initial_cash changed on {self.budget_change:%Y-%m-%d %H:%M}: the backtest keeps "
@@ -84,10 +87,11 @@ class Comparison:
                 f"{len(self.backtest_only)} only in the backtest"
             )
         extra = self.mean_extra_cost_bps
-        if extra is not None and extra > self.slippage_bps:
+        if extra is not None and extra > EXTRA_COST_BPS:
             found.append(
-                f"fills cost {extra:.1f} bps more than the backtest on average; raise "
-                "costs.slippage_bps and validate again"
+                f"fills cost {extra:.1f} bps more than the backtest on average, beyond the "
+                f"{self.slippage_bps:g} bps of slippage it already assumes; raise "
+                "costs.slippage_bps by that and validate again"
             )
         if self.max_gap > MAX_EQUITY_GAP:
             found.append(f"equity drifted up to {self.max_gap:.1%} from the backtest")
@@ -97,7 +101,11 @@ class Comparison:
 def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> Comparison:
     points = ledger.equity_points()
     if not points:
-        raise ValueError("the ledger has no bar events yet")
+        timeframe, first = next_close(config, datetime.now(UTC))
+        raise ValueError(
+            f"the ledger has no bar events yet: run the session past a {timeframe} close "
+            f"(the next is {first:%H:%M} UTC)"
+        )
     start = points[0].time
     base = base_cash(config, ledger)  # the backtest starts with what the session started with
     result = run_period(
@@ -139,6 +147,19 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
         session_fills, [f for f in _fills(result) if f.time <= end], step
     )
     last = shared[-1]
+    notes = []
+    for event in ledger.events_starting("resumed after halt"):
+        if start <= event.time <= last:
+            notes.append(
+                f"the kill switch was cleared on {event.time:%Y-%m-%d %H:%M} (`tbot resume`): "
+                "the backtest does not resume, so the two differ from then on"
+            )
+    changes = [e for e in ledger.events_starting("config changed") if start < e.time <= last]
+    if changes:
+        notes.append(
+            f"the trading config changed on {changes[-1].time:%Y-%m-%d %H:%M}: the backtest "
+            "runs today's config over the whole period, so the two differ before then"
+        )
     return Comparison(
         start=start,
         end=last,
@@ -159,6 +180,7 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
         flows=sum(value for at, value in flows if at <= last),
         stop_fills=len(in_period) - len(session_fills),
         budget_change=budget[0] if budget else None,
+        notes=tuple(notes),
     )
 
 

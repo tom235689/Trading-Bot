@@ -35,6 +35,9 @@ Only show what would be done; changes nothing and asks for no rights.
 .PARAMETER Elevated
 Internal: set when the script restarted itself with administrator rights.
 
+.PARAMETER Busy
+Internal: doctor saw a session running on the config before the script elevated itself.
+
 .EXAMPLE
 tbot autostart paper
 tbot autostart live -Live
@@ -49,7 +52,8 @@ param(
     [switch] $NoStart,
     [switch] $Remove,
     [switch] $DryRun,
-    [switch] $Elevated
+    [switch] $Elevated,
+    [switch] $Busy
 )
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
@@ -59,10 +63,6 @@ if ($Remove) {
     & (Join-Path $PSScriptRoot "remove_task.ps1") -Config $Config -Name $Name -DryRun:$DryRun
     exit $LASTEXITCODE
 }
-if (-not $DryRun -and -not $Elevated -and -not (Test-Admin)) {
-    exit (Invoke-Elevated $PSCommandPath $PSBoundParameters)
-}
-
 $code = 0
 try {
     $path = Resolve-Config $repo $Config
@@ -74,14 +74,27 @@ try {
     if (-not $Name) { $Name = "tbot $stem" }
     $uv = (Get-Command uv).Source  # the task may not see the same PATH
 
-    $busy = $false
+    # Everything is checked before the administrator prompt: a typo never asks for rights.
+    $busy = [bool] $Busy
     if (-not $SkipDoctor) {
         $report = @(& $uv --directory $repo run --quiet --frozen python -m tbot doctor $path)
         $doctorCode = $LASTEXITCODE
         $report | ForEach-Object { Write-Output $_ }
         if ($doctorCode -eq 4) { throw "$Config is no valid session config: see the error above" }
-        if ($doctorCode -ne 0) { throw "doctor found problems: fix the FAIL lines, or pass -SkipDoctor" }
+        if ($doctorCode -ne 0) {
+            $null = @(& $uv --directory $repo run --quiet --frozen python -m tbot doctor $path --offline)
+            if ($LASTEXITCODE -eq 0) {
+                throw ("only network checks failed (no network, or Binance refusing this region): " +
+                    "try again when they pass; -SkipDoctor registers the task anyway")
+            }
+            throw "doctor found problems: fix the FAIL lines above, then run this again"
+        }
         $busy = [bool] ($report | Where-Object { $_ -match "process: a session is running" })
+    }
+    if (-not $DryRun -and -not $Elevated -and -not (Test-Admin)) {
+        $PSBoundParameters["SkipDoctor"] = $true  # checked above
+        if ($busy) { $PSBoundParameters["Busy"] = $true }
+        exit (Invoke-Elevated $PSCommandPath $PSBoundParameters)
     }
 
     $runner = Join-Path $PSScriptRoot "run_bot.ps1"
@@ -92,7 +105,8 @@ try {
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
-        -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+        -Priority 5  # normal; the default 7 runs the bot below normal priority
     $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U  # no stored password
     $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings `
@@ -122,7 +136,16 @@ try {
             $withdrawn = @(& $uv --directory $repo run --quiet --frozen python -m tbot stop $path --cancel)
             $withdrawn | Where-Object { $_ -match "withdrawn" } | ForEach-Object { Write-Output $_ }
             Start-ScheduledTask -TaskName $Name
-            Write-Output "registered and started '$Name': it runs at every boot. Watch it: tbot status, tbot log $stem -f"
+            Start-Sleep -Seconds 10  # a start that fails at once ends the task: say why
+            $state = [string] (Get-ScheduledTask -TaskName $Name).State
+            if ($state -eq "Running") {
+                Write-Output "registered and started '$Name': it runs at every boot. Watch it: tbot status, tbot log $stem -f"
+            } else {
+                $journal = Join-Path $repo "logs\$stem.supervisor.log"
+                $last = if (Test-Path $journal) { Get-Content $journal -Tail 1 } else { "no journal yet" }
+                Write-Output "registered '$Name', but it is not running ($state): $last"
+                $code = 1
+            }
         }
     }
 } catch {

@@ -5,7 +5,7 @@ import polars as pl
 import pytest
 
 from tbot.backtest.engine import BacktestResult
-from tbot.backtest.metrics import compute_metrics
+from tbot.backtest.metrics import Metrics, compute_metrics
 from tbot.backtest.report import format_metrics
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -75,3 +75,32 @@ def test_report_mentions_key_metrics() -> None:
     text = format_metrics(compute_metrics(result()))
     for label in ("CAGR", "Sharpe", "Max drawdown", "Profit factor"):
         assert label in text
+
+
+def test_a_short_period_shows_no_annualized_ratios() -> None:
+    day = datetime(2024, 1, 1, tzinfo=UTC)
+    nan = math.nan
+    short = Metrics(
+        day,
+        day,
+        1 / 365,
+        100.0,
+        99.0,
+        -0.01,
+        -0.97,
+        -595.4,
+        nan,
+        -0.01,
+        nan,
+        0.0,
+        0.0,
+        0.0,
+        0,
+        nan,
+        nan,
+        nan,
+    )
+    text = format_metrics(short)
+    assert "Sharpe        n/a (under 30 days)" in text
+    assert "-595" not in text
+    assert "Win rate -" in text

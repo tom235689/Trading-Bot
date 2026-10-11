@@ -1,5 +1,6 @@
 """Configuration shared by backtest, paper, and live modes."""
 
+import re
 from collections.abc import Mapping
 from typing import Any, Self
 
@@ -41,6 +42,18 @@ def load_yaml(text: str) -> Any:
     return yaml.load(text, Loader=_UniqueKeyLoader)
 
 
+SYMBOL = re.compile(r"[A-Z0-9]{2,20}")
+
+
+def normalize_symbol(value: str) -> str:
+    """BTC/USDT, btc-usdt, or BTC_USDT is BTCUSDT; anything else is an error, not a symbol
+    that fails later with advice that cannot help (`tbot download`)."""
+    symbol = re.sub(r"[/\-_ ]", "", value).upper()
+    if not SYMBOL.fullmatch(symbol):
+        raise ValueError(f"{value!r} is no Binance spot symbol such as BTCUSDT or BTC/USDT")
+    return symbol
+
+
 class StrategyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -53,7 +66,7 @@ class StrategyConfig(BaseModel):
     @field_validator("symbols")
     @classmethod
     def normalize_symbols(cls, symbols: list[str]) -> list[str]:
-        normalized = [symbol.replace("/", "").upper() for symbol in symbols]
+        normalized = [normalize_symbol(symbol) for symbol in symbols]
         if len(set(normalized)) < len(normalized):  # a repeat would take a share it never uses
             raise ValueError(f"a symbol is listed twice: {symbols}")
         return normalized

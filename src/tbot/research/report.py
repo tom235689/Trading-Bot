@@ -80,7 +80,11 @@ def format_report(r: ValidationReport) -> str:
     )
     for check in r.gate:
         status = "PASS" if check.passed else "FAIL"
-        lines.append(f"   {status}  {check.name}: {check.value:.3g} vs {check.threshold:.3g}")
+        if "return" in check.name or "drawdown" in check.name:  # fractions, shown as percent
+            values = f"{check.value:+.1%} vs {check.threshold:+.1%}"
+        else:
+            values = f"{check.value:.3g} vs {check.threshold:.3g}"
+        lines.append(f"   {status}  {check.name}: {values}")
     lines.append(f"   {'PASSED' if r.passed else 'FAILED'}")
     return "\n".join(lines)
 

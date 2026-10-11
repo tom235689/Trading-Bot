@@ -5,15 +5,17 @@ import logging
 import os
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from binance_fake import make_bars
+from factories import price_bars
 from tbot import __version__
 from tbot.backtest.config import BacktestConfig
 from tbot.cli import (
@@ -23,6 +25,8 @@ from tbot.cli import (
     EXIT_LEDGER,
     announce,
     build_parser,
+    check_holdout,
+    check_period,
     config_arg,
     config_names,
     load_session_config,
@@ -30,13 +34,14 @@ from tbot.cli import (
     not_running,
     output_file,
     parse_symbol,
+    parse_timeframe,
     pick_config,
     print_notes,
     run,
     session_logging,
     write_dashboard,
 )
-from tbot.core.config import load_yaml
+from tbot.core.config import StrategyConfig, load_yaml
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.live.config import Settings, save_settings
@@ -51,6 +56,7 @@ from tbot.live.runner import (
 )
 from tbot.monitoring.dashboard import DashboardData
 from tbot.monitoring.telegram import Telegram
+from tbot.research.validate import ValidationConfig
 from tbot.risk.guard import GuardState
 
 
@@ -776,6 +782,7 @@ def test_tbot_runs_in_the_repository_wherever_it_is_typed(
         return 0
 
     monkeypatch.setattr("tbot.cli.main", main)
+    monkeypatch.setattr("tbot.cli.ORIGIN", None)  # run() sets it: restored after the test
     monkeypatch.setattr("tbot.cli.ROOT", tmp_path / "installed")  # a wheel: no repository
     assert run() == 0
     monkeypatch.setattr("tbot.cli.ROOT", repo)
@@ -794,10 +801,10 @@ def test_two_configs_on_one_ledger_are_pointed_out(
     )
     assert main(["status"]) == 0
     out = capsys.readouterr().out
-    assert "config/mypaper.yaml also use paper.sqlite" in out.replace("\\", "/")
+    assert "config/mypaper.yaml uses paper.sqlite too" in out.replace("\\", "/")
     assert main(["doctor", "mypaper", "--offline"]) in (0, 1)
     out = capsys.readouterr().out.replace("\\", "/")
-    assert "WARN ledger: config/paper.yaml also use paper.sqlite: one book for two" in out
+    assert "WARN ledger: config/paper.yaml uses paper.sqlite too: one book for two" in out
 
 
 def test_account_without_keys_says_so_before_any_request(
@@ -852,5 +859,155 @@ def test_a_missing_ledger_names_the_command_that_starts_it(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     write_configs(tmp_path)
-    assert main(["compare", "testnet"]) == EXIT_CONFIG
+    assert main(["compare", "testnet"]) == EXIT_ERROR  # the config is fine: nothing ran
     assert "(`tbot live testnet` starts it;" in capsys.readouterr().err
+
+
+def test_files_named_from_another_folder_are_found_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "mine.yaml").write_text(f"start: 2024-01-01\nstrategies:\n{STRATEGY}", "utf-8")
+    monkeypatch.setattr("tbot.cli.ORIGIN", elsewhere)  # what run() records before it moves
+    assert config_arg("mine.yaml") == elsewhere / "mine.yaml"
+    assert config_arg("paper") == Path("config/paper.yaml")  # names stay names
+    assert config_arg("config/testnet.yaml") == Path("config/testnet.yaml")  # the repository's
+    assert output_file("x.html", Path("reports"), "a.html") == elsewhere / "x.html"
+
+
+def test_symbols_are_written_as_binance_writes_them(capsys: pytest.CaptureFixture[str]) -> None:
+    def strategy(*symbols: str) -> StrategyConfig:
+        return StrategyConfig(
+            name="donchian_trend", symbols=list(symbols), timeframe=Timeframe.H4, allocation=1.0
+        )
+
+    assert strategy("btc-usdt", "ETH_USDT", "SOL/USDT").symbols == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    with pytest.raises(ValidationError, match="no Binance spot symbol"):
+        strategy("BTC.USDT")
+    assert main(["download", "--symbols", "BTC:USDT"]) == EXIT_CONFIG
+    assert "'BTC:USDT' is no Binance spot symbol" in capsys.readouterr().err
+
+
+def test_a_config_of_another_kind_names_the_command_for_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    assert main(["live", "paper"]) == EXIT_CONFIG
+    err = capsys.readouterr().err.replace("\\", "/")
+    assert "config/paper.yaml is a paper config: run it with `tbot paper paper`" in err
+    assert main(["backtest", "testnet"]) == EXIT_CONFIG
+    assert "is a testnet or live config: run it with `tbot live testnet`" in capsys.readouterr().err
+    assert main(["status", "trend"]) == EXIT_CONFIG
+    assert "is a backtest config: run it with `tbot backtest trend`" in capsys.readouterr().err
+
+
+def test_a_mistyped_key_gets_a_suggestion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    paper = tmp_path / "config" / "paper.yaml"
+    text = paper.read_text("utf-8")
+    paper.write_text(text + "initial_cahs: 500\nguard: {max_drawdown: 45}\n", "utf-8")
+    assert main(["status", "paper"]) == EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "initial_cahs: unknown key (did you mean initial_cash?)" in err
+    assert "guard.max_drawdown: Input should be less than 1 (a fraction: 0.45 means 45%)" in err
+    params = STRATEGY.replace("allocation: 1.0}", "allocation: 1.0, params: {exti: 5}}")
+    paper.write_text(f"ledger: paper.sqlite\nstrategies:\n{params}", "utf-8")
+    assert main(["paper", "paper"]) == EXIT_CONFIG
+    assert "strategies.0.params.exti: unknown key (did you mean exit?)" in capsys.readouterr().err
+
+
+def test_a_paper_config_without_a_ledger_line_is_a_session_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    (tmp_path / "config" / "mini.yaml").write_text(f"strategies:\n{STRATEGY}", "utf-8")
+    assert main(["status"]) == 0
+    assert any(line.startswith("mini ") for line in capsys.readouterr().out.splitlines())
+
+
+def test_help_is_a_command_too(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["help"]) == 0
+    assert "usage: tbot" in capsys.readouterr().out
+    assert main(["help", "paper"]) == 0
+    assert "usage: tbot paper" in capsys.readouterr().out
+
+
+def test_wrong_values_say_what_is_expected(capsys: pytest.CaptureFixture[str]) -> None:
+    assert parse_timeframe("4H") == Timeframe.H4
+    assert main(["download", "--timeframes", "4x"]) == EXIT_CONFIG
+    assert "'4x' is no timeframe; use one of 1m, 3m" in capsys.readouterr().err
+    assert main(["download", "--start", "2026-02-30"]) == EXIT_CONFIG
+    assert "'2026-02-30' is no date; use YYYY-MM-DD" in capsys.readouterr().err
+    assert output_file("mydash", Path("reports"), "a.html") == Path("mydash.html")
+    assert build_parser().parse_args(["backtest", "x", "--html"]).html == ""
+
+
+def two_streams(store: BarStore, eth_start: datetime, eth_bars: int) -> BacktestConfig:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    flat = [100.0] * 600  # 100 days of 4h bars
+    store.write("BTCUSDT", Timeframe.H4, price_bars(start, Timeframe.H4, flat, flat))
+    short = [100.0] * eth_bars
+    store.write("ETHUSDT", Timeframe.H4, price_bars(eth_start, Timeframe.H4, short, short))
+    return BacktestConfig.model_validate(
+        {
+            "start": "2024-01-02",
+            "end": "2024-04-01",
+            "strategies": [
+                {
+                    "name": "donchian_trend",
+                    "symbols": ["BTCUSDT", "ETHUSDT"],
+                    "timeframe": "4h",
+                    "allocation": 1.0,
+                    "params": {"entry": 5, "exit": 3},
+                }
+            ],
+        }
+    )
+
+
+def test_a_stream_that_ends_early_or_starts_late_is_named_before_the_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = BarStore(tmp_path)
+    config = two_streams(store, datetime(2024, 1, 21, tzinfo=UTC), 300)  # to 2024-03-11
+    with pytest.raises(ValueError, match="ETHUSDT 4h data ends 2024-03-11 00:00, before the"):
+        check_period(config, store)  # a delisted symbol would cut the whole run short
+    print_notes(config.model_copy(update={"end": None}), store)
+    out = capsys.readouterr().out
+    assert "ETHUSDT 4h data ends 2024-03-11 00:00 (its last close)" in out
+    assert "leave it out or set end:" in out
+    assert "ETHUSDT 4h data starts 2024-01-21, after the period starts" in out
+
+
+def test_a_week_of_missing_bars_inside_the_period_is_named(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = BarStore(tmp_path)
+    config = two_streams(store, datetime(2024, 1, 1, tzinfo=UTC), 600)
+    eth = store.read("ETHUSDT", Timeframe.H4)
+    hole = (eth["open_time"] < datetime(2024, 2, 1, tzinfo=UTC)) | (
+        eth["open_time"] >= datetime(2024, 2, 1, tzinfo=UTC) + timedelta(days=10)
+    )
+    other = BarStore(tmp_path / "holed")
+    other.write("BTCUSDT", Timeframe.H4, store.read("BTCUSDT", Timeframe.H4))
+    other.write("ETHUSDT", Timeframe.H4, eth.filter(hole))
+    print_notes(config, other)
+    assert "ETHUSDT 4h misses a week or more of bars inside the period" in capsys.readouterr().out
+
+
+def test_a_holdout_after_the_stored_bars_fails_before_anything_runs(tmp_path: Path) -> None:
+    store = BarStore(tmp_path)
+    base = two_streams(store, datetime(2024, 1, 1, tzinfo=UTC), 600)
+    late = ValidationConfig.model_validate(
+        {"backtest": "base.yaml", "holdout_start": date(2024, 6, 1), "grid": {"entry": [5]}}
+    )
+    with pytest.raises(ValueError, match="holdout_start 2024-06-01 is after the stored"):
+        check_holdout(late, base.model_copy(update={"end": None}), store)

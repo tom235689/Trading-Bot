@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import polars as pl
@@ -17,7 +17,7 @@ from tbot.core.config import StrategyConfig
 from tbot.core.timeframe import Timeframe
 from tbot.data.schema import empty_bars
 from tbot.data.store import BarStore
-from tbot.exchange.binance import INVALID_SYMBOL, BinanceError
+from tbot.exchange.binance import INVALID_SYMBOL, BinanceError, BinanceSpot
 from tbot.execution.sim_broker import SimulatedBroker
 from tbot.live import runner
 from tbot.live.clock import ServerClock
@@ -343,3 +343,15 @@ def test_the_heartbeat_and_stream_alerts_follow_the_feed(
 
     assert asyncio.run(scenario()) == ["", "stale streams: BTCUSDT 4h"]
     assert "[paper] stream BTCUSDT 4h is back: bars arrive again" in notifier.messages
+
+
+def test_the_heartbeat_ignores_a_pair_binance_pauses() -> None:
+    class Spot:
+        def trading(self, symbol: str) -> bool:
+            return symbol != "ETHUSDT"
+
+    spot = cast(BinanceSpot, Spot())
+    paused = ("ETHUSDT", H4)
+    assert runner.heartbeat_problem([paused], "", spot) == ""
+    assert runner.heartbeat_problem([KEY, paused], "", spot) == "stale streams: BTCUSDT 4h"
+    assert runner.heartbeat_problem([], "reconciliation failing") == "reconciliation failing"

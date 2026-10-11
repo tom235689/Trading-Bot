@@ -73,3 +73,13 @@ def test_nan_and_negative_values_fail() -> None:
     )
     report = check_bars(bars, H1, LATER)
     assert (report.ok, report.invalid_values) == (False, 3)
+
+
+def test_a_week_without_bars_is_missing_data() -> None:
+    bars = make_bars(T0, 480, H1)
+    week = bars.filter((pl.col("open_time") < at(100)) | (pl.col("open_time") >= at(100 + 24 * 8)))
+    report = check_bars(week, H1, LATER)
+    assert not report.ok
+    assert len(report.long_gaps) == 1
+    days = bars.filter((pl.col("open_time") < at(100)) | (pl.col("open_time") >= at(100 + 24 * 3)))
+    assert check_bars(days, H1, LATER).ok  # Binance paused for days in 2018: a warning

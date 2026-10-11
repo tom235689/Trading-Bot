@@ -2,7 +2,7 @@
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 
@@ -30,6 +30,11 @@ def format_line(line: str) -> str:
         return line
     if not isinstance(record, dict):
         return line
+    return format_record(record)
+
+
+def format_record(record: Mapping[str, object]) -> str:
+    """One log record as `tbot log` shows it; the console of a session uses it too."""
     stamp = str(record.get("timestamp", ""))[:19].replace("T", " ")
     level = str(record.get("level", ""))
     message = str(record.get("text") or record.get("event", ""))

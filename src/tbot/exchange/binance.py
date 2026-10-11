@@ -131,6 +131,7 @@ class Order:
     stop_price: float | None = None
     fills: tuple[TradeFill, ...] = ()  # only on a FULL order response
     orig_qty: float = 0.0  # the size ordered
+    updated: datetime | None = None  # last change, such as a stop's last execution
 
     @property
     def done(self) -> bool:
@@ -139,6 +140,7 @@ class Order:
 
 def parse_order(data: Mapping[str, Any]) -> Order:
     stop = float(data.get("stopPrice", 0) or 0)
+    millis = int(data.get("updateTime") or data.get("transactTime") or 0)
     fills = tuple(
         TradeFill(float(f["price"]), float(f["qty"]), float(f["commission"]), f["commissionAsset"])
         for f in data.get("fills", [])
@@ -155,6 +157,7 @@ def parse_order(data: Mapping[str, Any]) -> Order:
         stop_price=stop or None,
         fills=fills,
         orig_qty=float(data.get("origQty", 0)),
+        updated=datetime.fromtimestamp(millis / 1000, UTC) if millis else None,
     )
 
 
@@ -228,7 +231,13 @@ class BinanceSpot:
         return f"{query}&signature={signature}"
 
     async def _request(
-        self, method: str, path: str, params: Params | None = None, *, signed: bool = False
+        self,
+        method: str,
+        path: str,
+        params: Params | None = None,
+        *,
+        signed: bool = False,
+        attempts: int | None = None,
     ) -> Any:
         """Send a request, retrying lost connections, rate limits, and server errors.
 
@@ -239,7 +248,7 @@ class BinanceSpot:
         """
         params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key}
-        attempts = 1 if method == "POST" else self.retries
+        attempts = 1 if method == "POST" else attempts or self.retries
         attempt, resynced = 0, False
         while True:
             wait = self.paused_until - time.monotonic()
@@ -381,10 +390,16 @@ class BinanceSpot:
         }
         return parse_order(await self._request("POST", "/api/v3/order", params, signed=True))
 
-    async def get_order(self, symbol: str, client_order_id: str) -> Order | None:
+    async def get_order(
+        self, symbol: str, client_order_id: str, *, attempts: int | None = None
+    ) -> Order | None:
+        """The order, or None when Binance does not know it; `attempts` 1 leaves retries to
+        a caller that has its own."""
         params = {"symbol": symbol, "origClientOrderId": client_order_id}
         try:
-            data = await self._request("GET", "/api/v3/order", params, signed=True)
+            data = await self._request(
+                "GET", "/api/v3/order", params, signed=True, attempts=attempts
+            )
         except BinanceError as exc:
             if exc.code == ORDER_NOT_FOUND:
                 return None

@@ -108,7 +108,7 @@ class LiveFeed:
         if key in self._stale_reported:
             self._stale_reported.discard(key)
             if self.on_fresh is not None:
-                self.on_fresh(key)
+                _report(self.on_fresh, key)  # the bars are stored: they must still be queued
         return bars
 
     def stale(self) -> list[StreamKey]:
@@ -229,7 +229,8 @@ class LiveFeed:
                 stale = self._overdue_seconds(key, self.clock()) > self.stale_after
                 if stale and key not in self._stale_reported:
                     self._stale_reported.add(key)
-                    self.on_stale(key, self.last[key] or datetime.min.replace(tzinfo=UTC))
+                    last = self.last[key] or datetime.min.replace(tzinfo=UTC)
+                    _report(self.on_stale, key, last)
 
     def _overdue_seconds(self, key: StreamKey, now: datetime) -> float:
         """Seconds since the bar after the last one should have closed, if it has not come.
@@ -289,6 +290,14 @@ class LiveFeed:
         present = {key for close, key, _ in pending if close == close_ms}
         expected = {key for key in self.keys if close_ms % key[1].millis == 0}
         return expected <= present or any(close > close_ms for close, _, _ in pending)
+
+
+def _report[*Args](callback: Callable[[*Args], None], *args: *Args) -> None:
+    """Run a report callback; its failure (a ledger busy for a moment) loses no bar."""
+    try:
+        callback(*args)
+    except Exception as exc:
+        log.error("report_failed", error=repr(exc))
 
 
 def close_time(key: StreamKey, bar: pl.DataFrame) -> datetime:

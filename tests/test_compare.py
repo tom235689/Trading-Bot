@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from factories import price_bars
-from tbot.cli import EXIT_CONFIG, main
+from tbot.cli import EXIT_ERROR, main
 from tbot.core.config import StrategyConfig
 from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
@@ -151,7 +151,7 @@ def test_compare_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     assert "verdict: tracks the backtest" in capsys.readouterr().out
     fresh = cfg.model_copy(update={"ledger": tmp_path / "never_ran.sqlite"})
     path.write_text(fresh.model_dump_json(), encoding="utf-8")
-    assert main(["compare", str(path)]) == EXIT_CONFIG
+    assert main(["compare", str(path)]) == EXIT_ERROR
     assert "no ledger" in capsys.readouterr().err
 
 
@@ -192,3 +192,21 @@ def test_a_budget_change_is_named(tmp_path: Path) -> None:
     assert comparison.budget_change is None
     moved = replace(comparison, budget_change=T0 + H4.delta * 250)
     assert moved.checks()[0].startswith("initial_cash changed on 2024-02-11 16:00")
+
+
+def test_a_resume_and_a_config_change_are_named(tmp_path: Path) -> None:
+    cfg, store = run_session(tmp_path)
+    with Ledger(cfg.ledger) as ledger:
+        times = [p.time for p in ledger.equity_points()]
+        ledger.add_event(times[5], "info", "resumed after halt: drawdown")
+        ledger.add_event(times[8], "warning", "config changed: a -> b")
+        text = comparison_text(compare_session(cfg, ledger, store), "paper.sqlite")
+    assert "the kill switch was cleared on" in text
+    assert "the trading config changed on" in text
+
+
+def test_a_few_bps_of_extra_cost_are_flagged(tmp_path: Path) -> None:
+    cfg, store = run_session(tmp_path, spread_bps=4)
+    with Ledger(cfg.ledger) as ledger:
+        checks = compare_session(cfg, ledger, store).checks()
+    assert any("beyond the 5 bps of slippage it already assumes" in check for check in checks)

@@ -61,14 +61,22 @@ $line = ($arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } el
 
 $delay = $FirstDelaySeconds
 $runs = 0
+$missing = 0  # starts in a row without uv
 while ($true) {
     $started = Get-Date
     $exe = Find-Uv
     $code = -1
     $last = ""
     if (-not $exe) {
+        $missing += 1
         $last = "uv not found (was $Uv): install uv again, then run tbot autostart $name again"
+        if ($missing -ge 3) {  # this supervisor keeps its PATH: a new uv needs a new task start
+            Write-Journal "$last; not retrying"
+            exit 4
+        }
     } else {
+        $missing = 0
+        if (Test-Path $console) { Move-Item -Force $console "$console.1" }  # the run before stays
         Write-Journal "starting: $exe $line"
         try {
             $process = Start-Process -FilePath $exe -ArgumentList $line -NoNewWindow -PassThru `

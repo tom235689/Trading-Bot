@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from factories import Scripted, price_bars
-from tbot.cli import EXIT_CONFIG, load_session_config, main
+from tbot.cli import EXIT_CONFIG, EXIT_ERROR, load_session_config, main
 from tbot.core.config import StrategyConfig
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
@@ -284,12 +284,12 @@ def test_status_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
         encoding="utf-8",
     )
     code = main(["status", str(config_path), "--data-dir", str(tmp_path / "data")])
-    assert code == EXIT_CONFIG  # reading must not create a ledger
+    assert code == EXIT_ERROR  # reading must not create a ledger
     assert "no ledger" in capsys.readouterr().err
     Ledger(tmp_path / "paper.sqlite").close()
     assert main(["status", str(config_path), "--data-dir", str(tmp_path / "data")]) == 0
     out = capsys.readouterr().out
-    assert "no equity snapshots yet" in out
+    assert "no bar event yet: the first comes with the next 4h close" in out
     assert "no bars BTCUSDT" in out
     assert main(["resume", str(config_path)]) == 0
     assert "not halted" in capsys.readouterr().out
@@ -380,7 +380,7 @@ def test_a_resume_is_kept_when_reconciliation_writes_the_guard(tmp_path: Path) -
         ledger.set_meta(GUARD_META, guard.state.model_dump_json())
         assert resume(config).startswith("resumed")
         adopt_resume(guard, ledger)  # what reconciliation does before it shifts the guard
-        guard.shift(-25.0)
+        guard.shift(-25.0, 1000.0)
         ledger.set_meta(GUARD_META, guard.state.model_dump_json())
         assert not load_guard(config, ledger).state.halted
 

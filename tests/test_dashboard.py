@@ -13,7 +13,7 @@ from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.live.config import PaperConfig
-from tbot.live.ledger import EquityPoint, Ledger
+from tbot.live.ledger import Adjustment, EquityPoint, Ledger
 from tbot.monitoring.dashboard import (
     DashboardData,
     _line_chart,
@@ -208,3 +208,22 @@ def test_a_budget_change_scales_no_later_percentage(
     traded = growth(times, equity, flows, equity[0])
     assert min(drawdowns(traded, 1.0)) == pytest.approx(loss)
     assert traded[-1] - 1 == pytest.approx(loss)
+
+
+def test_a_ledger_without_bar_events_shows_its_book(tmp_path: Path) -> None:
+    store = BarStore(tmp_path / "data")
+    closes = [100.0] * 10
+    store.write("BTCUSDT", H4, price_bars(T0, H4, closes, closes))
+    config = PaperConfig(
+        initial_cash=10_000.0,
+        strategies=[
+            StrategyConfig(name="donchian_trend", symbols=["BTCUSDT"], timeframe=H4, allocation=1.0)
+        ],
+        ledger=tmp_path / "paper.sqlite",
+    )
+    with Ledger(config.ledger) as ledger:
+        ledger.add_adjustment(Adjustment(T0, "", 0.0, 500.0, "deposit"))
+        ledger.add_adjustment(Adjustment(T0, "BTCUSDT", 10.0, 0.0, "coins moved in"))
+    html = render(from_ledger(config, store, "paper"))
+    assert "11,500" in html  # cash 10,500 and 10 BTCUSDT at 100, not the 10,000 it began with
+    assert "Exposure now" in html

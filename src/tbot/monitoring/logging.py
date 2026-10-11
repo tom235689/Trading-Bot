@@ -6,10 +6,33 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import structlog
-from structlog.typing import Processor
+from structlog.typing import EventDict, Processor, WrappedLogger
+
+from tbot.monitoring.logview import format_record
 
 MAX_BYTES = 20 * 1024 * 1024
 BACKUPS = 5
+
+
+def readable(logger: WrappedLogger, method: str, event: EventDict) -> str:
+    """`time level message key=value`, as `tbot log` prints the JSON log."""
+    return format_record(event)
+
+
+def configure_quiet() -> None:
+    """Commands other than sessions: warnings and errors only, readable, on stderr."""
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.format_exc_info,
+            readable,
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
+        # Looked up at every call: a test or a caller may have replaced sys.stderr.
+        logger_factory=lambda *args: structlog.PrintLogger(sys.stderr),
+        cache_logger_on_first_use=False,
+    )
 
 
 def configure_logging(
@@ -38,10 +61,7 @@ def configure_logging(
     console.setLevel(console_level)
     console.setFormatter(
         structlog.stdlib.ProcessorFormatter(
-            processors=[
-                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-                structlog.dev.ConsoleRenderer(colors=False),
-            ],
+            processors=[structlog.stdlib.ProcessorFormatter.remove_processors_meta, readable],
             foreign_pre_chain=shared,  # websockets, httpx: same timestamp and level
         )
     )

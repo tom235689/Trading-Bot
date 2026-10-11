@@ -5,11 +5,13 @@ Warnings (gaps, zero volume, large moves) are usually real market events and are
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import polars as pl
 
 from tbot.core.timeframe import Timeframe
+
+LONG_GAP = timedelta(days=7)  # no market pause: missing data, such as a deleted month
 
 
 @dataclass(frozen=True)
@@ -34,7 +36,13 @@ class QualityReport:
 
     @property
     def ok(self) -> bool:
-        return not (self.duplicates or self.misaligned or self.incomplete or self.invalid_values)
+        broken = self.duplicates or self.misaligned or self.incomplete or self.invalid_values
+        return not (broken or self.long_gaps)
+
+    @property
+    def long_gaps(self) -> tuple[Gap, ...]:
+        """Gaps of a week or more: Binance pauses for hours, not weeks."""
+        return tuple(gap for gap in self.gaps if gap.end - gap.start >= LONG_GAP)
 
     @property
     def missing_bars(self) -> int:

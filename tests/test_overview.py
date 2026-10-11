@@ -88,7 +88,8 @@ def test_rows_without_a_ledger_or_with_a_broken_one(tmp_path: Path) -> None:
     empty = session_row(
         "new", paper(tmp_path).model_copy(update={"ledger": tmp_path / "new.sqlite"}), store
     )
-    assert empty.notes == ("no bar event yet",)
+    [waiting] = empty.notes
+    assert waiting.startswith("no bar event yet (the next 4h close is ")
 
 
 def test_a_symbol_no_longer_traded_is_valued_from_its_stored_bars(tmp_path: Path) -> None:

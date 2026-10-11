@@ -10,7 +10,7 @@ Do not include API keys, Telegram tokens, heartbeat URLs, or ledgers in a report
 
 ## Supported versions
 
-Only the latest release gets fixes; `tbot update` installs it.
+Only the latest release gets fixes. Releases are tagged (`v<version>`); `tbot update` pulls the newest commit of the main branch, which holds the latest release and the fixes after it.
 
 ## Scope
 

@@ -37,6 +37,7 @@ class DashboardData:
     notes: list[str] = field(default_factory=list)
     # Money moved into (+) or out of the book from outside: not a return or a drawdown.
     flows: list[tuple[datetime, float]] = field(default_factory=list)
+    current: float | None = None  # the book at today's marks, for a ledger without events
 
 
 def growth(
@@ -197,7 +198,7 @@ def render(data: DashboardData) -> str:
     equity = downsample(data.equity)
     traded = growth(data.times, data.equity, data.flows, data.initial)
     dd = downsample(drawdowns(traded, 1.0))  # peaks between kept points count
-    final = data.equity[-1] if data.equity else data.initial
+    final = data.equity[-1] if data.equity else data.current or data.initial
     total_return = (traded[-1] if traded else 1.0) - 1
     max_dd = min(drawdowns(traded, 1.0), default=0.0)
     exposure_value = sum(q * (m or 0.0) for _, q, m in data.positions)
@@ -211,8 +212,12 @@ def render(data: DashboardData) -> str:
         [
             _tile("Equity", _fmt_money(final)),
             _tile("Total return", _fmt_pct(total_return), "up" if total_return >= 0 else "down"),
-            _tile("Max drawdown", _fmt_pct(max_dd), "down" if max_dd < 0 else ""),
-            _tile("Exposure", f"{exposure:.0%}"),
+            _tile(
+                "Max drawdown",
+                _fmt_pct(max_dd) if max_dd < 0 else "0.0%",
+                "down" if max_dd < 0 else "",
+            ),
+            _tile("Exposure now", f"{exposure:.0%}"),
             _tile("Fills", f"{len(data.fills):,}"),
         ]
     )
@@ -406,6 +411,7 @@ def from_ledger(config: SessionConfig, store: BarStore, title: str) -> Dashboard
         positions = [
             (symbol, qty, marks.get(symbol)) for symbol, qty in sorted(portfolio.positions.items())
         ]
+        current = portfolio.cash + sum(qty * (mark or 0.0) for _, qty, mark in positions)
         notes = []
         if guard.state.halted:
             notes.append(f"HALTED: {guard.state.halt_reason} (run `tbot resume`)")
@@ -433,6 +439,7 @@ def from_ledger(config: SessionConfig, store: BarStore, title: str) -> Dashboard
             events=ledger.recent_events(20),
             notes=notes,
             flows=flows,
+            current=current,
         )
     finally:
         ledger.close()

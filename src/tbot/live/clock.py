@@ -24,8 +24,9 @@ class ServerClock:
     """Server time from the last sync onward, on the monotonic clock: a step of the local
     wall clock (Windows time sync) moves nothing until the next sync measures it."""
 
-    def __init__(self, client: httpx.Client) -> None:
+    def __init__(self, client: httpx.Client, warn_offset: float = WARN_OFFSET) -> None:
         self.client = client
+        self.warn_offset = warn_offset  # a larger offset is logged as a warning
         self.offset = timedelta(0)  # server minus local wall clock, as last measured
         self.synced = False
         self.anchor: tuple[float, float] | None = None  # server time at a monotonic time
@@ -64,7 +65,7 @@ class ServerClock:
         self.offset = timedelta(seconds=best[1] - best[3])
         self.synced = True
         seconds = self.offset.total_seconds()
-        level = log.warning if abs(seconds) > WARN_OFFSET else log.info
+        level = log.warning if abs(seconds) > self.warn_offset else log.info
         level("clock_synced", offset_seconds=round(seconds, 3))
         return seconds
 

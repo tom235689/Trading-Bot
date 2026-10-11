@@ -108,9 +108,15 @@ try {
     if ($DryRun) {
         git fetch --quiet
         if ($others) { Write-Output "would refuse: $(Format-Busy $others)" }
-        Write-Output "would stop: $(($running | ForEach-Object { $_.Name }) -join ', ')"
-        Write-Output "would pull:"
-        git log --oneline "HEAD..@{u}"
+        $names = ($running | ForEach-Object { $_.Name }) -join ', '
+        Write-Output "would stop: $(if ($names) { $names } else { 'nothing (no task runs)' })"
+        $incoming = @(git log --oneline "HEAD..@{u}")
+        if ($incoming) {
+            Write-Output "would pull:"
+            $incoming | ForEach-Object { Write-Output "  $_" }
+        } else {
+            Write-Output "nothing to pull: already at $(Get-Version)"
+        }
         return
     }
     if ($others) { throw (Format-Busy $others) }  # before any task is stopped for nothing
@@ -123,6 +129,9 @@ try {
         foreach ($task in $running) {
             Write-Output "stopping '$($task.Name)'"
             $code = Invoke-Tbot @("stop", $task.Config, "--timeout", "$StopTimeoutSeconds")
+            if ($code -eq 4) {
+                throw "cannot ask '$($task.Name)' to stop: its config $($task.Config) does not load (see above)"
+            }
             if ($code -ne 0) {
                 $null = Invoke-Tbot @("stop", $task.Config, "--cancel")  # it keeps running
                 throw "'$($task.Name)' did not stop in time"
@@ -175,8 +184,10 @@ try {
         foreach ($task in $running) {
             if ((Get-ScheduledTask -TaskName $task.Name).State -eq "Running") { continue }
             $null = Invoke-Tbot @("stop", $task.Config, "--cancel")  # or the new start stops at once
+            # Offline, doctor fails only on what stops a start; its warnings are shown.
             if ((Invoke-Tbot @("doctor", $task.Config, "--offline")) -ne 0) {
-                Write-Output "NOT started '$($task.Name)': doctor reports a problem. Fix it, then: Start-ScheduledTask -TaskName '$($task.Name)'"
+                Write-Output ("NOT started '$($task.Name)': it could not start (see the FAIL lines). " +
+                    "Fix it, then: tbot autostart $($task.Config)")
                 $notStarted += $task.Name
                 continue
             }

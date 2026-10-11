@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -254,7 +254,9 @@ def test_order_state_unknown_is_settled_later(
         portfolio = Portfolio(1000.0)
         lookup = executor.spot.get_order
 
-        async def unreachable(symbol: str, client_id: str) -> Order | None:
+        async def unreachable(
+            symbol: str, client_id: str, attempts: int | None = None
+        ) -> Order | None:
             raise httpx.ConnectError("down")
 
         monkeypatch.setattr(executor.spot, "get_order", unreachable)
@@ -520,7 +522,9 @@ def test_an_order_booked_between_bars_gets_its_stop(
         portfolio = Portfolio(1000.0)
         lookup = executor.spot.get_order
 
-        async def unreachable(symbol: str, client_id: str) -> Order | None:
+        async def unreachable(
+            symbol: str, client_id: str, attempts: int | None = None
+        ) -> Order | None:
             raise httpx.ConnectError("down")
 
         monkeypatch.setattr(executor.spot, "get_order", unreachable)
@@ -611,7 +615,9 @@ def test_an_order_in_doubt_blocks_the_next_order_for_its_symbol(
         fake.error_after_next_order = httpx.Response(503)  # it executes; the answer is lost
         lookup = executor.spot.get_order
 
-        async def unreachable(symbol: str, client_id: str) -> Order | None:
+        async def unreachable(
+            symbol: str, client_id: str, attempts: int | None = None
+        ) -> Order | None:
             raise httpx.ConnectError("down")
 
         monkeypatch.setattr(executor.spot, "get_order", unreachable)
@@ -637,7 +643,9 @@ def test_no_stop_is_sized_while_a_sell_is_in_doubt(
         portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
         fake.error_after_next_order = httpx.Response(503)
 
-        async def unreachable(symbol: str, client_id: str) -> Order | None:
+        async def unreachable(
+            symbol: str, client_id: str, attempts: int | None = None
+        ) -> Order | None:
             raise httpx.ConnectError("down")
 
         monkeypatch.setattr(executor.spot, "get_order", unreachable)
@@ -938,8 +946,12 @@ def test_a_budget_cut_the_cash_covered_leaves_nothing_owed(tmp_path: Path) -> No
         ledger.set_meta(BUDGET_META, "1000.0")
         guard = RiskGuard(GuardConfig())
         check_budget(config, ledger, guard, T0)
-        assert budget_owed(ledger) == 0.0
+        assert budget_owed(ledger) == -500.0  # until the start's reconciliation knows better
         portfolio = Portfolio(500.0)
+        await reconcile_round(
+            executor, portfolio, MARKS, ledger, notifier, guard, config, lambda: T0
+        )
+        assert budget_owed(ledger) == 0.0
         portfolio.adjust("", 0.0, -800.0)  # the bug that books cash twice
         await reconcile_round(
             executor, portfolio, MARKS, ledger, notifier, guard, config, lambda: T0
@@ -971,7 +983,32 @@ def test_what_a_budget_cut_owes_shrinks_as_sales_repay_it(tmp_path: Path) -> Non
         owed.append(float(ledger.get_meta(OWED_META) or "nan"))
         return owed
 
-    assert run(fake, tmp_path, action, stop_pct=0.0) == [-496.0, -200.0]
+    assert run(fake, tmp_path, action, stop_pct=0.0) == [-500.0, -200.0]
+
+
+def test_a_budget_cut_with_a_buy_in_doubt_takes_none_of_the_owners_cash(tmp_path: Path) -> None:
+    # A buy sent before a crash executed but was never booked; the restart lowers the
+    # budget from 1000 to 500. Booking the buy leaves the book owing 490: the owner's 4000
+    # USDT must not pay it back.
+    fake = FakeSpot(balances={"USDT": 5000.0}, prices={BTC: 50000.0})
+    config = _live_config(tmp_path).model_copy(update={"initial_cash": 500.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[float]:
+        ledger.add_order(T0, BTC, 0.0198, "pending", "", "tb-crash")
+        await executor.spot.market_order(BTC, 0.0198, "tb-crash")  # its answer was lost
+        ledger.set_meta(BUDGET_META, "1000.0")
+        guard = RiskGuard(GuardConfig())
+        check_budget(config, ledger, guard, T0)
+        portfolio = Portfolio(1000.0)
+        portfolio.adjust("", 0.0, -500.0)  # the cut, as the restored book has it
+        await reconcile_round(
+            executor, portfolio, MARKS, ledger, notifier, guard, config, lambda: T0
+        )
+        return [portfolio.cash, budget_owed(ledger)]
+
+    cash, owed = run(fake, tmp_path, action, stop_pct=0.0)
+    assert cash == pytest.approx(-490.099, abs=0.01)
+    assert owed == pytest.approx(cash)
 
 
 def test_a_paused_symbol_keeps_its_stop_as_it_is(tmp_path: Path) -> None:
@@ -1035,3 +1072,117 @@ def test_a_paper_quote_lost_to_a_blip_is_asked_again(monkeypatch: pytest.MonkeyP
 
     assert asyncio.run(quote()) == 101.5
     assert waits == [1, 2]
+
+
+def test_an_order_refused_for_outdated_rules_goes_out_again_on_the_new_ones(
+    tmp_path: Path,
+) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[Fill]:
+        fake.rules[BTC] = {**fake.rules[BTC], "step": "0.001", "minQty": "0.001"}
+        fills = await executor.execute({BTC: 0.01234}, T0, Portfolio(1000.0), MARKS)
+        assert statuses(ledger) == ["pending", "failed", "pending", "filled"]
+        return fills
+
+    [fill] = run(fake, tmp_path, action, stop_pct=0.0)
+    assert fill.quantity == pytest.approx(0.012 * 0.999)  # in the bar, on the new step
+
+
+def test_order_lookups_after_a_lost_answer_are_single_tries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waits: list[float] = []
+
+    async def no_wait(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr("tbot.exchange.binance.asyncio.sleep", no_wait)
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+    fake.lose_next_order_response = True
+    original = fake.handle
+    lookups = 0
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        nonlocal lookups
+        if request.method == "GET" and request.url.path == "/api/v3/order":
+            lookups += 1
+            if lookups <= 3:  # every lookup the executor makes (LOOKUP_DELAYS)
+                raise httpx.ConnectError("down")
+        return original(request)
+
+    fake.handle = flaky  # type: ignore[method-assign]
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        await executor.execute({BTC: 0.01}, T0, Portfolio(1000.0), MARKS)
+        return statuses(ledger)
+
+    assert run(fake, tmp_path, action, stop_pct=0.0) == ["pending", "unknown"]
+    assert lookups == 3  # the lookups are the retries: none retries itself under the lock
+    assert [w for w in waits if w >= 1] == []
+
+
+def test_a_resumed_pair_gets_its_stop_refitted(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+    fake.statuses[BTC] = "BREAK"
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> set[str]:
+        await executor.report_status()
+        fake.statuses.clear()
+        executor.spot.rules_time = float("-inf")
+        await executor.check_rules()
+        return executor.unprotected
+
+    assert run(fake, tmp_path, action) == {BTC}  # reconciliation fits it to the book
+
+
+def test_a_stop_that_could_not_be_replaced_says_the_old_one_stays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.01}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)  # a stop is in place
+
+        async def down(symbol: str) -> list[Order]:
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(executor.spot, "open_orders", down)
+        executor.partial[BTC] = 0.004  # from an earlier stop over part of the position
+        await executor.after_event(portfolio, MARKS)
+        assert executor.partial == {}
+        return notifier.messages
+
+    messages = run(fake, tmp_path, action)
+    assert "The stop in place, if any, was not replaced and stays" in messages[-1]
+    assert [o["status"] for o in fake.orders if o["type"] == "STOP_LOSS_LIMIT"] == ["NEW"]
+
+
+def test_a_stop_that_executed_while_the_bot_was_down_is_booked_at_its_time(
+    tmp_path: Path,
+) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.01}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[Fill]:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)
+        fake.trigger_stop(BTC, at=T0 - timedelta(hours=2))
+        await executor.settle(portfolio)
+        return ledger.fills()
+
+    assert run(fake, tmp_path, action)[-1].time == T0 - timedelta(hours=2)
+
+
+def test_a_ledger_from_before_owes_what_its_cuts_took(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> float:
+        for cash in (1000.0, -1500.0):  # raised and spent, then cut (0.4.2 kept no debt)
+            note = f"{BUDGET_NOTE} by {cash}"
+            ledger.add_adjustment(Adjustment(T0, "", 0.0, cash, note))
+        return budget_owed(ledger)
+
+    assert run(fake, tmp_path, action) == -1500.0  # never less than the book may owe

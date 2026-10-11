@@ -208,12 +208,15 @@ if ($SkipDownload) {
 
 Step "doctor $Config"
 & $uv @run --quiet python -m tbot doctor $Config
-if ($LASTEXITCODE -ne 0) {
-    Write-Output "doctor reports a problem: fix the FAIL lines above, then run tbot doctor again"
-    exit 1
-}
+$doctorCode = $LASTEXITCODE
 Write-Output ""
-Write-Output "Ready. Next (README, Everyday use):"
+if ($doctorCode -ne 0) {
+    Write-Output "Set up, but doctor reports a problem: fix the FAIL lines above (a network check"
+    Write-Output "may only need a retry), then run tbot doctor again. After that:"
+} else {
+    Write-Output "Ready. Next (README, Everyday use):"
+}
 Write-Output "  tbot notify    Telegram alerts, guided (optional; WARN telegram above until then)"
 Write-Output "  tbot paper     paper trading until you stop it with Ctrl+C"
 Write-Output "  tbot status    every session at a glance, from another terminal"
+if ($doctorCode -ne 0) { exit 1 }

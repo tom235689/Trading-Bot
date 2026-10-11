@@ -273,11 +273,15 @@ def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard, now: d
             ledger.set_meta(BASE_META, stored if stored is not None else repr(config.initial_cash))
         if stored is not None and float(stored) != config.initial_cash:
             change = config.initial_cash - float(stored)
-            cash = restore_portfolio(config, ledger).cash + change
+            point = ledger.latest_equity()  # the book's value as last seen
+            equity = point.equity if point is not None else restore_portfolio(config, ledger).cash
+            # What a cut may leave owing is known once orders in doubt are settled, at the
+            # first reconciliation; until then the whole cut counts (note_repaid).
+            owed = min(0.0, budget_owed(ledger) + change)
             note = f"{BUDGET_NOTE} from {float(stored):,.2f} to {config.initial_cash:,.2f}"
             ledger.add_adjustment(Adjustment(now, "", 0.0, change, note))
-            ledger.set_meta(OWED_META, repr(min(0.0, cash)))
-            guard.shift(change)
+            ledger.set_meta(OWED_META, repr(owed))
+            guard.shift(change, equity)
             ledger.set_meta(GUARD_META, guard.state.model_dump_json())
             ledger.add_event(now, "warning", f"{note}; booked as a transfer")
         ledger.set_meta(BUDGET_META, repr(config.initial_cash))
@@ -300,6 +304,12 @@ def price_at(config: TradingConfig, store: BarStore, symbol: str, moment: dateti
     return 0.0
 
 
+def next_close(config: TradingConfig, now: datetime) -> tuple[Timeframe, datetime]:
+    """The finest timeframe the config trades and its next close: the next decision."""
+    timeframe = min((c.timeframe for c in config.strategies), key=lambda t: t.millis)
+    return timeframe, timeframe.floor(now) + timeframe.delta
+
+
 def budget_owed(ledger: Ledger) -> float:
     """What lowered budgets took beyond the book's cash and sales have not repaid, as a
     negative amount: cash below zero up to this is owed to the owner, not an error for
@@ -308,11 +318,12 @@ def budget_owed(ledger: Ledger) -> float:
     if raw is not None:
         return float(raw)
     budget = [a for a in ledger.adjustments() if a.note.startswith(BUDGET_NOTE)]  # 0.4.2
-    return min(0.0, sum(a.cash for a in budget))
+    return sum(a.cash for a in budget if a.cash < 0)
 
 
 def note_repaid(ledger: Ledger, cash: float) -> None:
-    """Sales repay what a lowered budget left owing; the book never owes more again."""
+    """Sales repay what a lowered budget left owing; the book never owes more again.
+    Run it after settle: an order in doubt booked later would look like a repayment."""
     owed = budget_owed(ledger)
     left = max(owed, min(0.0, cash))
     if left != owed or ledger.get_meta(OWED_META) is None:
@@ -529,7 +540,7 @@ async def consume(feed: LiveFeed, trader: SessionTrader) -> None:
 def make_notifier(settings: Settings, client: httpx.AsyncClient) -> Notifier:
     if settings.telegram_token and settings.telegram_chat_id:
         return Telegram(settings.telegram_token, settings.telegram_chat_id, client)
-    log.warning("telegram_not_configured", hint="set TBOT_TELEGRAM_TOKEN and TBOT_TELEGRAM_CHAT_ID")
+    log.warning("telegram_not_configured", hint="alerts go to the log; `tbot notify` sets it up")
     return LogNotifier()
 
 
@@ -927,13 +938,13 @@ async def _trade(
             answer = command_answer(session, ledger, label, clock.now, notes, store)
             commands = command_loop(direct, answer, utc_now())
             tasks.append(asyncio.create_task(commands, name="commands"))
-        elif config.telegram_commands:
-            log.warning("telegram_commands_off", hint="Telegram is not configured")
+        elif config.telegram_commands and (settings.telegram_token or settings.telegram_chat_id):
+            log.warning("telegram_commands_off", hint="set both TBOT_TELEGRAM_TOKEN and _CHAT_ID")
         if settings.heartbeat_url and valid_url(settings.heartbeat_url):
+            spot = getattr(executor, "spot", None)
 
             def problem() -> str:
-                stale = ", ".join(f"{symbol} {timeframe}" for symbol, timeframe in feed.stale())
-                return f"stale streams: {stale}" if stale else health.blocked
+                return heartbeat_problem(feed.stale(), health.blocked, spot)
 
             url, every = settings.heartbeat_url, config.heartbeat_seconds
             beat = heartbeat_loop(url, every, aclient, problem)
@@ -964,6 +975,19 @@ async def _trade(
         equity = session.portfolio.equity(session.marks)
         await notifier.send(f"[{label}] stopped, equity {equity:,.2f}")
     return code
+
+
+def heartbeat_problem(
+    stale: Sequence[StreamKey], blocked: str, spot: BinanceSpot | None = None
+) -> str:
+    """Why the heartbeat should not ping, or "": a stale stream or paused orders. A pair
+    Binance pauses may send no bars while the rest trades on, so it does not count."""
+    named = ", ".join(
+        f"{symbol} {timeframe}"
+        for symbol, timeframe in stale
+        if spot is None or spot.trading(symbol)
+    )
+    return f"stale streams: {named}" if named else blocked
 
 
 def valid_url(url: str) -> bool:
@@ -1045,7 +1069,7 @@ async def reconcile_round(
         # Money moved from outside: not a profit or loss for the guard.
         moved = sum(a.cash + a.quantity * marks.get(a.symbol, 0.0) for a in adjustments)
         adopt_resume(guard, ledger)
-        guard.shift(moved)
+        guard.shift(moved, portfolio.equity(marks))  # the book is adjusted after this
         ledger.set_meta(GUARD_META, guard.state.model_dump_json())
 
     adjustments = await reconcile(
@@ -1216,6 +1240,10 @@ def _check_config(config: SessionConfig, ledger: Ledger) -> None:
         ledger.set_meta("config_hash", current)
 
 
+def _stamp(iso: str | None) -> str:
+    return f"{iso[:16].replace('T', ' ')} UTC" if iso else "-"
+
+
 def _report_stale(
     ledger: Ledger, notifier: Notifier, label: str, key: StreamKey, last: datetime
 ) -> None:
@@ -1253,14 +1281,16 @@ def status_text(config: SessionConfig, store: BarStore) -> str:
         guard = load_guard(config, ledger)
         point = ledger.latest_equity()
         running = "a session is running" if is_running(config.ledger) else "no session running"
+        timeframe, first = next_close(config, utc_now())
         lines = [
             f"ledger {config.ledger.resolve()} ({running})",
-            f"created {ledger.get_meta('created_at') or '-'}",
+            f"created {_stamp(ledger.get_meta('created_at'))}",
             (
                 f"equity {point.equity:,.2f} at {point.time:%Y-%m-%d %H:%M} UTC, "
                 f"cash {point.cash:,.2f}, exposure {point.exposure:.1%}"
                 if point
-                else "no equity snapshots yet"
+                else f"no bar event yet: the first comes with the next {timeframe} close, "
+                f"{first:%H:%M} UTC"
             ),
             f"fills {len(portfolio.fills)}, round trips {len(portfolio.trades)}, "
             f"adjustments {len(ledger.adjustments())}",

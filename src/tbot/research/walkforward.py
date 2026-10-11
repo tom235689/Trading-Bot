@@ -117,7 +117,13 @@ def run_walk_forward(
     for window in plan:
         train = base.with_period(window.train_start, window.train_end)
         runs = run_sweep(train, grid, data_dir, workers=workers)
-        best = select_run(runs, grid, objective, min_trades, selection)
+        try:
+            best = select_run(runs, grid, objective, min_trades, selection)
+        except ValueError as exc:
+            raise ValueError(
+                f"train window {window.train_start} to {window.train_end}: {exc}; lower "
+                "min_trades, widen the grid, or lengthen train_months"
+            ) from None
         test = base.with_period(window.train_end, window.test_end).with_params(best.params)
         test_result, test_metrics = evaluate(test, data_dir)
         results.append(

@@ -47,10 +47,12 @@ HANGUL = re.compile("[" + "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in HANGUL_RA
 SECRETS = {
     "private key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     "telegram bot token": re.compile(r"(?<!\d)\d{8,12}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
-    # Anyone holding a monitor's ping URL can report a dead bot as alive.
+    # Anyone holding a monitor's ping URL can report a dead bot as alive. Matched by the
+    # shape of real keys (a UUID, a ping key, a token with digits), so docs examples pass.
     "monitor ping url": re.compile(
-        r"https?://\S*(?:hc-ping\.com|/api/push)/[A-Za-z0-9_-]{8,}"
-        r"|HEARTBEAT_URL\s*=\s*[\"']?https?://"
+        r"hc-ping\.com/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        r"|[A-Za-z0-9_-]{22}/)"
+        r"|/api/push/(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{8,}"
     ),
     "api key": re.compile(
         r"(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*\d)"

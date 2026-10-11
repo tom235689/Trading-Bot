@@ -62,23 +62,30 @@ class Telegram:
         return list(response.json().get("result", []))
 
     async def send(self, text: str) -> bool:
-        return await self.deliver(text) is None
+        """Send once; whether Telegram took it."""
+        sent, _ = await self._post(text)
+        return sent
 
     async def deliver(self, text: str) -> float | None:
         """Send once. None when done: sent, or refused in a way a retry cannot change;
         else the seconds Telegram asked to wait (0 when it did not say)."""
+        sent, wait = await self._post(text)
+        return None if sent else wait
+
+    async def _post(self, text: str) -> tuple[bool, float | None]:
+        """Whether it was sent, and when not, the wait before a retry or None for never."""
         payload = {"chat_id": self.chat_id, "text": text[:MAX_LENGTH]}
         try:
             response = await self.client.post(self.url, json=payload, timeout=15.0)
         except httpx.HTTPError as exc:  # no network, a timeout: try again
             log.warning("telegram_failed", error=describe_error(exc))  # never the URL
-            return 0.0
+            return False, 0.0
         if response.is_success:
-            return None
+            return True, None
         log.warning("telegram_failed", error=f"HTTP {response.status_code}: {response.text[:200]}")
         if response.status_code == 429:
-            return _retry_after(response)
-        return 0.0 if response.status_code >= 500 else None
+            return False, _retry_after(response)
+        return False, (0.0 if response.status_code >= 500 else None)  # 4xx: a wrong chat id
 
 
 class QueuedNotifier:

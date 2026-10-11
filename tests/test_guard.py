@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from tbot.risk.guard import GuardConfig, GuardState, Mode, RiskGuard
 
 T0 = datetime(2024, 1, 1, 8, tzinfo=UTC)
@@ -72,6 +74,16 @@ def test_money_moved_from_outside_shifts_the_levels() -> None:
     guard = RiskGuard(GuardConfig(daily_loss_limit=0.03, max_drawdown=0.15, stale_seconds=0))
     now = datetime(2024, 1, 1, 12, tzinfo=UTC)
     assert guard.check(now, 1000.0, now).mode == Mode.NORMAL
-    guard.shift(-300.0)  # a withdrawal is not a 30% loss
+    guard.shift(-300.0, 1000.0)  # a withdrawal is not a 30% loss
     assert guard.check(now, 700.0, now).mode == Mode.NORMAL
     assert (guard.state.peak_equity, guard.state.day_open_equity) == (700.0, 700.0)
+
+
+def test_a_transfer_in_a_drawdown_keeps_the_drawdown() -> None:
+    guard = RiskGuard(GuardConfig(daily_loss_limit=0, max_drawdown=0.45, stale_seconds=0))
+    now = datetime(2024, 1, 1, 12, tzinfo=UTC)
+    guard.check(now, 1500.0, now)
+    assert guard.check(now, 999.45, now).mode == Mode.NORMAL  # 33% down
+    guard.shift(-400.0, 999.45)  # the owner takes 400 out
+    assert guard.check(now, 599.45, now).mode == Mode.NORMAL  # still 33% down, not 45.5%
+    assert guard.state.peak_equity == pytest.approx(1500.0 * 599.45 / 999.45)

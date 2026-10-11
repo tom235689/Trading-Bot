@@ -248,3 +248,13 @@ def test_the_heartbeat_stops_while_the_bot_cannot_trade() -> None:
 
     assert asyncio.run(run()) == 0  # no ping while it cannot trade: the monitor reports it
     assert pings > 0
+
+
+def test_a_refused_message_is_not_reported_as_sent() -> None:
+    async def run() -> tuple[bool, float | None]:
+        refuse = httpx.MockTransport(lambda request: httpx.Response(400, json={"ok": False}))
+        async with httpx.AsyncClient(transport=refuse) as client:
+            bot = Telegram("token", "42", client)
+            return await bot.send("x"), await bot.deliver("x")
+
+    assert asyncio.run(run()) == (False, None)  # `tbot notify` must not say it was sent

@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.6.0 (2026-10-11)
+
+A second round of five reviews: the 0.5 changes themselves, updates and autostart, a new user's first day and the documents, simulated live trading over nine scenarios (outages, paused pairs, stops that fill while the bot is down, two sessions on one account, budget changes), and the data and research tools. Upgrade notes:
+- `tbot update` now restarts every scheduled session that could start: `tbot doctor --offline` fails only on what stops a start (a config the new version rejects, a ledger of another mode, missing API keys) and shows the rest as warnings. Since 0.5.0 an update left a live bot without Telegram, or a halted one, stopped. This update itself still runs the old script, which reads the new doctor, so it already restarts them.
+- A "nothing has run with this config yet" answer from `status`, `compare`, `dashboard`, `backup`, and `resume` now exits with 1, like `tbot log`, not 4: the config is fine.
+- Symbols may be written `BTC-USDT` or `BTC_USDT`; anything that is no symbol (`BTC.USDT`) is an error when the config loads.
+- Every config in `config\` that is no backtest or validation config is a session config, also one without a `ledger:` line (it uses the default ledger, and `tbot status` says when that is shared).
+
+**Live trading**
+- A budget cut no longer pays an order in doubt with the owner's cash: 0.5.0 worked out what a lowered `initial_cash` leaves owing before orders in doubt were settled, so a buy that executed during a crash could be booked against the owner's USDT. The whole cut now counts until the first reconciliation, then only what the book's cash is short of. Ledgers from 0.4.2 keep the sum of their cuts, as then.
+- A deposit, withdrawal, or budget change during a drawdown no longer trips the kill switch: the peak is rescaled with the equity, so a 33% drawdown stays 33% after the owner takes money out (it became 45.5% and flattened everything).
+- An order Binance refuses because a lot step or tick changed is sent again on reloaded rules in the same event, instead of waiting for the next bar with no stop on the position.
+- When Binance trades a paused pair again, its stop is refitted to what was booked during the pause.
+- Lookups of an order in doubt are single tries each (they are the retries), so a network blip no longer holds the event for minutes.
+- A stop that executed while the bot was down is booked at the time it executed, not at the restart: daily summaries put the loss on the right day.
+- A stop that could not be replaced because Binance was unreachable says the one in place stays, instead of "the position has no exchange stop".
+
+**Alerts and monitoring**
+- `tbot notify` reports a message Telegram refuses (a wrong chat id) as failed; 0.5.0 said it was sent.
+- A stream reported back, or stale, while the ledger is busy no longer loses the bars that arrived with it.
+- The heartbeat keeps pinging while only a pair Binance has paused is stale: the rest trades.
+- Session consoles print lines as `tbot log` does; other commands print only warnings and errors, and `tbot download` no longer reports the clock offset it corrects.
+
+**Command line**
+- Config errors name the fix: `initial_cahs: unknown key (did you mean initial_cash?)`, `guard.max_drawdown: ... (a fraction: 0.45 means 45%)`, `strategies.0.params.exti: unknown key (did you mean exit?)`, and a config given to the wrong command names the right one (`config\paper.yaml is a paper config: run it with tbot paper paper`) instead of listing every pydantic error.
+- A session says when its first decision comes (the next 4h close), and so do `tbot status` and `tbot compare` while there is none yet.
+- `tbot help` and `tbot help <command>`; `--timeframes 4H` works and a wrong value lists the right ones; a wrong date says the format.
+- `python -m tbot` typed in another folder takes files you name from that folder again (0.5.0 looked for them in the repository); `tbot.cmd` is unchanged.
+- `--out mydash` writes `mydash.html`; `--html` alone writes to `reports\`.
+- A broken `.env` stops `tbot paper` before it announces a start; `tbot status` shows readable times; small wording fixes.
+
+**Backtest, research, and data**
+- A stream that ends before the period's `end` (a symbol Binance delisted) is an error before the run, instead of silently cutting every stream short; without an `end`, the note says what to do. A symbol whose data starts after the period starts, and a week or more of missing bars inside it, are named before the run.
+- `tbot check` fails on gaps of a week or more (missing data, not a market pause) and says how to download the stream again.
+- `tbot validate` checks before anything runs that the holdout has stored bars.
+- A backtest of several strategies is logged as a portfolio, not as a trial of the first strategy, so it no longer inflates the deflated Sharpe's trial count.
+- `tbot compare` flags fills that cost more than 1 bps beyond the backtest (both already include the modeled slippage; it needed nearly double before), and names a `tbot resume` and a config change in the period.
+- A first download of a recently listed symbol no longer asks REST for every month before its listing.
+- A walk-forward train window without a qualifying run is named, with what to change; the gate prints returns and drawdowns in percent; a backtest shorter than 30 days shows no annualized ratios.
+- The dashboard of a ledger without bar events shows the book at today's marks, labels the exposure tile "Exposure now", and shows a flat drawdown as 0.0%.
+
+**Windows scripts**
+- `tbot autostart` checks the config and runs doctor before it asks for administrator rights, says when only network checks failed, registers the task at normal priority (Task Scheduler's default is below normal), and checks ten seconds after the start that the session still runs.
+- The supervisor ends (exit 4) after three tries without uv instead of retrying forever, and keeps the console of the run before as `.1`.
+- `tbot update` tells a config that no longer loads apart from a bot that did not stop, points at `tbot autostart <config>` to start a session again, and says "nothing to pull" on a dry run.
+- `tbot setup` prints its next steps also when its last doctor run fails.
+
+**Project**
+- The git guard matches monitor ping URLs by the shape of real keys, so examples in docs no longer block a commit.
+- `tbot doctor` names the symbol Binance does not list, asking one at a time (Binance's answer names none).
+- README, docs/CONFIG.md, DESIGN, SECURITY.md, and .env.example corrected where they disagreed with the code; DESIGN lists two known limits (BNB fees for a bot that trades BNB, a remainder below a coarser lot step).
+
+**Tests**
+- 36 new tests (484 in all); undoing any of 47 fixes makes a test fail.
+
 ## 0.5.1 (2026-10-10)
 
 - Linux and macOS: an `--out` or `--html` value ending in a backslash names a folder, as on Windows; it named a file such as `new\/a.html`. The new CI found it on its first Linux run.

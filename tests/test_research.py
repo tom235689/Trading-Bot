@@ -228,6 +228,8 @@ def test_validation_end_to_end(tmp_path: Path, data_dir: Path) -> None:
     assert "in-sample (" in text
     assert "out-of-sample (" in text
     assert "beyond the 45% kill switch" in text
+    holdout = next(line for line in text.splitlines() if "holdout return:" in line)
+    assert holdout.endswith("% vs +0.0%")  # fractions shown as percent, as elsewhere
 
 
 def test_validation_rejects_bad_holdout(tmp_path: Path) -> None:
@@ -299,3 +301,11 @@ def test_a_lone_peak_in_a_corner_is_no_plateau(data_dir: Path) -> None:
     assert corner == pytest.approx((2.3 + 1.0 + 1.0 + 1.3 + 5 * 1.0) / 9)
     pick = select_run(scored, grid, "sharpe", 1, "neighborhood")
     assert pick.params == {"entry": 15, "exit": 7}
+
+
+def test_a_train_window_without_a_qualifying_run_is_named(data_dir: Path) -> None:
+    base = BASE.with_period(date(2024, 1, 1), date(2024, 5, 1))
+    with pytest.raises(ValueError, match="train window 2024-01-01 to 2024-03-01: no parameter"):
+        run_walk_forward(
+            base, GRID, data_dir, train_months=2, test_months=1, objective="sharpe", min_trades=999
+        )

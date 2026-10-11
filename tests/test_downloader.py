@@ -277,3 +277,13 @@ def test_months_before_the_listing_do_not_hold_back_the_archives(
         sync(store, client, "BTCUSDT", H4, datetime(2023, 1, 1, tzinfo=UTC), LATER)
     assert store.read("BTCUSDT", H4).height > 4000  # the archives were stored as they came
     assert _gaps(store, H4) == 0
+
+
+def test_months_before_the_listing_cost_no_requests(tmp_path: Path) -> None:
+    def rest_calls(start: datetime, folder: str) -> int:
+        fake = FakeBinance("BTCUSDT", H1, ROWS)
+        with fake.client() as client:
+            sync(BarStore(tmp_path / folder), client, "BTCUSDT", H1, start, NOW)
+        return len([url for url in fake.requests if not url.endswith(".zip")])
+
+    assert rest_calls(datetime(2023, 6, 1, tzinfo=UTC), "early") == rest_calls(JAN_1, "listed")

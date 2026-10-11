@@ -200,7 +200,8 @@ def _download(
             frames = []
             for month, frame in zip(wanted, pool.map(fetch, wanted), strict=True):
                 if frame is None:
-                    unpublished.append(month)
+                    if seen:  # before the first bar a missing month is the listing, no hole
+                        unpublished.append(month)
                     holding = holding or seen  # nothing after a hole is stored before it is filled
                 else:
                     frames.append(frame)

@@ -135,7 +135,9 @@ def test_paper_ledger_alerts_and_network(tmp_path: Path) -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as client:
             return await run_checks(config, settings(), client)
 
-    assert by_name(asyncio.run(offline()))["binance"][0][0] == "fail"
+    unreachable = by_name(asyncio.run(offline()))["binance"][0]
+    assert unreachable[0] == "fail"
+    assert "Binance may not serve this region" in unreachable[1]
 
 
 def test_a_config_that_cannot_start_fails_first(tmp_path: Path) -> None:
@@ -273,7 +275,7 @@ def test_doctor_names_its_version(tmp_path: Path) -> None:
 
 def test_a_symbol_binance_does_not_list_is_named_among_those_asked(tmp_path: Path) -> None:
     config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
-    spot = fake()
+    spot = fake(rules={"BTCUSDT": fake().rules["BTCUSDT"]})  # no ETHUSDT
     answers = [
         httpx.Response(200),  # the heartbeat ping
         httpx.Response(200, json={"serverTime": int(time.time() * 1000)}),
@@ -281,5 +283,22 @@ def test_a_symbol_binance_does_not_list_is_named_among_those_asked(tmp_path: Pat
     ]
     spot.fail_next = answers
     assert by_name(check(config, settings(**ALERTS), spot))["symbols"] == [
-        ("fail", "Binance lists not all of BTCUSDT, ETHUSDT")
+        ("fail", "Binance does not list ETHUSDT")  # asked one at a time: Binance never says
     ]
+
+
+def test_offline_doctor_fails_only_on_what_stops_a_start(tmp_path: Path) -> None:
+    config = live(tmp_path)  # real money, no Telegram, a halted kill switch
+    with Ledger(config.ledger) as ledger:
+        halted = GuardState(halted=True, halt_reason="drawdown")
+        ledger.set_meta(GUARD_META, halted.model_dump_json())
+
+    async def offline(values: Settings) -> list[Check]:
+        async with httpx.AsyncClient() as client:  # not used offline
+            return await run_checks(config, values, client, offline=True)
+
+    found = by_name(asyncio.run(offline(settings(**KEYS))))
+    assert found["telegram"][0][0] == "warn"  # `tbot update` restarts a bot that ran so
+    assert found["kill switch"][0][0] == "warn"  # a halted bot runs, halted
+    no_keys = by_name(asyncio.run(offline(settings())))
+    assert no_keys["api key"][0][0] == "fail"  # the start would fail

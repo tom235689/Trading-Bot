@@ -107,3 +107,11 @@ def test_appends_take_turns(tmp_path: Path) -> None:
         assert other.is_alive()
     other.join(5)
     assert len(log.read()) == 1
+
+
+def test_a_run_of_several_strategies_is_no_trial_of_the_first() -> None:
+    first = CONFIG.strategies[0].model_copy(update={"allocation": 0.5})
+    second = first.model_copy(update={"symbols": ["ETHUSDT"]})
+    both = CONFIG.model_copy(update={"strategies": [first, second]})
+    assert make_record(both, metrics(1.0), "backtest").tag == "backtest-portfolio"
+    assert make_record(CONFIG, metrics(1.0), "backtest").tag == "backtest"

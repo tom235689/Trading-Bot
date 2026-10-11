@@ -16,6 +16,7 @@ from tbot.core.text import price_text
 from tbot.core.timeframe import to_millis
 from tbot.exchange.binance import (
     NOTHING_TO_CANCEL,
+    RULE_ERRORS,
     TRADING,
     BinanceError,
     BinanceSpot,
@@ -188,6 +189,7 @@ class LiveExecutor:
         marks: Mapping[str, float],
     ) -> list[Fill]:
         fills = []
+        await self.check_rules()  # a filter Binance changed, a pair it paused or resumed
         doubtful = await self._settle_doubts(set(orders), portfolio)
         for symbol, quantity in _sorted(orders):
             if symbol in doubtful:
@@ -197,9 +199,24 @@ class LiveExecutor:
                     f"[{self.label}] {symbol}: an earlier order was in doubt; no order this bar"
                 )
                 continue
+            fill = await self._execute_order(symbol, quantity, now, portfolio)
+            if fill is not None:
+                fills.append(fill)
+                await self.notifier.send(_fill_text(self.label, fill, portfolio.equity(marks)))
+        return fills
+
+    async def _execute_order(
+        self, symbol: str, quantity: float, now: datetime, portfolio: Portfolio
+    ) -> Fill | None:
+        """Send one order and book it; a failure is recorded and alerted, never raised.
+
+        A refusal for the symbol's filters means the cached rules are out of date: they are
+        reloaded and the order is tried once more, instead of waiting for the next bar.
+        """
+        for retry in (False, True):
             client_id = self._new_id(now, symbol, quantity)
             try:
-                fill = await self._execute_one(symbol, quantity, now, portfolio, client_id)
+                return await self._execute_one(symbol, quantity, now, portfolio, client_id)
             except OrderUnknown as exc:
                 log.error("order_unknown", symbol=symbol, client_order_id=client_id)
                 self.ledger.add_order(now, symbol, quantity, "unknown", str(exc), client_id)
@@ -207,12 +224,16 @@ class LiveExecutor:
                     f"[{self.label}] order state unknown for {symbol}; it is looked up again "
                     f"before the next reconciliation"
                 )
-                continue
+                return None
             except (BinanceError, httpx.HTTPError) as exc:
-                log.error("order_failed", symbol=symbol, quantity=quantity, error=repr(exc))
                 self.ledger.add_order(now, symbol, quantity, "failed", repr(exc), client_id)
+                if not retry and isinstance(exc, BinanceError) and exc.code in RULE_ERRORS:
+                    log.warning("order_rules_outdated", symbol=symbol, error=str(exc))
+                    await self.check_rules()
+                    continue
+                log.error("order_failed", symbol=symbol, quantity=quantity, error=repr(exc))
                 await self.notifier.send(f"[{self.label}] order failed for {symbol}: {exc}")
-                continue
+                return None
             except Exception as exc:  # unexpected: the order may be out, so it is looked up
                 log.exception("order_error", symbol=symbol, client_order_id=client_id)
                 self.ledger.add_order(now, symbol, quantity, "unknown", repr(exc), client_id)
@@ -220,11 +241,8 @@ class LiveExecutor:
                     f"[{self.label}] order error for {symbol}: {exc!r}; it is looked up again "
                     f"before the next reconciliation"
                 )
-                continue
-            if fill is not None:
-                fills.append(fill)
-                await self.notifier.send(_fill_text(self.label, fill, portfolio.equity(marks)))
-        return fills
+                return None
+        return None
 
     async def _settle_doubts(self, symbols: set[str], portfolio: Portfolio) -> set[str]:
         """Look up orders in doubt for these symbols; return the symbols that had one.
@@ -308,8 +326,8 @@ class LiveExecutor:
         log.warning("order_send_uncertain", symbol=symbol, error=repr(cause))
         for delay in LOOKUP_DELAYS:
             await asyncio.sleep(delay)
-            try:
-                order = await self.spot.get_order(symbol, client_id)
+            try:  # one try each: these lookups are the retries, under the event lock
+                order = await self.spot.get_order(symbol, client_id, attempts=1)
             except (BinanceError, httpx.HTTPError) as exc:
                 log.warning("order_lookup_failed", symbol=symbol, error=repr(exc))
                 continue
@@ -394,6 +412,7 @@ class LiveExecutor:
                 continue
             self.statuses[symbol] = status
             if status == TRADING:
+                self.unprotected.add(symbol)  # refit its stop to what was booked meanwhile
                 text = f"[{self.label}] Binance trades {symbol} again; its orders and stops resume"
             else:
                 text = (
@@ -473,7 +492,9 @@ class LiveExecutor:
             quote = order.quote_qty - state["quote"]
             price = quote / quantity
             fee = quote * self.fee_rate  # a stop's commission is not in its order record
-            fill = Fill(self.clock(), symbol, -quantity, price, fee)
+            # Booked when it executed, which may be long before this lookup (a bot down).
+            when = min(order.updated, self.clock()) if order.updated else self.clock()
+            fill = Fill(when, symbol, -quantity, price, fee)
             state = StopState(id=state["id"], qty=order.executed_qty, quote=order.quote_qty)
         with self.ledger.atomic():  # booked once, even across a crash
             if fill is not None:
@@ -587,8 +608,10 @@ class LiveExecutor:
             # A sell in doubt may have sold the book's coins: free coins can be the owner's.
             self.unprotected.add(symbol)  # placed once reconciliation settles it
             return
+        cancelled = False
         try:
             await self.cancel_stops(symbol, portfolio)
+            cancelled = True
             position = portfolio.position(symbol)
             if position <= 0 or symbol not in marks:
                 self.unprotected.discard(symbol)
@@ -622,11 +645,17 @@ class LiveExecutor:
         except Exception as exc:  # retried at every reconciliation until it works
             log.error("stop_failed", symbol=symbol, error=repr(exc))
             self.unprotected.add(symbol)
+            self.partial.pop(symbol, None)
             if symbol not in self.alerted:
                 self.alerted.add(symbol)
+                left = (
+                    "The position has no exchange stop"
+                    if cancelled
+                    else "The stop in place, if any, was not replaced and stays"
+                )
                 await self.notifier.send(
-                    f"[{self.label}] protective stop failed for {symbol}: {exc}. The position "
-                    f"has no exchange stop; retrying at every reconciliation"
+                    f"[{self.label}] protective stop failed for {symbol}: {exc}. {left}; "
+                    "retrying at every reconciliation"
                 )
 
     async def _note_partial(

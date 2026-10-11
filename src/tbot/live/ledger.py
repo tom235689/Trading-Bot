@@ -96,9 +96,9 @@ class Ledger:
         if SQLITE_ERROR is not None:
             raise LedgerUnavailable(
                 f"cannot load SQLite ({SQLITE_ERROR}). On Windows, Smart App Control can "
-                "block unsigned Python modules: install Python from python.org and run "
-                "`uv venv --python <path to its python.exe>` then `uv sync`, as the "
-                "README explains."
+                "block unsigned Python modules: run `tbot setup` again, which builds the "
+                "environment on Python signed by the Python Software Foundation (README, "
+                "Setup details)."
             )
         path.parent.mkdir(parents=True, exist_ok=True)
         self._atomic = False
@@ -324,6 +324,14 @@ class Ledger:
                 "INSERT INTO events (time, level, message) VALUES (?, ?, ?)",
                 (_iso(time), level, message),
             )
+
+    def events_starting(self, prefix: str) -> list[Event]:
+        """Events whose message starts with prefix, oldest first."""
+        rows = self.conn.execute(
+            "SELECT time, level, message FROM events WHERE substr(message, 1, ?) = ? ORDER BY id",
+            (len(prefix), prefix),
+        ).fetchall()
+        return [Event(_parse(t), lv, m) for t, lv, m in rows]
 
     def recent_events(self, limit: int) -> list[Event]:
         rows = self.conn.execute(

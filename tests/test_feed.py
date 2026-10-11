@@ -554,3 +554,26 @@ def test_a_stale_stream_that_comes_back_is_reported(tmp_path: Path) -> None:
     assert (stale, feed.stale(), back) == ([BTC1], [BTC1], [])
     assert feed._emit(BTC1, from_rows(make_rows(at(3), 2, H1))) == 2
     assert (feed.stale(), back) == ([], [BTC1])
+
+
+def test_a_failing_report_loses_no_bar(tmp_path: Path) -> None:
+    def broken(*args: object) -> None:
+        raise RuntimeError("database is locked")
+
+    feed, _, _ = make_feed(tmp_path, [BTC1], now=at(5.5), on_fresh=broken, on_stale=broken)
+    feed.last[BTC1] = at(2)
+    feed._stale_reported.add(BTC1)
+    assert feed._emit(BTC1, from_rows(make_rows(at(3), 2, H1))) == 2
+    assert feed.queue.qsize() == 2  # stored and queued: the strategy still sees them
+
+    feed.last[BTC1] = at(2)
+    feed.poll_seconds = 0.01
+
+    async def watch() -> None:
+        task = asyncio.create_task(feed.run_watchdog())
+        await asyncio.sleep(0.1)
+        assert not task.done()  # a failed stale report does not end the watchdog
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(watch())

@@ -5,6 +5,7 @@ import hmac
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qsl
 
@@ -67,7 +68,7 @@ class FakeSpot:
     def order_count(self, kind: str) -> int:
         return sum(1 for o in self.orders if o["type"] == kind)
 
-    def trigger_stop(self, symbol: str) -> None:
+    def trigger_stop(self, symbol: str, at: datetime | None = None) -> None:
         """Fill the open stop order of a symbol at its stop price, as the exchange would."""
         for order in self.orders:
             if (
@@ -85,6 +86,7 @@ class FakeSpot:
                     status="FILLED",
                     executedQty=order["origQty"],
                     cummulativeQuoteQty=f"{qty * price:.8f}",
+                    updateTime=int((at or datetime.now(UTC)).timestamp() * 1000),
                 )
                 order["trades"] = [
                     {
@@ -225,6 +227,9 @@ class FakeSpot:
         price = self.prices[symbol] * (1 + self.spread if side == "BUY" else 1 - self.spread)
         if qty < float(rules["minQty"]) or qty * price < float(rules["minNotional"]):
             return _error(400, -1013, "Filter failure: NOTIONAL")
+        step = float(rules["step"])
+        if abs(round(qty / step) * step - qty) > step * 1e-6:
+            return _error(400, -1013, "Filter failure: LOT_SIZE")
         order: dict[str, Any] = {
             "symbol": symbol,
             "orderId": self.next_id,

@@ -53,10 +53,12 @@ def setup_hash(config: BacktestConfig) -> str:
 
 
 def make_record(config: BacktestConfig, metrics: Metrics, tag: str) -> TrialRecord:
+    """A run as a trial of its first strategy; a run of several strategies is logged as a
+    portfolio, which no selection counts as a trial of the first."""
     strategy = config.strategies[0]
     return TrialRecord(
         time=datetime.now(UTC),
-        tag=tag,
+        tag=tag if len(config.strategies) == 1 else f"{tag}-portfolio",
         strategy=strategy.name,
         symbols=strategy.symbols,
         timeframe=str(strategy.timeframe),
