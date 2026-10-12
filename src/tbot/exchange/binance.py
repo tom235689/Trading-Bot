@@ -40,6 +40,7 @@ BAD_KEY_FORMAT = -2014
 RULE_ERRORS = frozenset({FILTER_FAILURE, BAD_PRECISION})  # the cached rules may be out of date
 KEY_ERRORS = frozenset({BAD_SIGNATURE, BAD_KEY_FORMAT})  # the key or secret is wrong
 TRADING = "TRADING"
+UNLISTED = "UNLISTED"  # the status of a configured pair Binance no longer lists
 NOISE = Decimal("1e-6")  # of a step: closer than this to it is float rounding, not a remainder
 Params = Mapping[str, str | int | float]
 
@@ -300,26 +301,46 @@ class BinanceSpot:
         data = await self._request("GET", "/api/v3/time")
         return datetime.fromtimestamp(data["serverTime"] / 1000, UTC)
 
-    async def load_rules(self, symbols: list[str]) -> dict[str, SymbolRules]:
-        """Filters and status of each symbol; a pair Binance pauses (BREAK) is listed with
-        its status, one it does not list fails with INVALID_SYMBOL."""
-        query = json.dumps(sorted(symbols), separators=(",", ":"))
-        data = await self._request("GET", "/api/v3/exchangeInfo", {"symbols": query})
-        infos = {info["symbol"]: info for info in data["symbols"]}
-        missing = set(symbols) - set(infos)
-        if missing:
-            raise BinanceError(INVALID_SYMBOL, f"unknown symbols: {', '.join(sorted(missing))}")
+    async def load_rules(
+        self, symbols: list[str], *, keep_unlisted: bool = False
+    ) -> dict[str, SymbolRules]:
+        """Filters and status of each symbol. A pair Binance pauses (BREAK) is listed with
+        its status; one it does not list fails with INVALID_SYMBOL naming it, or with
+        keep_unlisted (a running session) gets the status UNLISTED and keeps its rules."""
+        infos = await self._symbol_infos(symbols)
+        missing = sorted(set(symbols) - set(infos))
+        if missing and not keep_unlisted:
+            raise BinanceError(INVALID_SYMBOL, f"Binance does not list {', '.join(missing)}")
         for symbol, info in infos.items():
             self.rules[symbol] = parse_rules(info)
             self.status[symbol] = str(info["status"])
+        for symbol in missing:
+            self.status[symbol] = UNLISTED
         self.rules_time = time.monotonic()
         return self.rules
+
+    async def _symbol_infos(self, symbols: list[str]) -> dict[str, Any]:
+        """exchangeInfo by symbol. Binance refuses a whole list for one symbol it does not
+        list (-1121), so then each is asked alone."""
+        query = json.dumps(sorted(symbols), separators=(",", ":"))
+        try:
+            data = await self._request("GET", "/api/v3/exchangeInfo", {"symbols": query})
+        except BinanceError as exc:
+            if exc.code != INVALID_SYMBOL:
+                raise
+            if len(symbols) == 1:
+                return {}
+            infos: dict[str, Any] = {}
+            for symbol in symbols:
+                infos.update(await self._symbol_infos([symbol]))
+            return infos
+        return {info["symbol"]: info for info in data["symbols"]}
 
     async def refresh_rules(self, max_age: float = RULES_MAX_AGE) -> bool:
         """Reload the rules once they are max_age old, or an order failed a filter."""
         if not self.rules or time.monotonic() - self.rules_time < max_age:
             return False
-        await self.load_rules(sorted(self.rules))
+        await self.load_rules(sorted(self.rules), keep_unlisted=True)
         return True
 
     def trading(self, symbol: str) -> bool:
@@ -369,22 +390,18 @@ class BinanceSpot:
         return parse_order(await self._request("POST", "/api/v3/order", params, signed=True))
 
     async def stop_loss_order(
-        self,
-        symbol: str,
-        quantity: float,
-        stop_price: float,
-        limit_price: float,
-        client_order_id: str,
+        self, symbol: str, quantity: float, stop_price: float, client_order_id: str
     ) -> Order:
+        """A stop-market sell. With a limit price, Binance refuses a stop under the pair's
+        PERCENT_PRICE_BY_SIDE floor (0.8x the average price on most pairs), and a gap
+        through the limit leaves it unfilled."""
         rules = self.rules[symbol]
         params: dict[str, str | int | float] = {
             "symbol": symbol,
             "side": "SELL",
-            "type": "STOP_LOSS_LIMIT",
-            "timeInForce": "GTC",
+            "type": "STOP_LOSS",
             "quantity": rules.format_quantity(quantity),
             "stopPrice": rules.format_price(stop_price),
-            "price": rules.format_price(limit_price),
             "newClientOrderId": client_order_id,
             "newOrderRespType": "RESULT",  # a stop's default answer (ACK) omits side and status
         }

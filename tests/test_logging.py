@@ -1,9 +1,14 @@
 import logging
+from pathlib import Path
 
 import pytest
 import structlog
 
-from tbot.monitoring.logging import configure_logging, configure_quiet
+from tbot.monitoring.logging import (
+    RetryingRotatingFileHandler,
+    configure_logging,
+    configure_quiet,
+)
 
 
 def test_the_console_can_show_less_than_the_log_file(tmp_path: object) -> None:
@@ -42,3 +47,29 @@ def test_a_session_console_reads_like_tbot_log(capsys: pytest.CaptureFixture[str
         root.setLevel(saved[1])
         configure_quiet()
     assert " warning stale_stream  symbol=BTCUSDT" in err
+
+
+def test_a_log_another_process_holds_open_keeps_its_records(tmp_path: Path) -> None:
+    path = tmp_path / "bot.jsonl"
+    # Backups enough for every record where a rename of an open file works (Linux).
+    handler = RetryingRotatingFileHandler(path, maxBytes=200, backupCount=20, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    def write(text: str) -> None:
+        handler.emit(logging.makeLogRecord({"msg": text}))
+
+    try:
+        for index in range(5):
+            write(f"first {index} " + "x" * 60)
+        with path.open("rb"):  # on Windows nobody can rename it now
+            for index in range(5):
+                write(f"held {index} " + "x" * 60)
+        handler.retry_at = 0.0  # a minute later
+        write("after " + "x" * 60)
+    finally:
+        handler.close()
+    text = "".join(p.read_text(encoding="utf-8") for p in tmp_path.glob("bot.jsonl*"))
+    for index in range(5):
+        assert f"held {index} " in text
+    assert "after " in path.read_text(encoding="utf-8")
+    assert not list(tmp_path.glob("*.rotating"))

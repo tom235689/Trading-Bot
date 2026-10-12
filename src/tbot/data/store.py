@@ -3,7 +3,7 @@
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +19,16 @@ LOCK_SECONDS = 60.0  # another process merging into the same stream gets this lo
 
 class BarStore:
     def __init__(self, root: Path, exchange: str = "binance", market: str = "spot") -> None:
+        self.base = root
         self.root = root / exchange / market / "klines"
+
+    def download_hint(self, streams: Iterable[tuple[str, Timeframe]]) -> str:
+        """The `tbot download` that fetches these streams into this store."""
+        pairs = list(streams)
+        symbols = " ".join(dict.fromkeys(symbol for symbol, _ in pairs))
+        frames = " ".join(str(t) for t in sorted({t for _, t in pairs}, key=lambda t: t.millis))
+        where = "" if self.base == Path("data") else f' --data-dir "{self.base}"'
+        return f"`tbot download --symbols {symbols} --timeframes {frames}{where}`"
 
     def directory(self, symbol: str, timeframe: Timeframe) -> Path:
         return self.root / symbol / str(timeframe)

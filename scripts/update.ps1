@@ -23,6 +23,9 @@ How long a running session gets to finish its event and stop.
 .PARAMETER Elevated
 Internal: set when the script restarted itself with administrator rights.
 
+.PARAMETER Uv
+Internal: uv as found before the script elevated itself (an administrator account may not have it).
+
 .EXAMPLE
 tbot update -DryRun
 tbot update
@@ -32,7 +35,8 @@ powershell -ExecutionPolicy Bypass -File scripts\update.ps1
 param(
     [switch] $DryRun,
     [int] $StopTimeoutSeconds = 120,
-    [switch] $Elevated
+    [switch] $Elevated,
+    [string] $Uv = ""
 )
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
@@ -50,6 +54,14 @@ function Invoke-Checked([string] $exe, [string[]] $arguments) {
 function Invoke-Tbot([string[]] $arguments) {
     & $uv run --quiet --frozen python -m tbot @arguments | Write-Host
     return $LASTEXITCODE
+}
+
+function Get-Incoming {
+    # Commits a pull would bring, or $null when that cannot be known (no upstream).
+    $ErrorActionPreference = "Continue"  # under Stop, a line on stderr would throw
+    $lines = @(git log --oneline "HEAD..@{u}" 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return ,$lines
 }
 
 function Get-Version {
@@ -81,7 +93,7 @@ function Format-Busy($processes) {
 
 $exitCode = 0
 try {
-    $uv = (Get-Command uv -ErrorAction Stop).Source
+    if (-not $Uv) { $Uv = (Get-Command uv -ErrorAction Stop).Source }
     $tasks = @(Get-ScheduledTask | ForEach-Object {
         $action = $_.Actions | Where-Object {
             $_.Arguments -and $_.Arguments.ToLowerInvariant().Contains($runner)
@@ -92,6 +104,7 @@ try {
         }
     })
     if ($tasks -and -not $DryRun -and -not $Elevated -and -not (Test-Admin)) {
+        $PSBoundParameters["Uv"] = $Uv
         exit (Invoke-Elevated $PSCommandPath $PSBoundParameters)
     }
     foreach ($task in $tasks) { Write-Output "task '$($task.Name)': $($task.State), $($task.Config)" }
@@ -107,11 +120,16 @@ try {
     $others = Get-OtherProcesses @($running | ForEach-Object { $_.Config })
     if ($DryRun) {
         git fetch --quiet
+        $fetched = $LASTEXITCODE -eq 0
         if ($others) { Write-Output "would refuse: $(Format-Busy $others)" }
         $names = ($running | ForEach-Object { $_.Name }) -join ', '
         Write-Output "would stop: $(if ($names) { $names } else { 'nothing (no task runs)' })"
-        $incoming = @(git log --oneline "HEAD..@{u}")
-        if ($incoming) {
+        $incoming = Get-Incoming
+        if ($null -eq $incoming) {
+            Write-Output "cannot tell what would be pulled: this branch has no upstream to pull from"
+        } elseif (-not $fetched) {
+            Write-Output "cannot tell what would be pulled: git fetch failed (see above)"
+        } elseif ($incoming) {
             Write-Output "would pull:"
             $incoming | ForEach-Object { Write-Output "  $_" }
         } else {

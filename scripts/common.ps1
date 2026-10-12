@@ -51,8 +51,8 @@ function Format-Arguments([System.Collections.IDictionary] $bound) {
     # Bound script parameters as a powershell.exe command line.
     $parts = foreach ($key in $bound.Keys) {
         $value = $bound[$key]
-        if ($value -is [System.Management.Automation.SwitchParameter]) {
-            if ($value.IsPresent) { "-$key" }
+        if ($value -is [System.Management.Automation.SwitchParameter] -or $value -is [bool]) {
+            if ([bool] $value) { "-$key" }  # a switch set by the script itself is a bool
         } else {
             "-$key"
             ConvertTo-Argument ([string] $value)

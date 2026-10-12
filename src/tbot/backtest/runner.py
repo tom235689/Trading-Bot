@@ -67,7 +67,8 @@ def run_period(
     for (symbol, timeframe), needed in history_bars(slots, config.risk).items():
         frame = store.read(symbol, timeframe, start - timeframe.delta * needed * WARMUP_MARGIN, end)
         if frame.is_empty():
-            raise ValueError(f"no stored bars for {symbol} {timeframe}; run `tbot download`")
+            hint = store.download_hint([(symbol, timeframe)])
+            raise ValueError(f"no stored bars for {symbol} {timeframe}; run {hint}")
         bars[(symbol, timeframe)] = frame
     common = min(_last_close(key, frame) for key, frame in bars.items())
     if end is not None:  # a bar opening before end may close after it

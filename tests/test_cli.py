@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import io
 import json
@@ -135,7 +136,8 @@ def test_errors_end_in_one_line(tmp_path: Path, capsys: pytest.CaptureFixture[st
     empty = str(tmp_path / "empty")
     assert main(["backtest", "config/donchian_voltarget.yaml", "--data-dir", empty]) == EXIT_ERROR
     err = capsys.readouterr().err
-    assert err.startswith("error: no stored bars for BTCUSDT 4h; run `tbot download`")
+    assert err.startswith("error: no stored bars for BTCUSDT 4h; run `tbot download --symbols")
+    assert f'--data-dir "{empty}"`' in err  # the store it looked in
     assert "Traceback" not in err
 
     unknown = tmp_path / "unknown.yaml"
@@ -219,6 +221,8 @@ def test_each_config_logs_to_its_own_file() -> None:
 
     assert log_path(Path("config/paper.yaml")) == Path("logs/paper.jsonl")
     assert log_path(Path("config/paper-eth.yaml")) == Path("logs/paper-eth.jsonl")
+    elsewhere = {log_path(Path(folder) / "paper.yaml") for folder in ("a", "b", "config")}
+    assert len(elsewhere) == 3  # the same name in another folder: another log
 
 
 def test_download_stops_at_a_rate_limit(
@@ -900,9 +904,55 @@ def test_a_config_of_another_kind_names_the_command_for_it(
     err = capsys.readouterr().err.replace("\\", "/")
     assert "config/paper.yaml is a paper config: run it with `tbot paper paper`" in err
     assert main(["backtest", "testnet"]) == EXIT_CONFIG
-    assert "is a testnet or live config: run it with `tbot live testnet`" in capsys.readouterr().err
+    assert "is a testnet config: run it with `tbot live testnet`" in capsys.readouterr().err
     assert main(["status", "trend"]) == EXIT_CONFIG
     assert "is a backtest config: run it with `tbot backtest trend`" in capsys.readouterr().err
+    real = f"mode: live\nledger: live.sqlite\nstrategies:\n{STRATEGY}"
+    (tmp_path / "config" / "real.yaml").write_text(real, "utf-8")
+    assert main(["backtest", "real"]) == EXIT_CONFIG
+    assert "is a live config: run it with `tbot live real --live`" in capsys.readouterr().err
+
+
+def test_a_broken_config_is_named_by_what_the_command_needs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    # A backtest without its start: no valid paper config either, so no `tbot paper` advice.
+    nostart = f"end: 2024-06-01\nstrategies:\n{STRATEGY}"
+    (tmp_path / "config" / "nostart.yaml").write_text(nostart, "utf-8")
+    assert main(["backtest", "nostart"]) == EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "paper config" not in err
+    assert "start: Field required" in err
+    (tmp_path / "config" / "empty.yaml").write_text("", "utf-8")
+    assert main(["backtest", "empty"]) == EXIT_CONFIG
+    assert "paper config" not in capsys.readouterr().err
+    (tmp_path / "config" / "folder.yaml").mkdir()
+    assert main(["status", "config/folder.yaml"]) == EXIT_CONFIG
+    assert "is a folder, not a config file" in capsys.readouterr().err
+
+
+def test_a_validation_names_its_broken_base_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    folder = tmp_path / "config"
+    (folder / "base.yaml").write_text("start: 2024-01-01\nstart: 2024-02-01\n", "utf-8")
+    validation = "backtest: base.yaml\nholdout_start: 2025-01-01\ngrid: {entry: [20]}\n"
+    (folder / "check.yaml").write_text(validation, "utf-8")
+    assert main(["validate", "check"]) == EXIT_CONFIG
+    err = capsys.readouterr().err.replace("\\", "/")
+    assert "config/base.yaml: not valid YAML" in err
+    assert "Traceback" not in err
+
+
+def test_a_monthly_timeframe_is_no_minute() -> None:
+    assert parse_timeframe("4H") == Timeframe.H4
+    assert parse_timeframe("1D") == Timeframe.D1
+    with pytest.raises(argparse.ArgumentTypeError, match="'1M' is no timeframe"):
+        parse_timeframe("1M")
 
 
 def test_a_mistyped_key_gets_a_suggestion(
@@ -1011,3 +1061,60 @@ def test_a_holdout_after_the_stored_bars_fails_before_anything_runs(tmp_path: Pa
     )
     with pytest.raises(ValueError, match="holdout_start 2024-06-01 is after the stored"):
         check_holdout(late, base.model_copy(update={"end": None}), store)
+
+
+def test_help_for_a_windows_script_says_where_it_is(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["help", "autostart"]) == 0
+    assert "`tbot autostart -h` shows its help" in capsys.readouterr().out
+
+
+def test_a_backtest_config_keeps_no_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    assert main(["log", "trend"]) == EXIT_CONFIG
+    assert "is a backtest config: it prints, and keeps no log" in capsys.readouterr().err
+
+
+def test_a_path_that_cannot_be_checked_is_no_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    real = Path.exists
+
+    def denied(self: Path, *args: Any, **kwargs: Any) -> bool:
+        if "locked" in str(self):
+            raise PermissionError(13, "Permission denied")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", denied)
+    assert config_arg("locked/x.yaml") == Path("locked/x.yaml")
+
+
+def test_streams_of_different_timeframes_end_apart_without_a_note(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = BarStore(tmp_path)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    flat = [100.0] * 2003  # the 1h stream closes 3 h after the last 4h close
+    store.write("BTCUSDT", Timeframe.H1, price_bars(start, Timeframe.H1, flat, flat))
+    store.write("BTCUSDT", Timeframe.H4, price_bars(start, Timeframe.H4, flat[:500], flat[:500]))
+    config = BacktestConfig.model_validate(
+        {
+            "start": "2024-01-10",
+            "strategies": [
+                {
+                    "name": "donchian_trend",
+                    "symbols": ["BTCUSDT"],
+                    "timeframe": t,
+                    "allocation": 0.5,
+                }
+                for t in ("1h", "4h")
+            ],
+        }
+    )
+    print_notes(config, store)  # the 1h stream closes 3 h after the last 4h close
+    assert "data ends" not in capsys.readouterr().out
+    store.write("BTCUSDT", Timeframe.H1, price_bars(start, Timeframe.H1, flat * 2, flat * 2))
+    print_notes(config, store)  # now the 4h stream is far behind
+    assert "BTCUSDT 4h data ends" in capsys.readouterr().out

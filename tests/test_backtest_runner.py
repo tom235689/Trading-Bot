@@ -79,7 +79,7 @@ def test_runs_trend_on_stored_bars(tmp_path: Path) -> None:
 
 
 def test_missing_data_raises(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="run `tbot download`"):
+    with pytest.raises(ValueError, match="run `tbot download --symbols BTCUSDT --timeframes 4h"):
         run_backtest(load_config(write_config(tmp_path)), BarStore(tmp_path / "empty"))
 
 

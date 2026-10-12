@@ -9,7 +9,14 @@ from typing import Any, Literal, Self
 
 import numpy as np
 import numpy.typing as npt
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from tbot.backtest.config import BacktestConfig, load_config
 from tbot.backtest.engine import BacktestResult
@@ -36,7 +43,7 @@ from tbot.research.sweep import (
     run_sweep,
 )
 from tbot.research.trials import TrialLog, make_record
-from tbot.research.walkforward import WalkForwardResult, run_walk_forward
+from tbot.research.walkforward import WalkForwardResult, run_walk_forward, windows
 
 
 class WalkForwardConfig(BaseModel):
@@ -108,6 +115,19 @@ def load_validation_config(path: Path) -> tuple[ValidationConfig, BacktestConfig
         )
     if config.holdout_start <= base.start:
         raise ValueError("holdout_start must be after the backtest start")
+    wf = config.walk_forward  # checked now, not after the sweep has run
+    if not windows(base.start, config.holdout_start, wf.train_months, wf.test_months):
+        raise ValueError(
+            f"walk_forward: {wf.train_months} + {wf.test_months} months do not fit between "
+            f"start {base.start} and holdout_start {config.holdout_start}: shorten them"
+        )
+    try:
+        base.with_cost_multiplier(config.cost_multiplier)
+    except ValidationError:
+        raise ValueError(
+            f"cost_multiplier {config.cost_multiplier:g} takes the fee rate or the slippage "
+            "beyond what can be traded"
+        ) from None
     if base.end is not None and config.holdout_start >= base.end:
         raise ValueError("holdout_start must be before the backtest end")
     empty = [name for name, values in config.grid.items() if not values]

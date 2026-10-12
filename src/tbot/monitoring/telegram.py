@@ -15,6 +15,7 @@ MAX_LENGTH = 4000  # Telegram allows 4096 characters per message
 RETRY_FIRST = 5.0  # seconds before an alert Telegram did not take is sent again
 RETRY_MAX = 300.0
 MAX_AGE = 86400.0  # an alert still not sent after a day is dropped
+MOVED_HINT = "the group became a supergroup: set TBOT_TELEGRAM_CHAT_ID to the new id"
 
 
 class Notifier(Protocol):
@@ -50,6 +51,14 @@ class Telegram:
         result = body.get("result") if isinstance(body, dict) else None
         return str(result.get("username", "")) if isinstance(result, dict) else ""
 
+    async def chat(self) -> None:
+        """Whether the bot can reach its chat; sends nothing. Raises httpx errors (400 for a
+        chat it does not know); never log their URL."""
+        response = await self.client.get(
+            f"{self.base}/getChat", params={"chat_id": self.chat_id}, timeout=15.0
+        )
+        response.raise_for_status()
+
     async def updates(self, offset: int | None, timeout: int) -> list[dict[str, Any]]:
         """Messages sent to the bot (long poll). Raises httpx errors; never log their URL."""
         params: dict[str, Any] = {"timeout": timeout, "allowed_updates": '["message"]'}
@@ -82,6 +91,11 @@ class Telegram:
             return False, 0.0
         if response.is_success:
             return True, None
+        moved = migrated_to(response)
+        if moved and moved != self.chat_id:  # a group became a supergroup, with a new id
+            log.error("telegram_chat_moved", chat_id=moved, hint=MOVED_HINT)
+            self.chat_id = moved
+            return await self._post(text)
         log.warning("telegram_failed", error=f"HTTP {response.status_code}: {response.text[:200]}")
         if response.status_code == 429:
             return False, _retry_after(response)
@@ -128,6 +142,14 @@ class QueuedNotifier:
             await asyncio.wait_for(self.queue.join(), timeout)
         except TimeoutError:
             log.warning("alerts_not_sent", left=self.queue.qsize())
+
+
+def migrated_to(response: httpx.Response) -> str:
+    """The new chat id Telegram names when a group was upgraded to a supergroup, or ""."""
+    try:
+        return str(int(response.json()["parameters"]["migrate_to_chat_id"]))
+    except (ValueError, KeyError, TypeError):
+        return ""
 
 
 def _retry_after(response: httpx.Response) -> float:

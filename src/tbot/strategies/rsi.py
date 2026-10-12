@@ -25,6 +25,8 @@ class RsiParams(BaseModel):
     def check_bands(self) -> Self:
         if self.low >= self.high:
             raise ValueError("low must be below high")
+        if self.trend_period == 1:  # a close is never above its own average: never a buy
+            raise ValueError("trend_period must be 0 (off) or 2 or more")
         return self
 
 
@@ -44,7 +46,7 @@ def rsi(closes: npt.NDArray[np.float64], period: int) -> float:
         avg_gain = (avg_gain * (period - 1) + gain) / period
         avg_loss = (avg_loss * (period - 1) + loss) / period
     if avg_loss == 0:
-        return 100.0
+        return 50.0 if avg_gain == 0 else 100.0  # flat: neither overbought nor oversold
     return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
 
 

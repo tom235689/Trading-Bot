@@ -309,3 +309,14 @@ def test_a_train_window_without_a_qualifying_run_is_named(data_dir: Path) -> Non
         run_walk_forward(
             base, GRID, data_dir, train_months=2, test_months=1, objective="sharpe", min_trades=999
         )
+
+
+def test_validation_checks_its_walk_forward_and_costs_before_running(tmp_path: Path) -> None:
+    path = write_validation(tmp_path)
+    long = VALIDATION.replace("train_months: 2", "train_months: 36")
+    path.write_text(long, encoding="utf-8")
+    with pytest.raises(ValueError, match="walk_forward: 36 \\+ 1 months do not fit"):
+        load_validation_config(path)
+    path.write_text(VALIDATION + "cost_multiplier: 1000\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="cost_multiplier 1000 takes the fee rate"):
+        load_validation_config(path)

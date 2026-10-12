@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 from tbot.backtest.engine import BacktestResult
 from tbot.backtest.runner import run_period
+from tbot.core.config import streams_of
 from tbot.core.models import Fill
 from tbot.core.text import price_text
 from tbot.data.store import BarStore
@@ -121,8 +122,8 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
     shared = [t for t in backtest_times if t in session_by_time]
     if not shared:
         raise ValueError(
-            "no bar close is in both the session and the stored bars yet; run `tbot download`"
-            " or let the session run longer"
+            "no bar close is in both the session and the stored bars yet; run "
+            f"{store.download_hint(streams_of(config))} or let the session run longer"
         )
 
     # Deposits, withdrawals, and the startup reconcile of an account move money in or out;

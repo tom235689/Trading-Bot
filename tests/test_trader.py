@@ -13,7 +13,16 @@ from tbot.live.config import PaperConfig
 from tbot.live.executor import PaperExecutor
 from tbot.live.history import BarHistory
 from tbot.live.ledger import Ledger
-from tbot.live.runner import SessionTrader, load_guard, resume
+from tbot.live.runner import (
+    SessionTrader,
+    StartRefused,
+    check_budget,
+    load_guard,
+    restore_portfolio,
+    resume,
+    stop_path,
+    watch_stop_request,
+)
 from tbot.live.session import TradingSession
 from tbot.portfolio.allocation import StrategySlot
 from tbot.portfolio.portfolio import Portfolio
@@ -173,3 +182,78 @@ def test_failing_reconciliation_pauses_orders(tmp_path: Path) -> None:
     assert len(h.bar(1, 100.0)) == 1
     assert h.ledger.get_meta("targets") is not None  # strategy targets saved every event
     h.ledger.close()
+
+
+def budget_trader(
+    config: PaperConfig, ledger: Ledger, script: dict[datetime, dict[str, float]], prices: Prices
+) -> SessionTrader:
+    session = TradingSession(
+        config,
+        [StrategySlot(Scripted(["BTC"], {"script": script}), H1, 1.0)],
+        {BTC: BarHistory(H1)},
+        restore_portfolio(config, ledger),
+    )
+    executor = PaperExecutor(
+        SimulatedBroker(config.costs), prices, ledger, Collect(), lambda: at(9)
+    )
+    guard = load_guard(config, ledger)
+    return SessionTrader(session, ledger, executor, Collect(), guard, clock=lambda: at(9))
+
+
+@pytest.mark.parametrize("budgets", [(400.0, 100.0), (3000.0, 6000.0), (1500.0, 2000.0)])
+def test_two_budget_changes_before_a_bar_are_no_loss(
+    tmp_path: Path, budgets: tuple[float, float]
+) -> None:
+    guard = GuardConfig(daily_loss_limit=0.03, max_drawdown=0.45, stale_seconds=0)
+    config = config_for(tmp_path, guard)
+    with Ledger(config.ledger) as ledger:
+        check_budget(config, ledger, load_guard(config, ledger), at(0))
+        trader = budget_trader(config, ledger, {}, Prices())
+        asyncio.run(trader.handle({BTC: price_bars(at(0), H1, [100.0], [100.0])}))
+        for hour, budget in enumerate(budgets, start=1):  # two restarts, no bar between
+            changed = config.model_copy(update={"initial_cash": budget})
+            check_budget(changed, ledger, load_guard(changed, ledger), at(hour))
+        trader = budget_trader(changed, ledger, {}, Prices())
+        asyncio.run(trader.handle({BTC: price_bars(at(1), H1, [100.0], [100.0])}))
+        state = load_guard(changed, ledger).state
+    assert not state.halted
+    assert state.peak_equity == pytest.approx(budgets[-1])
+    assert state.day_open_equity == pytest.approx(budgets[-1])
+
+
+def test_a_budget_cut_beyond_what_the_book_holds_is_refused(tmp_path: Path) -> None:
+    config = config_for(tmp_path, GuardConfig(stale_seconds=0))
+    prices = Prices()
+    with Ledger(config.ledger) as ledger:
+        check_budget(config, ledger, load_guard(config, ledger), at(0))
+        trader = budget_trader(config, ledger, {at(1): {"BTC": 1.0}}, prices)
+        asyncio.run(trader.handle({BTC: price_bars(at(0), H1, [100.0], [100.0])}))  # buys
+        prices.current = 60.0
+        asyncio.run(trader.handle({BTC: price_bars(at(1), H1, [60.0], [60.0])}))
+        worth = ledger.latest_equity()
+        assert worth is not None
+        smaller = config.model_copy(update={"initial_cash": 300.0})
+        lowest = f"lowest it can be now is {1000 - worth.equity:,.2f}"
+        with pytest.raises(StartRefused, match=lowest):
+            check_budget(smaller, ledger, load_guard(smaller, ledger), at(2))
+        assert ledger.adjustments() == []  # nothing booked
+
+
+def test_a_stop_request_still_open_elsewhere_is_taken_once_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.live.runner.STOP_POLL_SECONDS", 0.01)
+    path = stop_path(tmp_path / "paper.sqlite")
+
+    async def go() -> bool:
+        stop = asyncio.Event()
+        with path.open("w", encoding="utf-8") as handle:  # Windows cannot delete it yet
+            handle.write("stop\n")
+            handle.flush()
+            task = asyncio.create_task(watch_stop_request(path, stop))
+            await asyncio.sleep(0.05)
+        await asyncio.wait_for(task, 2)
+        return stop.is_set()
+
+    assert asyncio.run(go())
+    assert not path.exists()

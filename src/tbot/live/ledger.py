@@ -301,6 +301,11 @@ class Ledger:
         ).fetchall()
         return [EquityPoint(_parse(t), e, c, x) for t, e, c, x in rows]
 
+    def equity_rows(self) -> int:
+        """Id of the last equity snapshot, 0 for none: tells a newer snapshot apart."""
+        row = self.conn.execute("SELECT MAX(id) FROM equity").fetchone()
+        return int(row[0] or 0)
+
     def latest_equity(self) -> EquityPoint | None:
         row = self.conn.execute(
             "SELECT time, equity, cash, exposure FROM equity ORDER BY id DESC LIMIT 1"

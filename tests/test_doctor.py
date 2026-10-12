@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+import pytest
 
 from binance_spot_fake import FakeSpot
 from factories import price_bars
@@ -15,7 +16,7 @@ from tbot.live.backup import backup_ledger, daily_backups
 from tbot.live.config import LiveConfig, PaperConfig, Settings
 from tbot.live.doctor import Check, backup_check, checks_text, guard_check, run_checks
 from tbot.live.ledger import Ledger
-from tbot.live.runner import GUARD_META, KEYS_MISSING, MODE_META, stop_path
+from tbot.live.runner import GUARD_META, KEYS_MISSING, MODE_META, mode_problem, stop_path
 from tbot.risk.guard import GuardConfig, GuardState
 
 STRATEGIES = [
@@ -189,7 +190,8 @@ def test_kill_switch_is_tried_on_the_stored_history(tmp_path: Path) -> None:
     assert "would have halted" in result.detail
     loose = tight.model_copy(update={"guard": GuardConfig(max_drawdown=0.9)})
     assert guard_check(loose, store).status == "ok"
-    assert "run `tbot download`" in guard_check(tight, BarStore(tmp_path / "none")).detail
+    hint = "run `tbot download --symbols BTCUSDT ETHUSDT --timeframes 4h"
+    assert hint in guard_check(tight, BarStore(tmp_path / "none")).detail
     few = guard_check(tight, short)  # what a paper start leaves: no verdict either way
     assert (few.status, few.detail[:42]) == ("warn", "too little stored history to test it (59 d")
 
@@ -261,7 +263,7 @@ def test_paused_and_unknown_symbols_are_named(tmp_path: Path) -> None:
     ]
     gone = fake(rules={"BTCUSDT": fake().rules["BTCUSDT"]})
     assert by_name(check(config, settings(**ALERTS), gone))["symbols"] == [
-        ("fail", "unknown symbols: ETHUSDT")
+        ("fail", "Binance does not list ETHUSDT")
     ]
 
 
@@ -302,3 +304,36 @@ def test_offline_doctor_fails_only_on_what_stops_a_start(tmp_path: Path) -> None
     assert found["kill switch"][0][0] == "warn"  # a halted bot runs, halted
     no_keys = by_name(asyncio.run(offline(settings())))
     assert no_keys["api key"][0][0] == "fail"  # the start would fail
+
+
+def test_doctor_asks_telegram_about_the_token_and_the_chat(tmp_path: Path) -> None:
+    config = live(tmp_path)
+
+    def telegram(spot: FakeSpot) -> list[tuple[str, str]]:
+        return by_name(check(config, settings(**ALERTS, **KEYS), spot))["telegram"]
+
+    assert telegram(fake()) == [
+        ("ok", "Telegram knows the bot and the chat; `tbot notify` tests it")
+    ]
+    assert telegram(fake(telegram_token="revoked")) == [
+        ("fail", "Telegram does not know TBOT_TELEGRAM_TOKEN (`tbot notify`)")
+    ]
+    [(status, detail)] = telegram(fake(telegram_chat="2"))
+    assert (status, detail.split(":")[0]) == ("fail", "the bot cannot reach TBOT_TELEGRAM_CHAT_ID")
+
+
+def test_a_ledger_of_another_mode_gets_a_free_name_suggested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config = PaperConfig(strategies=STRATEGIES, ledger=Path("data/paper.sqlite"))
+    with Ledger(tmp_path / "other.sqlite") as ledger:
+        ledger.set_meta(MODE_META, "testnet")
+        assert "(`ledger: data/paper-2.sqlite` or another new file)" in mode_problem(config, ledger)
+
+
+def test_the_clock_line_says_which_way_this_computer_is_off(tmp_path: Path) -> None:
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    [(_, detail)] = by_name(check(config, settings(**ALERTS), fake()))["clock"]
+    assert detail.startswith("this computer is ")
+    assert detail.endswith(("behind Binance", "ahead of Binance"))

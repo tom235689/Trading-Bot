@@ -28,6 +28,9 @@ Batch = dict[StreamKey, pl.DataFrame]
 log = structlog.get_logger(__name__)
 FETCH_ERRORS = (httpx.HTTPError, LookupError, ValueError, OSError)  # REST failures, retried
 HEALTHY_SECONDS = 60.0  # a socket open this long resets the reconnect backoff
+# Binance pushes every kline stream about every 2 s: a socket silent this long has
+# stalled while still answering pings, and is replaced.
+SILENCE_SECONDS = 120.0
 
 
 def utc_now() -> datetime:
@@ -72,6 +75,7 @@ class LiveFeed:
         }
         self.queue: asyncio.Queue[tuple[StreamKey, pl.DataFrame]] = asyncio.Queue()
         self.reconnects = 0
+        self.silence = SILENCE_SECONDS
         self._stale_reported: set[StreamKey] = set()
         self.rest_paused_until: datetime | None = None  # a rate limit: calling now risks a ban
 
@@ -184,13 +188,19 @@ class LiveFeed:
                 async with self.connector(url) as messages:
                     log.info("websocket_connected", streams=len(self.keys))
                     await self._catch_up_or_log()
-                    async for message in messages:
+                    while True:
+                        try:
+                            message = await asyncio.wait_for(anext(messages), self.silence)
+                        except StopAsyncIteration:
+                            break
                         kline = binance_ws.parse_kline(message)
                         if kline is not None and kline.closed and kline.key in self.last:
                             await self._on_socket_bar(kline.key, kline.bar)
                 error = "closed by the server"  # a clean close: reconnect as after an error
             except asyncio.CancelledError:
                 raise
+            except TimeoutError:
+                error = f"no message for {self.silence:.0f} s"
             except Exception as exc:  # any transport failure: reconnect
                 error = repr(exc)
             if loop.time() - opened > HEALTHY_SECONDS:

@@ -19,6 +19,12 @@ class Gap:
     start: datetime  # first missing open_time
     end: datetime  # last missing open_time
     missing: int
+    step: timedelta  # the timeframe
+
+    @property
+    def length(self) -> timedelta:
+        """The time the missing bars cover."""
+        return self.end + self.step - self.start
 
 
 @dataclass(frozen=True)
@@ -42,7 +48,7 @@ class QualityReport:
     @property
     def long_gaps(self) -> tuple[Gap, ...]:
         """Gaps of a week or more: Binance pauses for hours, not weeks."""
-        return tuple(gap for gap in self.gaps if gap.end - gap.start >= LONG_GAP)
+        return tuple(gap for gap in self.gaps if gap.length >= LONG_GAP)
 
     @property
     def missing_bars(self) -> int:
@@ -84,7 +90,7 @@ def check_bars(
         incomplete=unique.filter(pl.col("open_time") + step > now).height,
         invalid_values=bars.filter(invalid).height,
         gaps=tuple(
-            Gap(start=prev + step, end=cur - step, missing=(cur - prev) // step - 1)
+            Gap(start=prev + step, end=cur - step, missing=(cur - prev) // step - 1, step=step)
             for prev, cur in gaps.iter_rows()
         ),
         zero_volume=bars.filter(pl.col("volume") == 0).height,

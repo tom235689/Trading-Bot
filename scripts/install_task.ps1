@@ -38,6 +38,12 @@ Internal: set when the script restarted itself with administrator rights.
 .PARAMETER Busy
 Internal: doctor saw a session running on the config before the script elevated itself.
 
+.PARAMETER Uv
+Internal: uv as found before the script elevated itself (an administrator account may not have it).
+
+.PARAMETER User
+Internal: the account the task runs as, found before the script elevated itself.
+
 .EXAMPLE
 tbot autostart paper
 tbot autostart live -Live
@@ -53,7 +59,9 @@ param(
     [switch] $Remove,
     [switch] $DryRun,
     [switch] $Elevated,
-    [switch] $Busy
+    [switch] $Busy,
+    [string] $Uv = "",
+    [string] $User = ""
 )
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
@@ -72,7 +80,10 @@ try {
     if ($Live -and -not $isLive) { throw "-Live is only for a config with mode: live" }
     $stem = [IO.Path]::GetFileNameWithoutExtension($path)
     if (-not $Name) { $Name = "tbot $stem" }
-    $uv = (Get-Command uv).Source  # the task may not see the same PATH
+    if (-not $Uv) { $Uv = (Get-Command uv).Source }  # the task may not see the same PATH
+    # With an administrator's password typed into the prompt, the elevated run is that
+    # administrator: the task still runs as the owner who asked for it.
+    if (-not $User) { $User = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
 
     # Everything is checked before the administrator prompt: a typo never asks for rights.
     $busy = [bool] $Busy
@@ -82,18 +93,21 @@ try {
         $report | ForEach-Object { Write-Output $_ }
         if ($doctorCode -eq 4) { throw "$Config is no valid session config: see the error above" }
         if ($doctorCode -ne 0) {
-            $null = @(& $uv --directory $repo run --quiet --frozen python -m tbot doctor $path --offline)
-            if ($LASTEXITCODE -eq 0) {
-                throw ("only network checks failed (no network, or Binance refusing this region): " +
-                    "try again when they pass; -SkipDoctor registers the task anyway")
+            $fails = @($report | Where-Object { $_ -match '^FAIL' })
+            $network = @($fails | Where-Object { $_ -match '^FAIL\s*(binance: unreachable|heartbeat: ping failed)' })
+            if ($fails.Count -gt 0 -and $network.Count -eq $fails.Count) {
+                throw ("only network checks failed (no network, Binance refusing this region, or the " +
+                    "heartbeat monitor down): try again when they pass; -SkipDoctor registers the task anyway")
             }
             throw "doctor found problems: fix the FAIL lines above, then run this again"
         }
         $busy = [bool] ($report | Where-Object { $_ -match "process: a session is running" })
     }
     if (-not $DryRun -and -not $Elevated -and -not (Test-Admin)) {
-        $PSBoundParameters["SkipDoctor"] = $true  # checked above
-        if ($busy) { $PSBoundParameters["Busy"] = $true }
+        $PSBoundParameters["SkipDoctor"] = [switch] $true  # checked above
+        if ($busy) { $PSBoundParameters["Busy"] = [switch] $true }
+        $PSBoundParameters["Uv"] = $Uv
+        $PSBoundParameters["User"] = $User
         exit (Invoke-Elevated $PSCommandPath $PSBoundParameters)
     }
 
@@ -107,8 +121,7 @@ try {
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
         -Priority 5  # normal; the default 7 runs the bot below normal priority
-    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U  # no stored password
+    $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType S4U  # no stored password
     $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings `
         -Principal $principal -Description "Trading bot ($stem), restarted after crashes"
 

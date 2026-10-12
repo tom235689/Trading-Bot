@@ -36,8 +36,8 @@ STOP_PREFIX = "tbs"
 STOP_META = "stop:"  # + symbol: the protective stop in force and how much of it is booked
 TAG_META = "order_tag"
 BUY_MARGIN = 0.002  # keep this much quote free for price movement between quote and fill
-STOP_LIMIT_GAP = 0.005  # limit price below the stop price so a triggered stop fills
 LOOKUP_DELAYS = (0.5, 1.0, 2.0, 4.0)  # seconds between lookups of an order in doubt
+ORDER_PATIENCE = 120.0  # seconds after sending before an order Binance does not know failed
 PRICE_ATTEMPTS = 3  # a paper quote lost to a network blip is asked again
 
 
@@ -178,6 +178,7 @@ class LiveExecutor:
         self.alerted: set[str] = set()  # stop failures already sent, until one works
         self.statuses: dict[str, str] = {}  # each symbol's Binance status as last reported
         self.partial: dict[str, float] = {}  # held beyond a stop: other orders lock it
+        self.missing_since: dict[str, datetime] = {}  # client id -> sent, or first not found
         self.tag = session_tag(ledger)
         self.stop_prefix = f"{STOP_PREFIX}{self.tag}"
 
@@ -315,6 +316,7 @@ class LiveExecutor:
         Raises OrderUnknown when the lookups find nothing: an order whose send status was
         unknown can still appear later, so settle() asks again before deciding it failed.
         """
+        sent = self.clock()
         try:
             return await self.spot.market_order(symbol, quantity, client_id)
         except BinanceError as exc:
@@ -334,6 +336,7 @@ class LiveExecutor:
             if order is not None:
                 log.warning("order_recovered", symbol=symbol, client_order_id=client_id)
                 return order
+        self.missing_since[client_id] = sent
         raise OrderUnknown(f"{symbol} {client_id}: sent, then {cause!r}; not found yet")
 
     async def _book(
@@ -440,6 +443,11 @@ class LiveExecutor:
     async def _resolve(self, record: OrderRecord, portfolio: Portfolio) -> int:
         order = await self.spot.get_order(record.symbol, record.client_id)
         if order is None:
+            # Binance can list an order whose send timed out only later: wait a while.
+            first = self.missing_since.setdefault(record.client_id, self.clock())
+            if (self.clock() - first).total_seconds() < ORDER_PATIENCE:
+                return 0
+            self.missing_since.pop(record.client_id, None)
             self.ledger.add_order(
                 record.time,
                 record.symbol,
@@ -456,6 +464,7 @@ class LiveExecutor:
             return 0
         if not order.done:
             return 0  # still working; asked again next time
+        self.missing_since.pop(record.client_id, None)
         rules = self.spot.rules[record.symbol]
         price = order.quote_qty / order.executed_qty if order.executed_qty else 0.0
         fill = await self._book(
@@ -468,6 +477,8 @@ class LiveExecutor:
                 f"({order.status}); nothing was traded"
             )
             return 0
+        self.unprotected.add(record.symbol)  # its stop fits the book again, even if this
+        # round fails before the stops are replaced
         await self.notifier.send(
             f"[{self.label}] booked an order whose result was not recorded: {_fill_summary(fill)}"
         )
@@ -533,6 +544,11 @@ class LiveExecutor:
 
     async def cancel_stops(self, symbol: str, portfolio: Portfolio) -> int:
         """Cancel this bot's stop orders, then book whatever of them executed first."""
+        count = await self._cancel_own_stops(symbol)
+        await self._settle_stop(symbol, portfolio)
+        return count
+
+    async def _cancel_own_stops(self, symbol: str) -> int:
         count = 0
         state = self._stop_state(symbol)
         tracked = state["id"] if state is not None else None  # also one from before tags
@@ -548,7 +564,6 @@ class LiveExecutor:
                 log.info("stop_already_gone", symbol=symbol, order_id=order.order_id)
                 continue
             count += 1
-        await self._settle_stop(symbol, portfolio)
         return count
 
     async def after_event(self, portfolio: Portfolio, marks: Mapping[str, float]) -> None:
@@ -610,8 +625,9 @@ class LiveExecutor:
             return
         cancelled = False
         try:
-            await self.cancel_stops(symbol, portfolio)
-            cancelled = True
+            await self._cancel_own_stops(symbol)
+            cancelled = True  # from here on, a failure leaves the position without a stop
+            await self._settle_stop(symbol, portfolio)
             position = portfolio.position(symbol)
             if position <= 0 or symbol not in marks:
                 self.unprotected.discard(symbol)
@@ -621,23 +637,22 @@ class LiveExecutor:
             balances = await self.spot.balances()
             free = balances[rules.base].free if rules.base in balances else 0.0
             stop = rules.round_price(marks[symbol] * (1 - self.protective_stop_pct))
-            limit = rules.round_price(stop * (1 - STOP_LIMIT_GAP))
-            if not self._stoppable(rules, position, limit):
+            if not self._stoppable(rules, position, stop):
                 self.unprotected.discard(symbol)  # dust: nothing an exchange stop can hold
                 self.alerted.discard(symbol)
                 self.partial.pop(symbol, None)
                 return
             quantity = min(rules.round_quantity(position), rules.floor_quantity(free))
-            if not self._stoppable(rules, quantity, limit):
+            if not self._stoppable(rules, quantity, stop):
                 raise ValueError(
                     f"only {free:.8f} of the {position:.8f} held is free; other orders lock "
                     "the rest"
                 )
             client_id = f"{self.stop_prefix}{symbol}{uuid4().hex[:12]}"
             self._set_stop_state(symbol, StopState(id=client_id, qty=0.0, quote=0.0))
-            await self.spot.stop_loss_order(symbol, quantity, stop, limit, client_id)
+            await self.spot.stop_loss_order(symbol, quantity, stop, client_id)
             self.unprotected.discard(symbol)
-            await self._note_partial(symbol, position, quantity, limit)
+            await self._note_partial(symbol, position, quantity, stop)
             if symbol in self.alerted:
                 self.alerted.discard(symbol)
                 await self.notifier.send(f"[{self.label}] protective stop for {symbol} placed")

@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.7.0 (2026-10-12)
+
+A line-by-line review of the whole code base in six parts: the order path, the session runner and its state, the command line, backtest and research, data and monitoring, and the scripts and documents. Upgrade notes:
+- Protective stops are now stop-market orders (`STOP_LOSS`). The stop-limit orders of earlier versions had a limit 0.5% under the trigger, and Binance's `PERCENT_PRICE_BY_SIDE` filter refuses a sell priced under 0.8 times the 5-minute average on BTCUSDT, ETHUSDT, and most other pairs: at the default 20% nearly every stop was refused (each one alerted), so testnet and live positions mostly had no exchange stop. The first event after the update replaces them.
+- `tbot autostart` from a normal terminal failed since 0.6.0 (the elevated window got `-SkipDoctor "True"`); it works again.
+- A lower `initial_cash` that takes more than the book is worth is refused at start, with the lowest value it can be.
+- `daily_loss_limit` now also sees the bar that closes at midnight UTC: it counts for the day it ends. On 1d bars the rule could never trip before. On the 2018-2026 backtest of the shipped config it changes no trade and the final equity by less than 0.01%.
+- A config with `target_volatility` whose `volatility_lookback_days` gives fewer than 10 bars of a strategy's timeframe is refused: such a window was never measured, and the scaling silently did nothing.
+- `--data-dir` is relative to the folder the command was typed in, like every other path.
+- A config outside `config\` logs to `logs/<name>-<hash>.jsonl`, so two configs of the same name never share a log.
+
+**Live trading**
+- Stop-market protective stops (above).
+- When Binance stops listing one configured pair, the others are still checked: Binance refuses a whole symbol-rules request for one unknown symbol, which froze every refresh of filters and statuses. The pair gets the status `UNLISTED` and waits like a paused one; a start names it.
+- An order whose answer was lost counts as never sent only once Binance still does not know it two minutes after it went out; 0.6.0 could decide that seconds later, and an order that executed late then had no stop and was booked as the owner's.
+- A buy booked by reconciliation gets its stop even when the rest of that reconciliation failed.
+- A stop that was cancelled, then could not be replaced because the lookup failed, is alerted as gone, not as still in place.
+- Two `initial_cash` changes before the next bar, or a change after a withdrawal, no longer trip the kill switch: the guard is rescaled from the book's value after the last transfer, not from the last bar's.
+- A book emptied by a transfer no longer crashes the session with a division by zero at every bar.
+- A `tbot stop` request still open in another process no longer crashes the session on Windows.
+
+**Alerts and monitoring**
+- A websocket that stays open but goes silent for two minutes is replaced; bars no longer arrive late for up to a day without an alert.
+- Alerts follow a Telegram group that became a supergroup (new chat id), and the log says to update `TBOT_TELEGRAM_CHAT_ID`; doctor names the new id.
+- `tbot doctor` asks Telegram whether it knows the token and the chat (nothing is sent), so a revoked token or a wrong chat id no longer passes.
+- The JSON log keeps every record when Windows refuses its rotation (another process has it open), and rotates a minute later; before, every record was lost from then on.
+
+**Command line**
+- A config of another kind is named as one only when it is valid as that kind: a backtest config without `start:` now says `start: Field required`, not "a paper config". A live config is pointed at `tbot live <config> --live`.
+- `--timeframes 1M` is refused (Binance's month) instead of read as one minute; `4H` and `1D` still work.
+- A folder given as a config, a path that cannot be checked, and a YAML error in a validation's base file get a one-line message instead of a traceback or a misleading one.
+- `tbot backup --out` never writes over an existing file, and `dashboard --out` and `backtest --html` write only `.html` files.
+- "Run `tbot download`" advice names the symbols, timeframes, and data folder that are missing.
+- `tbot help setup|update|autostart` says how to see the script's help; `tbot log` on a backtest config says it keeps no log; a ledger of another mode suggests a free file name; doctor's clock line says whether this computer is ahead or behind.
+- A backtest of streams with different timeframes no longer notes that the coarser one "ends" early.
+
+**Backtest, research, and data**
+- `tbot validate` checks before anything runs that a walk-forward window fits before `holdout_start` and that `cost_multiplier` leaves a tradable fee, instead of failing after the sweep.
+- RSI of a flat series is 50, not 100; `trend_period: 1` is refused; an infinite `initial_cash` is refused.
+- `tbot check` counts exactly a week of missing bars as a long gap, and allows for a local clock a little behind Binance's.
+
+**Windows scripts**
+- `tbot autostart` works from a normal terminal again (above). It says "only network checks failed" only when the failures are network ones, not for a missing Telegram, a bad heartbeat URL, or a halted kill switch.
+- With an administrator's password typed into the prompt (a standard account), autostart, update, and remove use the uv found before elevating, and the task runs as the owner, not the administrator.
+- `tbot update -DryRun` says when it cannot tell what would be pulled (no upstream, a failed fetch) instead of "nothing to pull".
+
+**Project**
+- The commit-message hook skips only git's own closing comment block, so a `#` line in a message is checked too.
+- README, DESIGN, CONFIG, and SECURITY updated for all of the above.
+
+**Tests**
+- 31 new tests (515 in all); undoing any of 40 fixes makes a test fail.
+
 ## 0.6.0 (2026-10-11)
 
 A second round of five reviews: the 0.5 changes themselves, updates and autostart, a new user's first day and the documents, simulated live trading over nine scenarios (outages, paused pairs, stops that fill while the bot is down, two sessions on one account, budget changes), and the data and research tools. Upgrade notes:

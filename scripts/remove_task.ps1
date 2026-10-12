@@ -19,6 +19,9 @@ Only say what would be done; changes nothing and asks for no rights.
 .PARAMETER Elevated
 Internal: set when the script restarted itself with administrator rights.
 
+.PARAMETER Uv
+Internal: uv as found before the script elevated itself (an administrator account may not have it).
+
 .EXAMPLE
 tbot autostart paper -Remove
 powershell -ExecutionPolicy Bypass -File scripts\remove_task.ps1 paper
@@ -27,12 +30,17 @@ param(
     [Parameter(Position = 0)] [string] $Config = "paper",
     [string] $Name = "",
     [switch] $DryRun,
-    [switch] $Elevated
+    [switch] $Elevated,
+    [string] $Uv = ""
 )
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+if (-not $Uv) {
+    $found = Get-Command uv -ErrorAction SilentlyContinue
+    if ($found) { $Uv = $found.Source; $PSBoundParameters["Uv"] = $Uv }
+}
 $named = [bool] $Name  # a task named outright may belong to no config here
 if (-not $Name) { $Name = "tbot " + [IO.Path]::GetFileNameWithoutExtension($Config) }
 
@@ -80,16 +88,16 @@ try {
         # The session the task runs, which may differ from the name given here.
         $action = @($task.Actions)[0]
         $session = if ($action.Arguments -match '-Config "([^"]+)"') { $Matches[1] } else { $Config }
-        $uv = (Get-Command uv -ErrorAction Stop).Source
-        & $uv run --quiet --frozen python -m tbot stop $session
+        if (-not $Uv) { throw "uv not found: install it, or stop the bot with tbot stop first" }
+        & $Uv run --quiet --frozen python -m tbot stop $session
         if ($LASTEXITCODE -ne 0) {
-            & $uv run --quiet --frozen python -m tbot stop $session --cancel | Out-Null  # it keeps running
+            & $Uv run --quiet --frozen python -m tbot stop $session --cancel | Out-Null  # it keeps running
             throw "the bot did not stop in time; the task and the bot are left as they were"
         }
         # The bot is gone; a supervisor still waiting to restart it is ended with the task,
         # and the request left for that restart is withdrawn.
         Stop-ScheduledTask -TaskName $Name
-        & $uv run --quiet --frozen python -m tbot stop $session --cancel | Out-Null
+        & $Uv run --quiet --frozen python -m tbot stop $session --cancel | Out-Null
     }
     Unregister-ScheduledTask -TaskName $Name -Confirm:$false
     Write-Output "removed '$Name'; the ledger, data, and logs are kept"

@@ -9,6 +9,7 @@ import tbot.strategies  # noqa: F401  # registers built-in strategies
 from tbot.strategies.base import BarWindow, StrategyContext
 from tbot.strategies.donchian import DonchianTrend
 from tbot.strategies.registry import available_strategies, create_strategy, register_strategy
+from tbot.strategies.rsi import RsiParams, rsi
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -68,3 +69,12 @@ def test_restore_continues_from_saved_targets() -> None:
     for strategy in (DonchianTrend(["BTC", "ETH"]), RsiReversion(["BTC", "ETH"])):
         strategy.restore({"BTC": 0.5, "ETH": 0.0})
         assert strategy._long == {"BTC": True, "ETH": False}
+
+
+def test_rsi_of_a_flat_series_is_neutral() -> None:
+    assert rsi(np.full(30, 100.0), 14) == 50.0
+
+
+def test_a_trend_filter_of_one_bar_is_refused() -> None:
+    with pytest.raises(pydantic.ValidationError, match="trend_period must be 0"):
+        RsiParams(trend_period=1)

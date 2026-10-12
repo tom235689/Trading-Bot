@@ -1,7 +1,9 @@
 """Configuration shared by backtest, paper, and live modes."""
 
+import math
 import re
 from collections.abc import Mapping
+from datetime import timedelta
 from typing import Any, Self
 
 import yaml
@@ -11,6 +13,7 @@ from tbot.core.timeframe import Timeframe
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel
 from tbot.risk.limits import RiskLimits
+from tbot.risk.volatility import MIN_BARS, lookback_bars
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -75,7 +78,7 @@ class StrategyConfig(BaseModel):
 class TradingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    initial_cash: float = Field(default=10_000.0, gt=0)
+    initial_cash: float = Field(default=10_000.0, gt=0, allow_inf_nan=False)
     costs: CostModel = CostModel()
     risk: RiskLimits = RiskLimits()
     rebalance: RebalanceRules = RebalanceRules()
@@ -85,6 +88,22 @@ class TradingConfig(BaseModel):
     def check_allocations(self) -> Self:
         if sum(s.allocation for s in self.strategies) > 1 + 1e-9:
             raise ValueError("strategy allocations must sum to at most 1")
+        return self
+
+    @model_validator(mode="after")
+    def check_volatility_window(self) -> Self:
+        """Volatility targeting with too few bars to measure would silently do nothing."""
+        days = self.risk.volatility_lookback_days
+        if not self.risk.target_volatility:
+            return self
+        for c in self.strategies:
+            bars = lookback_bars(c.timeframe, days)
+            if bars < MIN_BARS:
+                least = math.ceil(MIN_BARS * c.timeframe.delta / timedelta(days=1))
+                raise ValueError(
+                    f"risk.volatility_lookback_days {days} gives {bars} bars of {c.timeframe}; "
+                    f"volatility targeting needs {MIN_BARS}: set it to {least} or more"
+                )
         return self
 
     def with_params(self, params: Mapping[str, Any]) -> Self:
@@ -99,3 +118,8 @@ class TradingConfig(BaseModel):
             slippage_bps=self.costs.slippage_bps * multiplier,
         )
         return self.model_copy(update={"costs": costs})
+
+
+def streams_of(config: TradingConfig) -> list[tuple[str, Timeframe]]:
+    """Every symbol and timeframe the config trades."""
+    return [(symbol, c.timeframe) for c in config.strategies for symbol in c.symbols]

@@ -4,6 +4,7 @@ from datetime import date
 from pathlib import Path
 from typing import Self
 
+import yaml
 from pydantic import model_validator
 
 from tbot.core.config import StrategyConfig, TradingConfig, load_yaml
@@ -30,4 +31,8 @@ class BacktestConfig(TradingConfig):
 
 
 def load_config(path: Path) -> BacktestConfig:
-    return BacktestConfig.model_validate(load_yaml(path.read_text(encoding="utf-8")))
+    try:
+        raw = load_yaml(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:  # a validation's base file: say which file it is
+        raise ValueError(f"{path}: not valid YAML: {exc}") from None
+    return BacktestConfig.model_validate(raw)

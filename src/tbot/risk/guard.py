@@ -53,22 +53,28 @@ class RiskGuard:
     def check(self, now: datetime, equity: float, bar_time: datetime) -> Decision:
         """Update peak and day-open equity, then decide what this event may do."""
         state, cfg = self.state, self.config
+        # The first event of a day closes the last bar of the day before: its loss counts
+        # against that day's open (else a 1d bar's loss is never seen).
+        day_open = state.day_open_equity
         if state.day != now.date():
+            if state.day is None or (now.date() - state.day).days > 1:
+                day_open = equity  # no day before, or one long gone: nothing to test
             state.day = now.date()
             state.day_open_equity = equity
         state.peak_equity = max(state.peak_equity, equity)
 
         if state.halted:
             return Decision(Mode.HALT, state.halt_reason)
-        if cfg.max_drawdown and equity < state.peak_equity * (1 - cfg.max_drawdown):
+        positive = state.peak_equity > 0  # a book emptied by a transfer has no drawdown
+        if cfg.max_drawdown and positive and equity < state.peak_equity * (1 - cfg.max_drawdown):
             drawdown = equity / state.peak_equity - 1
             self.halt(f"drawdown {drawdown:.1%} beyond {_percent(cfg.max_drawdown)} limit")
             return Decision(Mode.HALT, state.halt_reason)
         if cfg.stale_seconds and (now - bar_time).total_seconds() > cfg.stale_seconds:
             age = (now - bar_time).total_seconds()
             return Decision(Mode.BLOCK, f"bar is {age:.0f}s old")
-        if cfg.daily_loss_limit and equity < state.day_open_equity * (1 - cfg.daily_loss_limit):
-            loss = equity / state.day_open_equity - 1
+        if cfg.daily_loss_limit and day_open > 0 and equity < day_open * (1 - cfg.daily_loss_limit):
+            loss = equity / day_open - 1
             return Decision(
                 Mode.REDUCE_ONLY, f"day loss {loss:.1%} beyond {_percent(cfg.daily_loss_limit)}"
             )

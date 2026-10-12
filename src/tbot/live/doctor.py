@@ -11,10 +11,10 @@ from pydantic import ValidationError
 
 from tbot import __version__
 from tbot.backtest.runner import run_period
+from tbot.core.config import streams_of
 from tbot.data.http import describe_error
 from tbot.data.store import BarStore
 from tbot.exchange.binance import (
-    INVALID_SYMBOL,
     KEY_ERRORS,
     PRODUCTION_URL,
     TESTNET_URL,
@@ -25,6 +25,7 @@ from tbot.live.backup import daily_backups
 from tbot.live.config import LiveConfig, SessionConfig, Settings
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.runner import (
+    HEARTBEAT_URL_HINT,
     KEY_REJECTED,
     KEYS_MISSING,
     AlreadyRunning,
@@ -39,6 +40,7 @@ from tbot.live.runner import (
     unbooked_budget,
     valid_url,
 )
+from tbot.monitoring.telegram import Telegram, migrated_to
 from tbot.portfolio.allocation import build_slots
 
 MAX_CLOCK_OFFSET = 1.0  # seconds; the bot corrects for it, but a drifting clock needs a fix
@@ -103,19 +105,57 @@ async def run_checks(
             )
         )
         return checks
+    side = "behind" if offset > 0 else "ahead of"  # offset: Binance minus this clock
     checks.append(
         Check(
             "ok" if abs(offset) <= MAX_CLOCK_OFFSET else "warn",
             "clock",
-            f"{offset:+.2f} s against Binance"
-            + ("" if abs(offset) <= MAX_CLOCK_OFFSET else "; turn on Windows time sync"),
+            f"this computer is {abs(offset):.2f} s {side} Binance"
+            + ("" if abs(offset) <= MAX_CLOCK_OFFSET else "; turn on the system's time sync"),
         )
     )
     if live is None:
         checks.extend(await symbol_checks(config, public))
     else:
         checks.extend(await account_checks(live, settings, client, offset))
+    if settings.telegram_token and settings.telegram_chat_id:
+        verified = await telegram_check(settings.telegram_token, settings.telegram_chat_id, client)
+        checks = [verified if c.name == "telegram" else c for c in checks]
     return checks
+
+
+async def telegram_check(token: str, chat: str, client: httpx.AsyncClient) -> Check:
+    """Ask Telegram whether it knows the token and the chat; nothing is sent."""
+    bot = Telegram(token, chat, client)
+    try:
+        await bot.me()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 404):
+            return Check(
+                "fail", "telegram", "Telegram does not know TBOT_TELEGRAM_TOKEN (`tbot notify`)"
+            )
+        return Check("fail", "telegram", f"cannot check the token: {describe_error(exc)}")
+    except httpx.HTTPError as exc:  # the token is in the URL: never print it
+        return Check("fail", "telegram", f"unreachable: {describe_error(exc)}")
+    try:
+        await bot.chat()
+    except httpx.HTTPStatusError as exc:
+        moved = migrated_to(exc.response)
+        if moved:
+            return Check(
+                "fail",
+                "telegram",
+                f"the group became a supergroup: set TBOT_TELEGRAM_CHAT_ID to {moved}",
+            )
+        return Check(
+            "fail",
+            "telegram",
+            "the bot cannot reach TBOT_TELEGRAM_CHAT_ID: a wrong id, or the bot is not in that "
+            "chat (`tbot notify` finds it)",
+        )
+    except httpx.HTTPError as exc:
+        return Check("fail", "telegram", f"unreachable: {describe_error(exc)}")
+    return Check("ok", "telegram", "Telegram knows the bot and the chat; `tbot notify` tests it")
 
 
 def strategy_checks(config: SessionConfig) -> list[Check]:
@@ -135,8 +175,9 @@ def guard_check(config: SessionConfig, store: BarStore) -> Check:
     if not config.guard.max_drawdown:
         return Check("warn", "kill switch", "off (guard.max_drawdown is 0)")
     firsts = [store.first_open_time(s, c.timeframe) for c in config.strategies for s in c.symbols]
+    hint = store.download_hint(streams_of(config))
     if any(first is None for first in firsts):
-        return Check("warn", "kill switch", "no stored history to test it on; run `tbot download`")
+        return Check("warn", "kill switch", f"no stored history to test it on; run {hint}")
     start = max(f for f in firsts if f is not None) + timedelta(days=90)  # after the warmup
     lasts = [store.last_open_time(s, c.timeframe) for c in config.strategies for s in c.symbols]
     days = (min(last for last in lasts if last is not None) - start).days
@@ -145,7 +186,7 @@ def guard_check(config: SessionConfig, store: BarStore) -> Check:
             "warn",
             "kill switch",
             f"too little stored history to test it ({max(days, 0)} days after the warmup); "
-            "run `tbot download` for the full history",
+            f"run {hint} for the full history",
         )
     try:
         result = run_period(config, store, start, None, config.guard)
@@ -269,7 +310,7 @@ def alert_checks(settings: Settings, real_money: bool = False) -> list[Check]:
     if not valid_url(url):
         return [
             telegram,
-            Check("fail", "heartbeat", "TBOT_HEARTBEAT_URL must be a full http(s):// URL"),
+            Check("fail", "heartbeat", HEARTBEAT_URL_HINT),
         ]
     return [telegram]  # pinged once the network is known to work
 
@@ -279,10 +320,6 @@ async def symbol_checks(config: SessionConfig, spot: BinanceSpot) -> list[Check]
     try:
         rules = await spot.load_rules(symbols)
     except BinanceError as exc:
-        if exc.code == INVALID_SYMBOL and "unknown symbols" not in exc.message:
-            unknown = await unlisted(spot, symbols)  # Binance does not say which
-            named = ", ".join(unknown) or ", ".join(symbols)
-            return [Check("fail", "symbols", f"Binance does not list {named}")]
         return [Check("fail", "symbols", exc.message)]
     paused = [f"{s} {spot.status[s]}" for s in sorted(rules) if not spot.trading(s)]
     if paused:
@@ -307,18 +344,6 @@ async def symbol_checks(config: SessionConfig, spot: BinanceSpot) -> list[Check]
             )
         ]
     return [Check("ok", "symbols", f"{', '.join(sorted(rules))} trading")]
-
-
-async def unlisted(spot: BinanceSpot, symbols: list[str]) -> list[str]:
-    """The symbols Binance does not list, asked one at a time."""
-    found = []
-    for symbol in symbols:
-        try:
-            await spot.load_rules([symbol])
-        except BinanceError as exc:
-            if exc.code == INVALID_SYMBOL:
-                found.append(symbol)
-    return found
 
 
 async def account_checks(

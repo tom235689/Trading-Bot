@@ -28,7 +28,8 @@ def test_clean_data() -> None:
 def test_gap_is_warning() -> None:
     report = check_bars(BARS.filter(~ROW.is_between(10, 12)), H1, LATER)
     assert report.ok
-    assert report.gaps == (Gap(start=at(10), end=at(12), missing=3),)
+    assert report.gaps == (Gap(start=at(10), end=at(12), missing=3, step=timedelta(hours=1)),)
+    assert report.gaps[0].length == timedelta(hours=3)
     assert report.missing_bars == 3
 
 
@@ -83,3 +84,14 @@ def test_a_week_without_bars_is_missing_data() -> None:
     assert len(report.long_gaps) == 1
     days = bars.filter((pl.col("open_time") < at(100)) | (pl.col("open_time") >= at(100 + 24 * 3)))
     assert check_bars(days, H1, LATER).ok  # Binance paused for days in 2018: a warning
+
+
+def test_exactly_a_week_of_missing_bars_is_a_long_gap() -> None:
+    bars = make_bars(T0, 480, H1)
+
+    def without(hours: int) -> bool:
+        kept = (pl.col("open_time") < at(100)) | (pl.col("open_time") >= at(100 + hours))
+        return check_bars(bars.filter(kept), H1, LATER).ok
+
+    assert not without(24 * 7)  # 168 bars missing: a week
+    assert without(24 * 7 - 1)

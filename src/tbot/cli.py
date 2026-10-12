@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import difflib
+import hashlib
 import io
 import logging
 import os
@@ -130,6 +131,7 @@ ROOT = Path(__file__).resolve().parents[2]  # the repository, when tbot runs fro
 DATA_HELP = "bar store and trial log (default: data)"
 SESSION_DATA_HELP = "bar store (default: data); the ledger is set in the config"
 ORIGIN: Path | None = None  # where the command was typed, when run() changed folders
+SCRIPTS = ("setup", "update", "autostart")  # tbot.cmd runs these PowerShell scripts
 
 
 def typed_path(value: str) -> Path:
@@ -138,16 +140,25 @@ def typed_path(value: str) -> Path:
     return ORIGIN / path if ORIGIN is not None and not path.is_absolute() else path
 
 
+def exists(path: Path) -> bool:
+    """Whether the path is there; one that cannot be checked counts as not, and reading
+    it later says why."""
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def input_path(value: str) -> Path:
     """A file to read: where the command was typed, else in the repository."""
     typed = typed_path(value)
-    return typed if typed.exists() or not Path(value).exists() else Path(value)
+    return typed if exists(typed) or not exists(Path(value)) else Path(value)
 
 
 def config_arg(value: str) -> Path:
     """A config file, or the name of one in config/: `paper` is config/paper.yaml."""
     path = input_path(value)
-    if not path.exists() and not path.suffix and Path(value).name == value:
+    if not exists(path) and not path.suffix and Path(value).name == value:
         for suffix in CONFIG_SUFFIXES:
             named = CONFIG_DIR / f"{value}{suffix}"
             if named.is_file():
@@ -209,7 +220,8 @@ def parse_date(value: str) -> datetime:
 
 
 def parse_timeframe(value: str) -> Timeframe:
-    for candidate in (value, value.lower()):
+    # 4H or 1D as well, but never 1M: that is Binance's month, not a minute.
+    for candidate in (value, value[:-1] + value[-1:].lower() if value[-1:] in "HD" else value):
         try:
             return Timeframe(candidate)
         except ValueError:
@@ -228,6 +240,15 @@ KIND_USE = {
     "live": "a testnet or live config: run it with `tbot live {name}`",
     "paper": "a paper config: run it with `tbot paper {name}`",
 }
+KIND_LOADERS: dict[str, Callable[[Path], object]] = {}  # filled below the loaders
+
+
+def live_command(name: str, config: SessionConfig | dict[str, Any]) -> str:
+    """The command that starts this session: a real-money one needs --live."""
+    mode = config.get("mode") if isinstance(config, dict) else getattr(config, "mode", None)
+    if mode == "live":
+        return f"tbot live {name} --live"
+    return f"tbot live {name}" if mode else f"tbot paper {name}"
 
 
 def kind_of(raw: dict[str, Any]) -> str:
@@ -240,6 +261,11 @@ def kind_of(raw: dict[str, Any]) -> str:
 
 
 def read_yaml(path: Path) -> dict[str, Any]:
+    try:
+        if path.is_dir():
+            raise ConfigError(f"{path} is a folder, not a config file")
+    except OSError:
+        pass  # reading it says why
     try:
         raw = load_yaml(path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
@@ -264,12 +290,24 @@ def load[T](path: Path, loader: Callable[[Path], T], kinds: tuple[str, ...]) -> 
         return loader(path)
     except (ValidationError, ValueError) as exc:
         kind = kind_of(raw)
-        if kind not in kinds:
-            use = KIND_USE[kind].format(name=short_name(path))
+        if kind not in kinds and loads_as(path, kind):
+            name = short_name(path)
+            use = KIND_USE[kind].format(name=name)
+            if kind == "live":
+                use = f"a {raw.get('mode')} config: run it with `{live_command(name, raw)}`"
             raise ConfigError(f"{path} is {use}") from None
         raise ConfigError(f"{path}: {brief(exc)}") from None
     except OSError as exc:  # a file the config points at, such as a validation's backtest
         raise ConfigError(f"{path}: {exc}") from None
+
+
+def loads_as(path: Path, kind: str) -> bool:
+    """Whether the file is a valid config of this kind: only then is it named one."""
+    try:
+        KIND_LOADERS[kind](path)
+    except (ValidationError, ValueError, OSError):
+        return False
+    return True
 
 
 def check_strategies(path: Path, config: TradingConfig) -> None:
@@ -296,6 +334,14 @@ def load_session_config(path: Path) -> SessionConfig:
 
 def load_live_config(path: Path) -> LiveConfig:
     return load(path, lambda path: LiveConfig.model_validate(read_yaml(path)), ("live",))
+
+
+KIND_LOADERS.update(
+    validation=load_validation_config,
+    backtest=load_config,
+    live=lambda path: LiveConfig.model_validate(read_yaml(path)),
+    paper=lambda path: PaperConfig.model_validate(read_yaml(path)),
+)
 
 
 @dataclass(frozen=True)
@@ -437,19 +483,19 @@ def build_parser() -> argparse.ArgumentParser:
         "every session at a glance; with a config, that one in detail",
         "every session",
     )
-    status.add_argument("--data-dir", type=Path, default=Path("data"), help=SESSION_DATA_HELP)
+    status.add_argument("--data-dir", type=typed_path, default=Path("data"), help=SESSION_DATA_HELP)
 
     paper = command("paper", "paper trade on live Binance data until stopped")
     paper.add_argument(
         "config", nargs="?", type=config_arg, default="paper", help="default: config/paper.yaml"
     )
-    paper.add_argument("--data-dir", type=Path, default=Path("data"), help=SESSION_DATA_HELP)
+    paper.add_argument("--data-dir", type=typed_path, default=Path("data"), help=SESSION_DATA_HELP)
     paper.add_argument("--log-file", type=typed_path, help="default: logs/<config name>.jsonl")
 
     live = command("live", "trade on Binance testnet or live until stopped")
     live.add_argument("config", type=config_arg, help="testnet, live, or a config file")
     live.add_argument("--live", action="store_true", help="required when the config mode is live")
-    live.add_argument("--data-dir", type=Path, default=Path("data"), help=SESSION_DATA_HELP)
+    live.add_argument("--data-dir", type=typed_path, default=Path("data"), help=SESSION_DATA_HELP)
     live.add_argument("--log-file", type=typed_path, help="default: logs/<config name>.jsonl")
 
     stop_cmd = session(
@@ -471,7 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
     log_cmd.add_argument("--file", type=input_path, help="a log file to read instead, such as a .1")
 
     doctor = session("doctor", "check keys, alerts, network, and the ledger before a session")
-    doctor.add_argument("--data-dir", type=Path, default=Path("data"), help=SESSION_DATA_HELP)
+    doctor.add_argument("--data-dir", type=typed_path, default=Path("data"), help=SESSION_DATA_HELP)
     doctor.add_argument(
         "--offline",
         action="store_true",
@@ -481,12 +527,16 @@ def build_parser() -> argparse.ArgumentParser:
     command("notify", "set up Telegram alerts (guided) and send a test message")
 
     dashboard = session("dashboard", "write an HTML dashboard of a session and open it")
-    dashboard.add_argument("--data-dir", type=Path, default=Path("data"), help=SESSION_DATA_HELP)
+    dashboard.add_argument(
+        "--data-dir", type=typed_path, default=Path("data"), help=SESSION_DATA_HELP
+    )
     dashboard.add_argument("--out", default=None, help="a file or folder (default: reports/)")
     dashboard.add_argument("--no-open", action="store_true", help="do not open it in a browser")
 
     compare = session("compare", "compare a session with a backtest of the same period")
-    compare.add_argument("--data-dir", type=Path, default=Path("data"), help=SESSION_DATA_HELP)
+    compare.add_argument(
+        "--data-dir", type=typed_path, default=Path("data"), help=SESSION_DATA_HELP
+    )
 
     backup = session("backup", "copy a session ledger, also while it runs")
     backup.add_argument(
@@ -525,12 +575,12 @@ def build_parser() -> argparse.ArgumentParser:
             help="e.g. 1h 4h 1d (default: 1h 4h)",
         )
         parser_.add_argument(
-            "--data-dir", type=Path, default=Path("data"), help="bar store (default: data)"
+            "--data-dir", type=typed_path, default=Path("data"), help="bar store (default: data)"
         )
 
     backtest = command("backtest", "run a backtest from a YAML config")
     backtest.add_argument("config", type=config_arg, help=CONFIG_HELP)
-    backtest.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
+    backtest.add_argument("--data-dir", type=typed_path, default=Path("data"), help=DATA_HELP)
     backtest.add_argument(
         "--attribution", action="store_true", help="also run each strategy alone and compare"
     )
@@ -549,7 +599,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=config_arg,
         help="a validation config, or its name from config/ such as donchian_voltarget_validation",
     )
-    validate.add_argument("--data-dir", type=Path, default=Path("data"), help=DATA_HELP)
+    validate.add_argument("--data-dir", type=typed_path, default=Path("data"), help=DATA_HELP)
     validate.add_argument(
         "--workers",
         type=int,
@@ -588,7 +638,7 @@ def run_download(args: argparse.Namespace) -> int:
     return EXIT_ERROR if failed else 0
 
 
-def print_report(symbol: str, timeframe: Timeframe, report: QualityReport) -> None:
+def print_report(symbol: str, timeframe: Timeframe, report: QualityReport, store: BarStore) -> None:
     status = "OK" if report.ok else "FAIL"
     print(
         f"{symbol} {timeframe}: {status}, {report.bars} bars, "
@@ -604,11 +654,13 @@ def print_report(symbol: str, timeframe: Timeframe, report: QualityReport) -> No
         if count:
             print(f"  error: {count} {name}")
     if report.long_gaps:
-        longest = max(report.long_gaps, key=lambda gap: gap.end - gap.start)
+        directory = store.directory(symbol, timeframe)
+        hint = store.download_hint([(symbol, timeframe)])
+        longest = max(report.long_gaps, key=lambda gap: gap.length)
         print(
             f"  error: {len(report.long_gaps)} gaps of a week or more, the longest "
             f"{fmt(longest.start)} .. {fmt(longest.end)}: data is missing; delete "
-            f"data/binance/spot/klines/{symbol}/{timeframe}/ and run `tbot download` again"
+            f"{directory} and run {hint} again"
         )
     if report.gaps:
         print(f"  gaps: {len(report.gaps)} ({report.missing_bars} missing bars)")
@@ -623,17 +675,19 @@ def print_report(symbol: str, timeframe: Timeframe, report: QualityReport) -> No
 
 def run_check(args: argparse.Namespace) -> int:
     store = BarStore(args.data_dir)
-    now = datetime.now(UTC)
+    # A minute of slack: this clock may run behind Binance's, which the download went by.
+    now = datetime.now(UTC) + timedelta(minutes=1)
     failed = False
     for symbol in args.symbols:
         for timeframe in args.timeframes:
             bars = store.read(symbol, timeframe)
             if bars.is_empty():
-                print(f"{symbol} {timeframe}: FAIL, no data (`tbot download` fetches it)")
+                hint = store.download_hint([(symbol, timeframe)])
+                print(f"{symbol} {timeframe}: FAIL, no data ({hint} fetches it)")
                 failed = True
                 continue
             report = check_bars(bars, timeframe, now)
-            print_report(symbol, timeframe, report)
+            print_report(symbol, timeframe, report, store)
             failed = failed or not report.ok
     return 1 if failed else 0
 
@@ -646,12 +700,14 @@ def print_notes(config: BacktestConfig, store: BarStore) -> None:
     """What a backtest of this config cannot show, said before it runs."""
     ends = data_ends(config, store)
     stop = min(max(ends.values()), utc_day(config.end)) if config.end and ends else None
-    if ends and min(ends.values()) < (stop or max(ends.values())):
+    # A coarser stream closes up to one of its bars after a finer one: no sign of an end.
+    lag = max((timeframe.delta for _, timeframe in ends), default=timedelta(0))
+    if ends and (stop or max(ends.values())) - min(ends.values()) >= lag:
         (symbol, timeframe), first = min(ends.items(), key=lambda item: item[1])
         print(
             f"Note: {symbol} {timeframe} data ends {first:%Y-%m-%d %H:%M} (its last close); "
-            "every stream stops there. `tbot download` brings it up to date; a symbol Binance "
-            "no longer lists stays short: leave it out or set end:"
+            f"every stream stops there. {store.download_hint([(symbol, timeframe)])} brings it "
+            "up to date; a symbol Binance no longer lists stays short: leave it out or set end:"
         )
     start = utc_day(config.start)
     for (symbol, timeframe), last in sorted(ends.items()):
@@ -663,7 +719,8 @@ def print_notes(config: BacktestConfig, store: BarStore) -> None:
             )
         bars = store.read(symbol, timeframe, start, stop or last)
         gaps = bars["open_time"].diff().drop_nulls() if bars.height > 1 else None
-        if gaps is not None and gaps.max() is not None and gaps.max() >= LONG_GAP:  # type: ignore[operator]
+        longest = gaps.max() if gaps is not None else None
+        if isinstance(longest, timedelta) and longest - timeframe.delta >= LONG_GAP:
             print(
                 f"Note: {symbol} {timeframe} misses a week or more of bars inside the period; "
                 "results there are not real (`tbot check` shows where)"
@@ -690,7 +747,8 @@ def check_period(config: BacktestConfig, store: BarStore) -> None:
             continue  # the backtest names the missing stream
         stored = f"{key[0]} {key[1]} is stored from {first:%Y-%m-%d} to {last:%Y-%m-%d}"
         if last + key[1].delta <= utc_day(config.start):
-            raise ValueError(f"{stored}, before the period starts: run `tbot download`")
+            hint = store.download_hint([key])
+            raise ValueError(f"{stored}, before the period starts: run {hint}")
         if config.end is not None and utc_day(config.end) <= first:
             raise ValueError(f"{stored}, after the period ends: no download goes back further")
     ends = data_ends(config, store)
@@ -701,7 +759,8 @@ def check_period(config: BacktestConfig, store: BarStore) -> None:
             raise ValueError(
                 f"{symbol} {timeframe} data ends {short:%Y-%m-%d %H:%M}, before the period's end "
                 f"{config.end}, and every stream would stop there: set end: {short:%Y-%m-%d}, "
-                "leave the symbol out, or `tbot download` if it is still listed"
+                f"leave the symbol out, or {store.download_hint([(symbol, timeframe)])} if it "
+                "is still listed"
             )
 
 
@@ -712,7 +771,8 @@ def check_holdout(config: ValidationConfig, base: BacktestConfig, store: BarStor
         (symbol, timeframe), last = min(ends.items(), key=lambda item: item[1])
         raise ValueError(
             f"holdout_start {config.holdout_start} is after the stored {symbol} {timeframe} "
-            f"bars (to {last:%Y-%m-%d %H:%M}): set it earlier, or `tbot download`"
+            f"bars (to {last:%Y-%m-%d %H:%M}): set it earlier, or "
+            f"{store.download_hint([(symbol, timeframe)])}"
         )
 
 
@@ -731,6 +791,14 @@ def output_file(value: str | None, folder: Path, name: str) -> Path:
     if value.endswith(("/", "\\")):  # a folder to create; a backslash ends one on any system
         return typed_path(value.rstrip("/\\")) / name
     return path if path.suffix else path.with_suffix(Path(name).suffix)  # `mydash`: mydash.html
+
+
+def html_file(value: str | None, folder: Path, name: str) -> Path:
+    """An output_file for a page: never a file of another kind, such as a ledger."""
+    path = output_file(value, folder, name)
+    if path.suffix.lower() not in (".html", ".htm"):
+        raise ConfigError(f"{path}: the page is HTML; name a .html file or a folder")
+    return path
 
 
 def run_backtest_command(args: argparse.Namespace) -> int:
@@ -764,7 +832,7 @@ def run_backtest_command(args: argparse.Namespace) -> int:
     if args.html is not None:
         subtitle = f"{args.config}, {config.start} to {config.end or 'latest'}"
         data = from_backtest(result, f"Backtest {args.config.stem}", subtitle)
-        out = output_file(args.html, Path("reports"), f"{args.config.stem}.html")
+        out = html_file(args.html, Path("reports"), f"{args.config.stem}.html")
         write_dashboard(data, out, show=not args.no_open)
     return 0
 
@@ -780,7 +848,7 @@ def write_dashboard(data: DashboardData, out: Path, *, show: bool = False) -> No
 def run_dashboard_command(args: argparse.Namespace) -> int:
     path = args.config or pick_config("dashboard")
     config = existing_ledger(load_session_config(path), path)
-    out = output_file(args.out, Path("reports"), f"{path.stem}.html")
+    out = html_file(args.out, Path("reports"), f"{path.stem}.html")
     kind = config.mode.capitalize() if isinstance(config, LiveConfig) else "Paper"
     title = f"{kind} session {path.stem}"
     write_dashboard(from_ledger(config, BarStore(args.data_dir), title), out, show=not args.no_open)
@@ -863,8 +931,13 @@ def announce(kind: str, path: Path, config: SessionConfig, log_file: Path) -> No
 
 
 def log_path(config: Path) -> Path:
-    """One log per config, so two sessions never rotate the same file."""
-    return Path("logs") / f"{config.stem}.jsonl"
+    """One log per config, so two sessions never rotate the same file: a config in
+    config/ by its name, any other also by a hash of where it is."""
+    full = config.resolve()
+    if full.parent == Path("config").resolve():  # the repository: run() starts there
+        return Path("logs") / f"{config.stem}.jsonl"
+    digest = hashlib.sha256(str(full).lower().encode()).hexdigest()[:8]  # Windows ignores case
+    return Path("logs") / f"{config.stem}-{digest}.jsonl"
 
 
 def run_status_command(args: argparse.Namespace) -> int:
@@ -887,7 +960,9 @@ def run_status_command(args: argparse.Namespace) -> int:
 
 def run_log_command(args: argparse.Namespace) -> int:
     if args.file is None and args.config is not None:
-        read_yaml(args.config)  # a typo is no config, not a log yet to come
+        kind = kind_of(read_yaml(args.config))  # a typo is no config, not a log yet to come
+        if kind not in ("paper", "live"):
+            raise ConfigError(f"{args.config} is a {kind} config: it prints, and keeps no log")
     path = args.file or log_path(args.config or pick_config("log"))
     minimum = LEVELS.index(args.level)
     if isinstance(sys.stdout, io.TextIOWrapper):  # a console that cannot show a character
@@ -1000,6 +1075,8 @@ def run_backup_command(args: argparse.Namespace) -> int:
     config = existing_ledger(load_session_config(path), path)
     name = f"{config.ledger.stem}-{datetime.now(UTC):%Y%m%d-%H%M%S}.sqlite"
     out = output_file(args.out, backup_dir(config.ledger), name)  # a folder: a synced one
+    if exists(out):  # another backup, or a ledger: never written over
+        raise ConfigError(f"{out} exists: name a new file, or a folder")
     with Ledger(config.ledger) as ledger:
         ledger.backup(out)
     print(f"wrote {out}")
@@ -1041,8 +1118,7 @@ def is_halted(config: SessionConfig) -> bool:
 def existing_ledger[C: SessionConfig](config: C, path: Path) -> C:
     """Opening a ledger creates it; commands that only read must not leave one behind."""
     if not config.ledger.is_file():
-        name = short_name(path)
-        start = f"tbot live {name}" if isinstance(config, LiveConfig) else f"tbot paper {name}"
+        start = live_command(short_name(path), config)
         raise NothingYet(
             f"no ledger at {config.ledger}: nothing has run with this config yet "
             f"(`{start}` starts it; `tbot status` lists every session)"
@@ -1185,6 +1261,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["help"]:  # `tbot help`, `tbot help paper`
+        if argv[1:2] and argv[1] in SCRIPTS:
+            print(f"`tbot {argv[1]}` runs a Windows script: `tbot {argv[1]} -h` shows its help")
+            return 0
         argv = [*argv[1:2], "-h"]
     try:
         args = parser.parse_args(argv)

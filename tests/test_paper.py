@@ -303,6 +303,13 @@ def test_status_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert main(["backup", str(config_path), "--out", str(synced)]) == 0
     capsys.readouterr()
     assert [p.suffix for p in synced.iterdir()] == [".sqlite"]
+    ledger = str(tmp_path / "paper.sqlite")  # a file that exists, such as a ledger
+    assert main(["backup", str(config_path), "--out", ledger]) == EXIT_CONFIG
+    assert "exists: name a new file, or a folder" in capsys.readouterr().err
+    assert main(["dashboard", str(config_path), "--out", ledger, "--no-open"]) == EXIT_CONFIG
+    assert "the page is HTML" in capsys.readouterr().err
+    with Ledger(tmp_path / "paper.sqlite") as kept:
+        assert kept.counts() is not None  # still a ledger
 
 
 def test_live_command_needs_the_flag_for_real_money(tmp_path: Path) -> None:

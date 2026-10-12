@@ -126,6 +126,9 @@ def test_message_skips_comments_and_scissors() -> None:
     assert [f.where for f in gg.check_message(f"Title\n\nBody {SYLLABLE}")] == ["commit message:3"]
     # `git commit -m` keeps a leading `#` line, so the first paragraph is never a comment.
     assert [f.where for f in gg.check_message(f"#12 {SYLLABLE}")] == ["commit message:1"]
+    # Nor is a `#` line that text follows: `git commit -m Fix -m "# ..." -m more` keeps it.
+    later = f"Fix\n\n# {SYLLABLE}\nmore\n\n# template"
+    assert [f.where for f in gg.check_message(later)] == ["commit message:3"]
 
 
 # Integration tests against real temporary repositories.

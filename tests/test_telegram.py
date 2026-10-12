@@ -258,3 +258,23 @@ def test_a_refused_message_is_not_reported_as_sent() -> None:
             return await bot.send("x"), await bot.deliver("x")
 
     assert asyncio.run(run()) == (False, None)  # `tbot notify` must not say it was sent
+
+
+def test_alerts_follow_a_group_that_became_a_supergroup() -> None:
+    chats: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        chat = json.loads(request.content)["chat_id"]
+        chats.append(chat)
+        if chat == "-4001":
+            moved = {"migrate_to_chat_id": -1009876}
+            return httpx.Response(400, json={"ok": False, "parameters": moved})
+        return httpx.Response(200, json={"ok": True})
+
+    async def run() -> tuple[bool, bool, str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            bot = Telegram("token", "-4001", client)
+            return await bot.send("one"), await bot.send("two"), bot.chat_id
+
+    assert asyncio.run(run()) == (True, True, "-1009876")
+    assert chats == ["-4001", "-1009876", "-1009876"]

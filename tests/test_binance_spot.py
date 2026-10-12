@@ -85,7 +85,7 @@ def test_balances_orders_and_cancel() -> None:
 
     async def go(spot: BinanceSpot) -> tuple[dict[str, float], list[str], int, int]:
         before = {a: b.total for a, b in (await spot.balances()).items()}
-        stop = await spot.stop_loss_order("BTCUSDT", 0.2, 45000.0, 44900.0, "stop-1")
+        stop = await spot.stop_loss_order("BTCUSDT", 0.2, 45000.0, "stop-1")
         assert stop.status == "NEW"
         assert stop.stop_price == 45000.0
         open_ids = [o.client_order_id for o in await spot.open_orders("BTCUSDT")]
@@ -133,7 +133,7 @@ def test_load_rules_rejects_unknown_symbol() -> None:
         async with fake.client() as client:
             await BinanceSpot(client, "key", "secret").load_rules(["DOGEUSDT"])
 
-    with pytest.raises(BinanceError, match="unknown symbols"):
+    with pytest.raises(BinanceError, match="does not list DOGEUSDT"):
         asyncio.run(go())
 
 

@@ -197,18 +197,17 @@ def check_staged(cwd: Path | None = None) -> Iterator[Finding]:
 def check_message(text: str) -> Iterator[Finding]:
     """Scan a commit message, skipping git's comments and anything below the scissors line.
 
-    Git's own comments always follow a blank line, so a comment line in the first
-    paragraph is message text: `git commit -m "#12 ..."` keeps it.
+    Git's own comments are the block of `#` lines its editor template ends with, after
+    the first paragraph. Any other `#` line is message text: `git commit -m` keeps it.
     """
-    first_paragraph = True
-    for number, raw in enumerate(text.split("\n"), start=1):
-        line = raw.rstrip("\r")
-        if SCISSORS.match(line):
-            break
-        if not line.strip():
-            first_paragraph = False
-        if first_paragraph or not line.startswith("#"):
-            yield from scan_line(f"commit message:{number}", line)
+    lines = [raw.rstrip("\r") for raw in text.split("\n")]
+    lines = lines[: next((i for i, line in enumerate(lines) if SCISSORS.match(line)), len(lines))]
+    first = next((i for i, line in enumerate(lines) if not line.strip()), len(lines))
+    end = len(lines)
+    while end > first and (not lines[end - 1].strip() or lines[end - 1].startswith("#")):
+        end -= 1
+    for number, line in enumerate(lines[:end], start=1):
+        yield from scan_line(f"commit message:{number}", line)
 
 
 def check_commit(sha: str, cwd: Path | None = None) -> Iterator[Finding]:

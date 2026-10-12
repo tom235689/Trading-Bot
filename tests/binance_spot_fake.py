@@ -11,6 +11,8 @@ from urllib.parse import parse_qsl
 
 import httpx
 
+STOPS = ("STOP_LOSS", "STOP_LOSS_LIMIT")
+ASK_MULTIPLIER_DOWN = 0.8  # PERCENT_PRICE_BY_SIDE of BTCUSDT and most pairs
 DEFAULT_RULES: dict[str, dict[str, str]] = {
     "BTCUSDT": {"tick": "0.01", "step": "0.00001", "minQty": "0.00001", "minNotional": "5"},
     "ETHUSDT": {"tick": "0.01", "step": "0.0001", "minQty": "0.0001", "minNotional": "5"},
@@ -53,6 +55,8 @@ class FakeSpot:
     error_after_next_order: httpx.Response | None = None  # place it, then answer this
     next_id: int = 1000
     can_trade: bool = True
+    telegram_token: str = "t"
+    telegram_chat: str = "1"
     restrictions: dict[str, bool] = field(
         default_factory=lambda: {
             "ipRestrict": True,
@@ -71,11 +75,7 @@ class FakeSpot:
     def trigger_stop(self, symbol: str, at: datetime | None = None) -> None:
         """Fill the open stop order of a symbol at its stop price, as the exchange would."""
         for order in self.orders:
-            if (
-                order["symbol"] == symbol
-                and order["type"] == "STOP_LOSS_LIMIT"
-                and order["status"] == "NEW"
-            ):
+            if order["symbol"] == symbol and order["type"] in STOPS and order["status"] == "NEW":
                 qty, price = float(order["origQty"]), float(order["stopPrice"])
                 base, quote = symbol[:-4], symbol[-4:]
                 self.locked[base] -= qty
@@ -110,15 +110,17 @@ class FakeSpot:
         path = request.url.path
         if path == "/ping":  # a heartbeat monitor, as doctor pings it
             return httpx.Response(200)
+        if path.startswith("/bot"):  # Telegram, as doctor asks it
+            return self._telegram(path, dict(parse_qsl(request.url.query.decode())))
         params = dict(parse_qsl(request.url.query.decode()))
         if path == "/api/v3/time":
             return httpx.Response(200, json={"serverTime": int(time.time() * 1000)})
         if path == "/api/v3/exchangeInfo":
             symbols = json.loads(params["symbols"])
+            if any(s not in self.rules for s in symbols):  # one unknown fails the whole list
+                return _error(400, -1121, "Invalid symbol.")
             infos = [
-                symbol_info(s, self.rules[s], self.statuses.get(s, "TRADING"))
-                for s in symbols
-                if s in self.rules
+                symbol_info(s, self.rules[s], self.statuses.get(s, "TRADING")) for s in symbols
             ]
             return httpx.Response(200, json={"symbols": infos})
         if path == "/api/v3/ticker/bookTicker":
@@ -180,6 +182,14 @@ class FakeSpot:
             return httpx.Response(200, json=open_orders)
         return httpx.Response(404, json={"code": -1, "msg": f"unhandled {request.method} {path}"})
 
+    def _telegram(self, path: str, params: dict[str, str]) -> httpx.Response:
+        token, method = path[len("/bot") :].split("/", 1)
+        if token != self.telegram_token:
+            return httpx.Response(401, json={"ok": False, "description": "Unauthorized"})
+        if method == "getChat" and params.get("chat_id") != self.telegram_chat:
+            return httpx.Response(400, json={"ok": False, "description": "chat not found"})
+        return httpx.Response(200, json={"ok": True, "result": {"username": "tbot_bot"}})
+
     def _check_signature(
         self, request: httpx.Request, params: dict[str, str]
     ) -> httpx.Response | None:
@@ -230,6 +240,9 @@ class FakeSpot:
         step = float(rules["step"])
         if abs(round(qty / step) * step - qty) > step * 1e-6:
             return _error(400, -1013, "Filter failure: LOT_SIZE")
+        limit = float(params.get("price", 0))
+        if limit and side == "SELL" and limit < self.prices[symbol] * ASK_MULTIPLIER_DOWN:
+            return _error(400, -1013, "Filter failure: PERCENT_PRICE_BY_SIDE")
         order: dict[str, Any] = {
             "symbol": symbol,
             "orderId": self.next_id,
@@ -245,7 +258,7 @@ class FakeSpot:
             "fills": [],
         }
         self.next_id += 1
-        if kind == "STOP_LOSS_LIMIT":
+        if kind in STOPS:
             if self.balances.get(base, 0.0) < qty:
                 return _error(400, -2010, "Account has insufficient balance for requested action.")
             self.balances[base] -= qty

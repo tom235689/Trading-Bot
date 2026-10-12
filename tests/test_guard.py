@@ -16,10 +16,12 @@ def test_normal_then_reduce_only_on_daily_loss() -> None:
     decision = guard.check(T0 + timedelta(hours=8), 965.0, T0 + timedelta(hours=8))
     assert decision.mode == Mode.REDUCE_ONLY
     assert "day loss -3.5%" in decision.reason
-    # A new day resets the reference.
+    # A new day resets the reference, after its first event judged the day that ended.
     next_day = T0 + timedelta(days=1)
-    assert guard.check(next_day, 965.0, next_day).mode == Mode.NORMAL
+    assert guard.check(next_day, 965.0, next_day).mode == Mode.REDUCE_ONLY
     assert guard.state.day_open_equity == 965.0
+    later = next_day + timedelta(hours=4)
+    assert guard.check(later, 965.0, later).mode == Mode.NORMAL
 
 
 def test_drawdown_halts_and_persists_until_resumed() -> None:
@@ -87,3 +89,24 @@ def test_a_transfer_in_a_drawdown_keeps_the_drawdown() -> None:
     guard.shift(-400.0, 999.45)  # the owner takes 400 out
     assert guard.check(now, 599.45, now).mode == Mode.NORMAL  # still 33% down, not 45.5%
     assert guard.state.peak_equity == pytest.approx(1500.0 * 599.45 / 999.45)
+
+
+def test_a_book_emptied_by_a_transfer_checks_without_dividing_by_zero() -> None:
+    now = datetime(2024, 1, 1, 8, tzinfo=UTC)
+    guard = RiskGuard(GuardConfig(), GuardState(day=now.date()))  # peak and day open 0
+    assert guard.check(now, -100.0, now).mode == Mode.NORMAL
+    guard.resume()
+    assert guard.check(now, -100.0, now).mode == Mode.NORMAL
+
+
+def test_the_bar_that_closes_at_midnight_counts_for_the_day_it_ends() -> None:
+    day = datetime(2024, 1, 1, tzinfo=UTC)
+    guard = RiskGuard(GuardConfig(daily_loss_limit=0.03, max_drawdown=0.5))
+    assert guard.check(day, 1000.0, day).mode == Mode.NORMAL
+    nextday = day + timedelta(days=1)  # a 1d bar closes: down 10% over its day
+    decision = guard.check(nextday, 900.0, nextday)
+    assert (decision.mode, decision.reason) == (Mode.REDUCE_ONLY, "day loss -10.0% beyond 3%")
+    later = nextday + timedelta(hours=4)  # the new day opened at 900
+    assert guard.check(later, 900.0, later).mode == Mode.NORMAL
+    gone = later + timedelta(days=3)  # days without events: no day before to judge
+    assert guard.check(gone, 800.0, gone).mode == Mode.NORMAL

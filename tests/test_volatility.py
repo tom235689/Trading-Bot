@@ -1,7 +1,9 @@
 import math
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from factories import Scripted, price_bars
 from tbot.backtest.engine import BacktestEngine
@@ -133,3 +135,25 @@ def test_session_matches_engine_with_targeting() -> None:
     assert [f.quantity for f in portfolio.fills] == pytest.approx(
         expected.fills["quantity"].to_list()
     )
+
+
+def test_a_volatility_window_too_short_to_measure_is_refused() -> None:
+    strategy: dict[str, Any] = {"name": "donchian_trend", "symbols": ["BTCUSDT"]}
+    strategy.update(timeframe="1d", allocation=1.0)
+    risk = {"target_volatility": 0.4, "volatility_lookback_days": 5}
+    with pytest.raises(ValidationError, match=r"gives 5 bars of 1d; .* set it to 10 or more"):
+        TradingConfig.model_validate({"strategies": [strategy], "risk": risk})
+    TradingConfig.model_validate(
+        {"strategies": [strategy], "risk": {**risk, "volatility_lookback_days": 10}}
+    )
+    TradingConfig.model_validate(
+        {"strategies": [strategy], "risk": {**risk, "target_volatility": 0}}
+    )
+
+
+def test_an_infinite_budget_is_refused() -> None:
+    strategy = {"name": "donchian_trend", "symbols": ["BTCUSDT"], "timeframe": "4h"}
+    with pytest.raises(ValidationError, match="finite number"):
+        TradingConfig.model_validate(
+            {"initial_cash": "inf", "strategies": [{**strategy, "allocation": 1.0}]}
+        )

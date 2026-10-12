@@ -577,3 +577,23 @@ def test_a_failing_report_loses_no_bar(tmp_path: Path) -> None:
         await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(watch())
+
+
+def test_a_socket_that_goes_silent_is_replaced(tmp_path: Path) -> None:
+    feed, _, _ = make_feed(tmp_path, [BTC1], now=at(4.5))
+    feed.last[BTC1] = at(3)
+    feed.silence = 0.05
+    connect, urls = fake_connector([[], [kline_message(BTC1, at(4), closed=True)]])
+    feed.connector = connect  # type: ignore[assignment]
+
+    async def run() -> datetime:
+        task = asyncio.create_task(feed.run_websocket())
+        _, bar = await asyncio.wait_for(feed.queue.get(), 5)  # from the second socket
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        opened: datetime = bar["open_time"][0]
+        return opened
+
+    assert asyncio.run(run()) == at(4)
+    assert len(urls) >= 2
+    assert feed.reconnects >= 1

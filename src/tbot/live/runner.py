@@ -1,6 +1,7 @@
 """Paper, testnet, and live sessions: one event loop, different executors."""
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -66,6 +67,9 @@ BASE_META = "base_cash"  # what the book started with
 SUPERVISED_ENV = "TBOT_SUPERVISED"  # set by scripts/run_bot.ps1
 BUDGET_NOTE = "initial_cash changed"  # adjustments that book a changed budget
 OWED_META = "budget_owed"  # what a lowered budget took beyond the book's cash (<= 0)
+# The book's value after the last transfer, with the equity snapshot it follows.
+MOVED_META = "equity_after_transfer"
+HEARTBEAT_URL_HINT = "TBOT_HEARTBEAT_URL must be a full http(s):// URL"
 MODE_META = "mode"  # paper, testnet, or live: what the book is
 EXIT_REFUSED = 4  # as the command line's config error: the supervisor gives up
 KEYS_MISSING = (
@@ -273,8 +277,13 @@ def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard, now: d
             ledger.set_meta(BASE_META, stored if stored is not None else repr(config.initial_cash))
         if stored is not None and float(stored) != config.initial_cash:
             change = config.initial_cash - float(stored)
-            point = ledger.latest_equity()  # the book's value as last seen
-            equity = point.equity if point is not None else restore_portfolio(config, ledger).cash
+            equity = book_equity(config, ledger)
+            if equity + change < 0:
+                raise StartRefused(
+                    f"initial_cash {config.initial_cash:,.2f} takes {-change:,.2f} out of a "
+                    f"book worth {equity:,.2f}; the lowest it can be now is "
+                    f"{float(stored) - equity:,.2f}"
+                )
             # What a cut may leave owing is known once orders in doubt are settled, at the
             # first reconciliation; until then the whole cut counts (note_repaid).
             owed = min(0.0, budget_owed(ledger) + change)
@@ -283,8 +292,29 @@ def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard, now: d
             ledger.set_meta(OWED_META, repr(owed))
             guard.shift(change, equity)
             ledger.set_meta(GUARD_META, guard.state.model_dump_json())
+            note_transfer(ledger, equity + change)
             ledger.add_event(now, "warning", f"{note}; booked as a transfer")
         ledger.set_meta(BUDGET_META, repr(config.initial_cash))
+
+
+def book_equity(config: SessionConfig, ledger: Ledger) -> float:
+    """The book's value as last known: the last bar event's, unless a transfer came after."""
+    raw = ledger.get_meta(MOVED_META)
+    if raw is not None:
+        rows, equity = json.loads(raw)
+        if rows == ledger.equity_rows():
+            return float(equity)
+    point = ledger.latest_equity()
+    if point is not None:
+        return point.equity
+    last = {fill.symbol: fill.price for fill in ledger.fills()}  # no bar event valued it yet
+    book = restore_portfolio(config, ledger)
+    return book.cash + sum(qty * last.get(s, 0.0) for s, qty in book.positions.items())
+
+
+def note_transfer(ledger: Ledger, equity: float) -> None:
+    """Remember the book's value after a transfer, until the next bar event values it."""
+    ledger.set_meta(MOVED_META, json.dumps([ledger.equity_rows(), equity]))
 
 
 def price_at(config: TradingConfig, store: BarStore, symbol: str, moment: datetime) -> float:
@@ -406,7 +436,8 @@ def build_session(
     for key, count in lookback.items():
         frames[key] = bars_since(store, key, count, until)
         if frames[key].height < count // WARMUP_MARGIN:
-            raise ValueError(f"not enough stored bars for {key[0]} {key[1]}; run `tbot download`")
+            hint = store.download_hint([key])
+            raise ValueError(f"not enough stored bars for {key[0]} {key[1]}; run {hint}")
     histories = {
         key: BarHistory(key[1], max_bars=max(MAX_BARS, count)) for key, count in lookback.items()
     }
@@ -610,9 +641,12 @@ def mode_problem(config: SessionConfig, ledger: Ledger) -> str:
     mode, kept = session_mode(config), ledger_mode(ledger)
     if kept is None or kept == mode:
         return ""
+    named = Path("data") / f"{mode}.sqlite"
+    if named.resolve() == config.ledger.resolve():  # that is the one taken
+        named = named.with_name(f"{mode}-2.sqlite")
     return (
         f"{config.ledger} keeps a {kept} book, not a {mode} one: give this config a ledger "
-        f"of its own (`ledger: data/{mode}.sqlite` or a new file)"
+        f"of its own (`ledger: {named.as_posix()}` or another new file)"
     )
 
 
@@ -632,7 +666,8 @@ def take_stop_request(ledger: Path) -> bool:
         age = time.time() - path.stat().st_mtime
     except FileNotFoundError:
         return False
-    path.unlink(missing_ok=True)
+    with contextlib.suppress(PermissionError):  # held open by `tbot stop` or a scanner
+        path.unlink(missing_ok=True)
     return age < STOP_REQUEST_SECONDS
 
 
@@ -652,7 +687,11 @@ def is_running(ledger: Path, wait: float = 0.0) -> bool:
 async def watch_stop_request(path: Path, stop: asyncio.Event) -> None:
     while not stop.is_set():
         if path.exists():
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except PermissionError:  # Windows: still open in another process; next poll
+                await asyncio.sleep(STOP_POLL_SECONDS)
+                continue
             log.info("stop_requested")
             stop.set()
             return
@@ -940,7 +979,9 @@ async def _trade(
             tasks.append(asyncio.create_task(commands, name="commands"))
         elif config.telegram_commands and (settings.telegram_token or settings.telegram_chat_id):
             log.warning("telegram_commands_off", hint="set both TBOT_TELEGRAM_TOKEN and _CHAT_ID")
-        if settings.heartbeat_url and valid_url(settings.heartbeat_url):
+        if settings.heartbeat_url and not valid_url(settings.heartbeat_url):
+            log.warning("heartbeat_url_invalid", hint=HEARTBEAT_URL_HINT)
+        elif settings.heartbeat_url:
             spot = getattr(executor, "spot", None)
 
             def problem() -> str:
@@ -995,12 +1036,7 @@ def valid_url(url: str) -> bool:
         parsed = httpx.URL(url)
     except httpx.InvalidURL:
         parsed = None
-    if parsed is None or parsed.scheme not in ("http", "https") or not parsed.host:
-        log.warning(
-            "heartbeat_url_invalid", hint="TBOT_HEARTBEAT_URL must be a full http(s):// URL"
-        )
-        return False
-    return True
+    return parsed is not None and parsed.scheme in ("http", "https") and bool(parsed.host)
 
 
 async def run_paper(
@@ -1069,8 +1105,10 @@ async def reconcile_round(
         # Money moved from outside: not a profit or loss for the guard.
         moved = sum(a.cash + a.quantity * marks.get(a.symbol, 0.0) for a in adjustments)
         adopt_resume(guard, ledger)
-        guard.shift(moved, portfolio.equity(marks))  # the book is adjusted after this
+        equity = portfolio.equity(marks)  # the book is adjusted after this
+        guard.shift(moved, equity)
         ledger.set_meta(GUARD_META, guard.state.model_dump_json())
+        note_transfer(ledger, equity + moved)
 
     adjustments = await reconcile(
         spot,
