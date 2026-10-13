@@ -28,8 +28,9 @@ Batch = dict[StreamKey, pl.DataFrame]
 log = structlog.get_logger(__name__)
 FETCH_ERRORS = (httpx.HTTPError, LookupError, ValueError, OSError)  # REST failures, retried
 HEALTHY_SECONDS = 60.0  # a socket open this long resets the reconnect backoff
-# Binance pushes every kline stream about every 2 s: a socket silent this long has
-# stalled while still answering pings, and is replaced.
+# Binance pushes a kline stream with every trade, about every 2 s on busy pairs. A socket
+# silent this long across a bar close has stalled while still answering pings, and is
+# replaced; quiet pairs may send nothing for minutes between closes.
 SILENCE_SECONDS = 120.0
 
 
@@ -188,14 +189,7 @@ class LiveFeed:
                 async with self.connector(url) as messages:
                     log.info("websocket_connected", streams=len(self.keys))
                     await self._catch_up_or_log()
-                    while True:
-                        try:
-                            message = await asyncio.wait_for(anext(messages), self.silence)
-                        except StopAsyncIteration:
-                            break
-                        kline = binance_ws.parse_kline(message)
-                        if kline is not None and kline.closed and kline.key in self.last:
-                            await self._on_socket_bar(kline.key, kline.bar)
+                    await self._read(messages)
                 error = "closed by the server"  # a clean close: reconnect as after an error
             except asyncio.CancelledError:
                 raise
@@ -209,6 +203,37 @@ class LiveFeed:
             log.warning("websocket_error", error=error, retry_in=backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
+
+    async def _read(self, messages: AsyncIterator[str | bytes]) -> None:
+        """Handle messages until the server closes; raise TimeoutError on a stall."""
+        heard = self.clock()
+        pending: asyncio.Future[str | bytes] | None = None
+        try:
+            while True:
+                if pending is None:  # kept across a silence: cancelling ends the stream
+                    pending = asyncio.ensure_future(anext(messages))
+                done, _ = await asyncio.wait({pending}, timeout=self.silence)
+                if not done:
+                    if self._closed_since(heard):
+                        raise TimeoutError
+                    continue  # a quiet pair: no trades, no messages
+                received, pending = pending, None
+                try:
+                    message = received.result()
+                except StopAsyncIteration:
+                    return
+                heard = self.clock()
+                kline = binance_ws.parse_kline(message)
+                if kline is not None and kline.closed and kline.key in self.last:
+                    await self._on_socket_bar(kline.key, kline.bar)
+        finally:
+            if pending is not None:
+                pending.cancel()
+
+    def _closed_since(self, heard: datetime) -> bool:
+        """Whether a bar closed since the socket last spoke: it sends every close."""
+        now = self.clock() - CLOSE_GRACE
+        return any(key[1].floor(now) > heard for key in self.keys)
 
     async def _on_socket_bar(self, key: StreamKey, bar: pl.DataFrame) -> None:
         """Emit a socket bar only if it follows the last one; a gap is filled via REST first.

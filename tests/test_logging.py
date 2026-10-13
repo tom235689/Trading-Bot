@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 
 import pytest
@@ -72,4 +73,33 @@ def test_a_log_another_process_holds_open_keeps_its_records(tmp_path: Path) -> N
     for index in range(5):
         assert f"held {index} " in text
     assert "after " in path.read_text(encoding="utf-8")
+    assert not list(tmp_path.glob("*.rotating"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows refuses renaming an open file")
+def test_a_backup_held_open_during_a_rotation_loses_no_records(tmp_path: Path) -> None:
+    path = tmp_path / "bot.jsonl"
+    handler = RetryingRotatingFileHandler(path, maxBytes=300, backupCount=5, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    errors: list[str] = []
+    handler.handleError = lambda record: errors.append(record.getMessage())  # type: ignore[method-assign]
+
+    def write(text: str) -> None:
+        handler.emit(logging.makeLogRecord({"msg": text + " " + "x" * 60}))
+
+    try:
+        for index in range(5):
+            write(f"first-{index}")  # the fifth rotates: bot.jsonl.1
+        for index in range(1, 4):
+            write(f"second-{index}")
+        with (tmp_path / "bot.jsonl.1").open("rb"):  # a reader holds the backup
+            write("third-0")  # base moved aside, then .1 -> .2 refused
+        handler.retry_at = 0.0  # a minute later
+        for index in range(6):
+            write(f"fourth-{index}")
+    finally:
+        handler.close()
+    text = "".join(p.read_text(encoding="utf-8") for p in tmp_path.glob("bot.jsonl*"))
+    assert errors == []
+    assert all(f"second-{index} " in text for index in range(1, 4))
     assert not list(tmp_path.glob("*.rotating"))

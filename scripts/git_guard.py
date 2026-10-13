@@ -14,6 +14,7 @@ import io
 import re
 import subprocess
 import sys
+import zipfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -53,6 +54,10 @@ SECRETS = {
         r"hc-ping\.com/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
         r"|[A-Za-z0-9_-]{22}/)"
         r"|/api/push/(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{8,}"
+        r"|/api/v1/heartbeat/(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{16,}"
+        # Any monitor: a heartbeat URL set to one ending in a token of letters and digits.
+        r"|(?i:heartbeat_?url)\s*[=:]\s*[\"']?https?://\S*/"
+        r"(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{10,}"
     ),
     "api key": re.compile(
         r"(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*\d)"
@@ -65,6 +70,8 @@ SECRETS = {
 }
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+ZIP_MEMBERS = 1000  # files of an archive scanned
+ZIP_MEMBER_BYTES = 50_000_000
 ASCII_RUN = re.compile(rb"[\x20-\x7e]{16,}")  # the strings in a binary file
 SCISSORS = re.compile(r"^# -+ >8 -+$")
 
@@ -94,7 +101,13 @@ def scan_text(where: str, text: str) -> Iterator[Finding]:
 def blob_text(data: bytes) -> str | None:
     """The text of a file git treats as binary, when it is UTF-16 (PowerShell 5.1 writes
     it with `>` and Out-File); None for other binary files."""
-    for bom, codec in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+    marks = (
+        (b"\xff\xfe\x00\x00", "utf-32-le"),  # before UTF-16-LE, whose mark starts it
+        (b"\x00\x00\xfe\xff", "utf-32-be"),
+        (b"\xff\xfe", "utf-16-le"),
+        (b"\xfe\xff", "utf-16-be"),
+    )
+    for bom, codec in marks:
         if data.startswith(bom):
             return data[len(bom) :].decode(codec, errors="replace")
     if len(data) >= 2 and data[1::2].count(0) > len(data) // 4:  # ASCII as UTF-16-LE
@@ -105,8 +118,28 @@ def blob_text(data: bytes) -> str | None:
     return None
 
 
-def scan_blob(where: str, data: bytes) -> Iterator[Finding]:
-    """Scan a file a diff shows only as "Binary files differ"."""
+def scan_blob(where: str, data: bytes, depth: int = 0) -> Iterator[Finding]:
+    """Scan a file a diff shows only as "Binary files differ". A zip file (also docx, xlsx)
+    is opened: compression hides its text from a scan of the bytes."""
+    if data.startswith(b"PK\x03\x04") and depth < 2:
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                members = [m for m in archive.infolist() if not m.is_dir()]
+                for member in members[:ZIP_MEMBERS]:
+                    inside = f"{where}!{member.filename}"
+                    yield from scan_paths([member.filename], f"{where}!")
+                    if member.file_size > ZIP_MEMBER_BYTES:
+                        continue
+                    content = archive.read(member)
+                    try:
+                        member_text = content.decode("utf-8")
+                    except UnicodeDecodeError:
+                        yield from scan_blob(inside, content, depth + 1)
+                    else:
+                        yield from scan_text(inside, member_text)
+            return
+        except (zipfile.BadZipFile, NotImplementedError, RuntimeError):
+            pass  # not readable as a zip: scanned as bytes below
     text = blob_text(data)
     if text is not None:
         yield from scan_text(where, text)
@@ -198,7 +231,9 @@ def check_message(text: str) -> Iterator[Finding]:
     """Scan a commit message, skipping git's comments and anything below the scissors line.
 
     Git's own comments are the block of `#` lines its editor template ends with, after
-    the first paragraph. Any other `#` line is message text: `git commit -m` keeps it.
+    the first paragraph: that closing block is skipped, every other `#` line is checked.
+    A closing `#` paragraph that `git commit -m` kept is caught by the pre-push check,
+    which reads the stored message whole.
     """
     lines = [raw.rstrip("\r") for raw in text.split("\n")]
     lines = lines[: next((i for i, line in enumerate(lines) if SCISSORS.match(line)), len(lines))]

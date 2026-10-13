@@ -1326,6 +1326,11 @@ def test_a_budget_change_after_a_withdrawal_scales_from_what_is_left(tmp_path: P
         )
         lower = config.model_copy(update={"initial_cash": 700.0})  # then a restart: -300
         check_budget(lower, ledger, guard, T0)
+        assert guard.state.peak_equity == pytest.approx(600.0)  # rescaled once settled
+        portfolio.adjust("", 0.0, -300.0)  # the restored book has the cut
+        await reconcile_round(
+            executor, portfolio, MARKS, ledger, notifier, guard, lower, lambda: T0
+        )
         return guard
 
     guard = run(fake, tmp_path, action, stop_pct=0.0)

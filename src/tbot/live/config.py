@@ -1,9 +1,14 @@
 """Paper and live session configuration (YAML) and secrets (environment)."""
 
+import contextlib
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tbot.core.config import TradingConfig, load_yaml
@@ -63,6 +68,25 @@ class Settings(BaseSettings):
     heartbeat_url: str | None = None
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
+    # Testnet keys of their own, so a testnet session keeps running once the main pair is
+    # a live key; without them testnet uses the main pair.
+    binance_testnet_api_key: str | None = None
+    binance_testnet_api_secret: str | None = None
+
+    def api_keys(self, mode: str) -> tuple[str, str] | None:
+        """The key and secret for a testnet or live session, or None when not set."""
+        if mode == "testnet" and self.binance_testnet_api_key and self.binance_testnet_api_secret:
+            return self.binance_testnet_api_key, self.binance_testnet_api_secret
+        if self.binance_api_key and self.binance_api_secret:
+            return self.binance_api_key, self.binance_api_secret
+        return None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def strip(cls, value: Any) -> Any:
+        """A quoted value keeps its spaces, and a key with one fails in an HTTP header
+        whose error text would carry the key into logs."""
+        return value.strip() if isinstance(value, str) else value
 
 
 def save_settings(path: Path, values: dict[str, str]) -> None:
@@ -84,4 +108,62 @@ def save_settings(path: Path, values: dict[str, str]) -> None:
             lines.append(line)
     partial = path.with_name(path.name + ".partial")
     partial.write_bytes((newline.join(lines) + newline).encode("utf-8"))
-    partial.replace(path)
+    replace_keeping_access(partial, path)
+
+
+def replace_keeping_access(source: Path, target: Path) -> None:
+    """Put source in place of target in one step. Target's access rights stay (an
+    owner-only .env stays so); a new file is readable by its owner only."""
+    if sys.platform == "win32":
+        import ctypes
+
+        if target.exists():
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            if kernel32.ReplaceFileW(str(target), str(source), None, 0, None, None):
+                return  # keeps the target's security settings
+            source.replace(target)
+            return
+        source.replace(target)
+        user = os.environ.get("USERNAME", "")
+        if user:  # inherited rights of the folder: often every account on the PC
+            domain = os.environ.get("USERDOMAIN", "")
+            owner = f"{domain}\\{user}" if domain else user
+            with contextlib.suppress(OSError):
+                subprocess.run(
+                    ["icacls", str(target), "/inheritance:r", "/grant:r", f"{owner}:F"],
+                    capture_output=True,
+                    check=False,
+                )
+        return
+    if target.exists():
+        shutil.copymode(target, source)
+    else:
+        os.chmod(source, 0o600)
+    source.replace(target)
+
+
+BROAD_SIDS = {"S-1-1-0": "Everyone", "S-1-5-11": "Authenticated Users", "S-1-5-32-545": "Users"}
+
+
+def env_readers(path: Path) -> list[str]:
+    """Groups of other accounts that can read this file, or [] (also when unknown)."""
+    if sys.platform != "win32":
+        return ["other accounts"] if path.stat().st_mode & 0o077 else []
+    literal = str(path.resolve()).replace("'", "''")
+    script = (
+        f"(Get-Acl -LiteralPath '{literal}').Access | "
+        "Where-Object { $_.AccessControlType -eq 'Allow' } | ForEach-Object { try { "
+        "$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value "
+        "} catch { } }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return sorted({BROAD_SIDS[sid] for sid in result.stdout.split() if sid in BROAD_SIDS})

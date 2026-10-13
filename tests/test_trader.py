@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -257,3 +258,14 @@ def test_a_stop_request_still_open_elsewhere_is_taken_once_closed(
 
     assert asyncio.run(go())
     assert not path.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows cannot delete an open file")
+def test_a_stop_request_open_elsewhere_still_stops_a_start(tmp_path: Path) -> None:
+    from tbot.live.runner import take_stop_request
+
+    ledger = tmp_path / "paper.sqlite"
+    with stop_path(ledger).open("w", encoding="utf-8") as handle:
+        handle.write("stop\n")
+        handle.flush()
+        assert take_stop_request(ledger)  # obeyed, though it cannot be removed yet

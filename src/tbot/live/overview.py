@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from tbot.core.text import clock_text
 from tbot.data.store import BarStore
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Ledger
@@ -69,7 +70,7 @@ def _row(
     point = ledger.latest_equity()
     if point is None:
         timeframe, first = next_close(config, datetime.now(UTC))
-        waiting = f"no bar event yet (the next {timeframe} close is {first:%H:%M} UTC)"
+        waiting = f"no bar event yet (the next {timeframe} close is {clock_text(first)})"
         return SessionRow(name, state, notes=(*notes, waiting))
     # Deposits, withdrawals, and budget changes are money put in, not profit.
     flows = [

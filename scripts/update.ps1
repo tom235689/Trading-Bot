@@ -177,7 +177,11 @@ try {
             Invoke-Checked $uv @("sync", "--frozen")
             if ($stashed) {
                 & git stash pop --quiet
-                if ($LASTEXITCODE -ne 0) { throw "the update changes the same lines as your local changes" }
+                if ($LASTEXITCODE -ne 0) {
+                    throw ("the update changes the same lines as your local changes; nothing was " +
+                        "changed. To take it: note your edits (git diff), undo them with 'git checkout " +
+                        "-- <file>', run tbot update, then make them again in the updated file")
+                }
                 $stashed = $false
             }
         } catch {

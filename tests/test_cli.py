@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from datetime import UTC, date, datetime, timedelta
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
+import polars as pl
 import pytest
 import yaml
 from pydantic import ValidationError
@@ -18,7 +20,7 @@ from pydantic import ValidationError
 from binance_fake import make_bars
 from factories import price_bars
 from tbot import __version__
-from tbot.backtest.config import BacktestConfig
+from tbot.backtest.config import BacktestConfig, load_config
 from tbot.cli import (
     COMMANDS,
     EXIT_CONFIG,
@@ -136,7 +138,9 @@ def test_errors_end_in_one_line(tmp_path: Path, capsys: pytest.CaptureFixture[st
     empty = str(tmp_path / "empty")
     assert main(["backtest", "config/donchian_voltarget.yaml", "--data-dir", empty]) == EXIT_ERROR
     err = capsys.readouterr().err
-    assert err.startswith("error: no stored bars for BTCUSDT 4h; run `tbot download --symbols")
+    *progress, error = err.splitlines()
+    assert progress == ["running the backtest..."]
+    assert error.startswith("error: no stored bars for BTCUSDT 4h; run `tbot download --symbols")
     assert f'--data-dir "{empty}"`' in err  # the store it looked in
     assert "Traceback" not in err
 
@@ -429,13 +433,14 @@ class FakeTelegram:
         monkeypatch.setattr("tbot.cli.Telegram.send", send)
 
 
-CODE = "tb482913"
+CODE = "tb4f8a2e91"
 
 
-def message(chat: int, name: str, text: str = "hi") -> dict[str, Any]:
+def message(chat: int, name: str, text: str = "hi", age: float = 0.0) -> dict[str, Any]:
+    sent = datetime.now(UTC).timestamp() - age
     return {
         "update_id": chat,
-        "message": {"chat": {"id": chat, "first_name": name}, "text": text},
+        "message": {"chat": {"id": chat, "first_name": name}, "text": text, "date": int(sent)},
     }
 
 
@@ -455,9 +460,16 @@ def no_telegram(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_notify_guides_a_first_setup_and_saves_it(
     no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A stranger wrote to the bot first; only the chat that sends the code gets the alerts.
+    # A stranger wrote to the bot before (the backlog, skipped), and sends text holding
+    # the code and an old message; only the chat that sends the code gets the alerts.
     telegram = FakeTelegram(
-        monkeypatch, [[message(7, "Stranger")], [], [message(42, "Tom", f" {CODE} ")]]
+        monkeypatch,
+        [
+            [message(7, "Stranger", CODE)],
+            [message(8, "Stranger", f"all codes {CODE} tb000001")],
+            [message(9, "Stranger", CODE, age=3600)],
+            [message(42, "Tom", f" {CODE} ")],
+        ],
     )
     monkeypatch.setattr("builtins.input", lambda prompt="": "  123:abc  ")
     monkeypatch.setattr("tbot.cli.interactive", lambda: True)
@@ -1118,3 +1130,164 @@ def test_streams_of_different_timeframes_end_apart_without_a_note(
     store.write("BTCUSDT", Timeframe.H1, price_bars(start, Timeframe.H1, flat * 2, flat * 2))
     print_notes(config, store)  # now the 4h stream is far behind
     assert "BTCUSDT 4h data ends" in capsys.readouterr().out
+
+
+def test_a_session_that_dies_outside_its_own_alerts_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    sent: list[str] = []
+    monkeypatch.setattr("tbot.cli._alert", sent.append)
+
+    def unwritable(*args: object, **kwargs: object) -> int:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr("tbot.cli.run_paper", unwritable)
+    monkeypatch.setattr("tbot.cli.configure_logging", lambda *args, **kwargs: None)
+    assert main(["paper", "paper"]) == EXIT_ERROR
+    assert sent == ["tbot stopped: error: database or disk is full"]
+
+
+def test_a_support_report_holds_no_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    key = "A1b2" * 16  # 64 characters, as a Binance key
+    token = "123456789:" + "x" * 35
+    monkeypatch.setenv("TBOT_BINANCE_API_KEY", key)
+    monkeypatch.setenv("TBOT_TELEGRAM_TOKEN", token)
+    monkeypatch.setenv("TBOT_HEARTBEAT_URL", "https://hc-ping.com/abc123def456")
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    other = "Z9y8" * 16  # a key that is in no setting: caught by its shape
+    event = f"oops {key} {token} {other}"
+    leaked = {"timestamp": "2026-10-13T00:00:00Z", "level": "error", "event": event}
+    (logs / "paper.jsonl").write_text(json.dumps(leaked) + "\n", encoding="utf-8")
+    out = tmp_path / "report.txt"
+    assert main(["support", "--out", str(out)]) == 0
+    text = out.read_text(encoding="utf-8")
+    assert "TBOT_BINANCE_API_KEY" in text  # which settings are set, never their values
+    assert key not in text
+    assert token not in text
+    assert "hc-ping.com/abc123" not in text
+    assert other not in text
+    assert "oops [secret] [secret] [secret]" in text
+    assert "== doctor --offline" in text
+    assert main(["support", "--out", str(out)]) == EXIT_CONFIG  # never over a file
+
+
+def test_a_config_of_another_kind_that_does_not_load_says_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    check = "backtest: missing.yaml\nholdout_start: 2025-01-01\ngrid: {entry: [20]}\n"
+    (tmp_path / "config" / "check.yaml").write_text(check, "utf-8")
+    assert main(["backtest", "check"]) == EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "is a validation config: run it with `tbot validate check`, but it does not" in err
+    assert "did you mean backtest?" not in err
+
+
+def test_a_stream_short_of_its_own_bars_is_named_beside_a_coarser_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = BarStore(tmp_path)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    flat = [100.0] * 2400
+    store.write("BTCUSDT", Timeframe.H1, price_bars(start, Timeframe.H1, flat, flat))
+    store.write("ETHUSDT", Timeframe.H1, price_bars(start, Timeframe.H1, flat[:-20], flat[:-20]))
+    store.write("BTCUSDT", Timeframe.D1, price_bars(start, Timeframe.D1, flat[:100], flat[:100]))
+    hourly = {"name": "donchian_trend", "symbols": ["BTCUSDT", "ETHUSDT"], "timeframe": "1h"}
+    daily = {"name": "donchian_trend", "symbols": ["BTCUSDT"], "timeframe": "1d"}
+    config = BacktestConfig.model_validate(
+        {
+            "start": "2024-01-20",
+            "strategies": [{**hourly, "allocation": 0.5}, {**daily, "allocation": 0.5}],
+        }
+    )
+    print_notes(config, store)  # ETH 1h ends 20 hours early; the 1d stream must not hide it
+    assert "ETHUSDT 1h data ends" in capsys.readouterr().out
+
+
+def test_a_page_named_wrongly_fails_before_the_backtest_runs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = BarStore(tmp_path)
+    flat = [100.0] * 600
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    store.write("BTCUSDT", Timeframe.H4, price_bars(start, Timeframe.H4, flat, flat))
+    store.write("ETHUSDT", Timeframe.H4, price_bars(start, Timeframe.H4, flat, flat))
+    args = ["backtest", "donchian_trend", "--data-dir", str(tmp_path), "--html", "out.txt"]
+    assert main(args) == EXIT_CONFIG
+    assert "the page is HTML" in capsys.readouterr().err
+    assert not (tmp_path / "trials.jsonl").exists()  # nothing ran, nothing was logged
+
+
+def test_minutes_in_capitals_are_minutes() -> None:
+    assert parse_timeframe("15M") == Timeframe.M15
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_timeframe("1M")
+
+
+def test_a_backtest_on_history_never_downloaded_is_refused(tmp_path: Path) -> None:
+    store = BarStore(tmp_path)
+    recent = datetime(2026, 8, 7, tzinfo=UTC)  # what a session start fetched, no more
+    flat = [100.0] * 400
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        store.write(symbol, Timeframe.H4, price_bars(recent, Timeframe.H4, flat, flat))
+    config = load_config(Path("config/donchian_trend.yaml"))  # from 2018
+    with pytest.raises(ValueError, match="the stored bars start 2026-08-07, long after"):
+        check_period(config, store)
+
+
+def test_check_names_short_gaps_as_normal_and_missing_defaults_as_not_downloaded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = BarStore(tmp_path)
+    bars = make_bars(datetime(2024, 1, 1, tzinfo=UTC), 100, Timeframe.H1)
+    store.write(
+        "BTCUSDT", Timeframe.H1, bars.filter(~pl.col("open_time").is_in(bars["open_time"][10:13]))
+    )
+    assert main(["check", "--data-dir", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "gaps: 1 (3 missing bars); 1 shorter than a day: exchange pauses, normal" in out
+    assert "ETHUSDT 4h: not downloaded" in out
+    assert main(["check", "--data-dir", str(tmp_path), "--symbols", "ETHUSDT"]) == 1
+
+
+def test_a_never_started_live_config_does_not_point_at_starting_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    real = f"mode: live\nledger: live.sqlite\nstrategies:\n{STRATEGY}"
+    (tmp_path / "config" / "real.yaml").write_text(real, "utf-8")
+    assert main(["status", "real"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "real money: read README, Before real money, then `tbot doctor real`" in err
+    assert "--live" not in err
+
+
+def test_testnet_keys_of_their_own_come_first_for_testnet() -> None:
+    both = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        binance_api_key="live-key",
+        binance_api_secret="live-secret",
+        binance_testnet_api_key="test-key",
+        binance_testnet_api_secret="test-secret",
+    )
+    assert both.api_keys("testnet") == ("test-key", "test-secret")
+    assert both.api_keys("live") == ("live-key", "live-secret")
+    main_only = Settings(  # type: ignore[call-arg]
+        _env_file=None, binance_api_key="k", binance_api_secret="s"
+    )
+    assert main_only.api_keys("testnet") == ("k", "s")
+    assert Settings(_env_file=None).api_keys("live") is None  # type: ignore[call-arg]
+
+
+def test_settings_lose_the_spaces_a_quoted_value_keeps() -> None:
+    settings = Settings(_env_file=None, binance_api_key="  key\t")  # type: ignore[call-arg]
+    assert settings.binance_api_key == "key"

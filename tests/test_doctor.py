@@ -1,5 +1,7 @@
 import asyncio
 import os
+import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -337,3 +339,60 @@ def test_the_clock_line_says_which_way_this_computer_is_off(tmp_path: Path) -> N
     [(_, detail)] = by_name(check(config, settings(**ALERTS), fake()))["clock"]
     assert detail.startswith("this computer is ")
     assert detail.endswith(("behind Binance", "ahead of Binance"))
+
+
+def test_a_file_other_accounts_can_read_is_named(tmp_path: Path) -> None:
+    from tbot.live.config import env_readers, save_settings
+
+    env = tmp_path / ".env"
+    save_settings(env, {"TBOT_TELEGRAM_TOKEN": "t"})  # a new .env: its owner's only
+    assert env_readers(env) == []
+    if sys.platform == "win32":
+        subprocess.run(
+            ["icacls", str(env), "/grant", "*S-1-5-32-545:R"], check=True, capture_output=True
+        )
+        expected = ["Users"]
+    else:
+        env.chmod(0o644)
+        expected = ["other accounts"]
+    assert env_readers(env) == expected
+    save_settings(env, {"TBOT_TELEGRAM_CHAT_ID": "1"})  # replaced: its rights stay as they were
+    assert env_readers(env) == expected
+    assert "TBOT_TELEGRAM_CHAT_ID=1" in env.read_text(encoding="utf-8")
+
+
+def test_minute_bars_in_a_session_are_warned_about(tmp_path: Path) -> None:
+    fast = [s.model_copy(update={"timeframe": Timeframe.M5}) for s in STRATEGIES]
+    config = PaperConfig(strategies=fast, ledger=tmp_path / "paper.sqlite")
+    found = by_name(check(config, settings(**ALERTS), fake()))
+    assert found["timeframe"][0][0] == "warn"
+
+
+def test_a_key_binance_refuses_gets_what_to_check(tmp_path: Path) -> None:
+    found = by_name(check(live(tmp_path), settings(**ALERTS, **KEYS), fake(api_key="other")))
+    [(status, detail)] = found["api key"]
+    assert status == "fail"
+    assert "-2015" in detail
+    assert "made for the other network" in detail
+
+
+def test_telegram_down_or_moved_is_said_plainly() -> None:
+    from tbot.live.doctor import telegram_check
+
+    def answer(status: int, body: dict[str, object]) -> list[Check]:
+        def handle(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/getMe"):
+                return httpx.Response(200, json={"ok": True, "result": {"username": "b"}})
+            return httpx.Response(status, json=body)
+
+        async def run() -> list[Check]:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+                return [await telegram_check("t", "-4001", client)]
+
+        return asyncio.run(run())
+
+    moved = {"ok": False, "parameters": {"migrate_to_chat_id": -1009876}}
+    [check_moved] = answer(400, moved)
+    assert check_moved.detail.endswith("set TBOT_TELEGRAM_CHAT_ID to -1009876")
+    [check_down] = answer(502, {"ok": False})
+    assert check_down.detail.startswith("unreachable: ")

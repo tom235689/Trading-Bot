@@ -51,6 +51,7 @@ class FakeSpot:
     fail_next: list[httpx.Response] = field(default_factory=list)
     raise_next: list[Exception] = field(default_factory=list)  # a connection lost before sending
     statuses: dict[str, str] = field(default_factory=dict)  # e.g. BREAK; TRADING otherwise
+    delisted: set[str] = field(default_factory=set)  # every call naming one fails (-1121)
     lose_next_order_response: bool = False  # place the order, then fail the response
     error_after_next_order: httpx.Response | None = None  # place it, then answer this
     next_id: int = 1000
@@ -113,6 +114,8 @@ class FakeSpot:
         if path.startswith("/bot"):  # Telegram, as doctor asks it
             return self._telegram(path, dict(parse_qsl(request.url.query.decode())))
         params = dict(parse_qsl(request.url.query.decode()))
+        if params.get("symbol") in self.delisted:
+            return _error(400, -1121, "Invalid symbol.")
         if path == "/api/v3/time":
             return httpx.Response(200, json={"serverTime": int(time.time() * 1000)})
         if path == "/api/v3/exchangeInfo":

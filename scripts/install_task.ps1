@@ -94,10 +94,10 @@ try {
         if ($doctorCode -eq 4) { throw "$Config is no valid session config: see the error above" }
         if ($doctorCode -ne 0) {
             $fails = @($report | Where-Object { $_ -match '^FAIL' })
-            $network = @($fails | Where-Object { $_ -match '^FAIL\s*(binance: unreachable|heartbeat: ping failed)' })
+            $network = @($fails | Where-Object { $_ -match '^FAIL\s*[a-z ]+: (unreachable|ping failed)' })
             if ($fails.Count -gt 0 -and $network.Count -eq $fails.Count) {
-                throw ("only network checks failed (no network, Binance refusing this region, or the " +
-                    "heartbeat monitor down): try again when they pass; -SkipDoctor registers the task anyway")
+                throw ("only network checks failed (no network, Binance refusing this region, or Telegram " +
+                    "or the heartbeat monitor down): try again when they pass; -SkipDoctor registers the task anyway")
             }
             throw "doctor found problems: fix the FAIL lines above, then run this again"
         }

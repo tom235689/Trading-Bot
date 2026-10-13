@@ -84,6 +84,8 @@ class BarStore:
         directory.mkdir(parents=True, exist_ok=True)
         years = bars["open_time"].dt.year().unique().sort(descending=newest_first)
         with locked(directory / ".lock"):  # a merge by another process would be lost
+            for stale in directory.glob("*.tmp"):  # left by a writer that died; none runs now
+                stale.unlink(missing_ok=True)
             for year in years:
                 file = directory / f"{year}.parquet"
                 part = bars.filter(pl.col("open_time").dt.year() == year)

@@ -9,7 +9,12 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+import structlog
+
+from tbot import __version__
 from tbot.core.models import Fill
+
+log = structlog.get_logger(__name__)
 
 try:
     import sqlite3
@@ -20,7 +25,14 @@ else:
 
 
 class LedgerUnavailable(RuntimeError):
-    """The SQLite driver cannot be loaded, so no session can keep a ledger."""
+    """The ledger cannot be used: no SQLite driver, a damaged file, or one a newer tbot wrote."""
+
+
+# Bump when a ledger written by this code would mislead an older tbot (a table or meta value
+# it would read wrongly): an older tbot then refuses the ledger instead of guessing.
+SCHEMA_VERSION = 1
+SCHEMA_META = "schema_version"
+WRITER_META = "written_by"
 
 
 SCHEMA = """
@@ -116,6 +128,24 @@ class Ledger:
                     "ALTER TABLE orders ADD COLUMN client_id TEXT NOT NULL DEFAULT ''"
                 )
         self.conn.execute("CREATE INDEX IF NOT EXISTS orders_client ON orders (client_id)")
+        self.conn.execute(  # orders in doubt are looked for at every event and reconciliation
+            "CREATE INDEX IF NOT EXISTS orders_open ON orders (client_id) "
+            "WHERE status IN ('pending', 'unknown')"
+        )
+        schema = self.get_meta(SCHEMA_META)
+        if schema is not None and int(schema) > SCHEMA_VERSION:
+            writer = self.get_meta(WRITER_META) or "a newer version"
+            self.conn.close()
+            raise LedgerUnavailable(
+                f"{path} was written by tbot {writer}, newer than this tbot {__version__}: "
+                "update (`tbot update`), or restore a backup made before"
+            )
+
+    def mark_written(self) -> None:
+        """Say which tbot keeps this ledger, so an older one refuses it."""
+        with self.atomic():
+            self.set_meta(SCHEMA_META, str(SCHEMA_VERSION))
+            self.set_meta(WRITER_META, __version__)
 
     @contextmanager
     def atomic(self) -> Iterator[None]:
@@ -324,11 +354,18 @@ class Ledger:
     # events
 
     def add_event(self, time: datetime, level: str, message: str) -> None:
-        with self._write():
-            self.conn.execute(
-                "INSERT INTO events (time, level, message) VALUES (?, ?, ?)",
-                (_iso(time), level, message),
-            )
+        """Record an event. On its own (not in atomic()), a failed write is logged, not
+        raised: the alert that usually follows must still go out (a full disk)."""
+        try:
+            with self._write():
+                self.conn.execute(
+                    "INSERT INTO events (time, level, message) VALUES (?, ?, ?)",
+                    (_iso(time), level, message),
+                )
+        except sqlite3.Error as exc:
+            if self._atomic:
+                raise
+            log.error("event_not_recorded", message=message, error=repr(exc))
 
     def events_starting(self, prefix: str) -> list[Event]:
         """Events whose message starts with prefix, oldest first."""

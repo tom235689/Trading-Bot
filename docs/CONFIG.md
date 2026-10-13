@@ -35,7 +35,7 @@ Each strategy:
 | `symbols` | Binance spot symbols such as `BTC/USDT`, `BTC-USDT`, or `BTCUSDT` (all mean `BTCUSDT`); none twice. Testnet and live need one quote asset for all. |
 | `timeframe` | Bar length the strategy trades on: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, or `1d`; the shipped configs use `4h`. |
 | `allocation` | Share of equity for this strategy, more than 0 and at most 1. |
-| `params` | The strategy's own settings. `donchian_trend`: `entry` (55, bars of the breakout high) and `exit` (20, bars of the exit low). `rsi_reversion`: `period` (14), `low` (30), `high` (70), `trend_period` (0 = off; buy only above this moving average). |
+| `params` | The strategy's own settings. `donchian_trend`: `entry` (55, bars of the breakout high) and `exit` (20, bars of the exit low). `rsi_reversion`: `period` (14), `low` (30), `high` (70), `trend_period` (0 = off, else 2 or more; buy only above this moving average). |
 
 ## Backtest
 

@@ -397,7 +397,13 @@ def test_server_clock_keeps_its_offset_when_every_sample_is_slow(
 
     monkeypatch.setattr(
         "tbot.live.clock.time",
-        SimpleNamespace(time=fake_time, monotonic=fake_time, sleep=lambda s: 0),
+        SimpleNamespace(
+            time=fake_time,
+            monotonic=fake_time,
+            clock_gettime=lambda clock: fake_time(),  # Linux: CLOCK_BOOTTIME
+            CLOCK_BOOTTIME=7,
+            sleep=lambda s: 0,
+        ),
     )
     clock = ServerClock(httpx.Client(transport=httpx.MockTransport(handle)))
     assert clock.sync() == pytest.approx(5.0, abs=0.1)
@@ -579,15 +585,20 @@ def test_a_failing_report_loses_no_bar(tmp_path: Path) -> None:
     asyncio.run(watch())
 
 
-def test_a_socket_that_goes_silent_is_replaced(tmp_path: Path) -> None:
+def test_a_socket_silent_across_a_bar_close_is_replaced(tmp_path: Path) -> None:
     feed, _, _ = make_feed(tmp_path, [BTC1], now=at(4.5))
     feed.last[BTC1] = at(3)
     feed.silence = 0.05
+    now = [at(4.5)]
+    feed.clock = lambda: now[0]
     connect, urls = fake_connector([[], [kline_message(BTC1, at(4), closed=True)]])
     feed.connector = connect  # type: ignore[assignment]
 
     async def run() -> datetime:
         task = asyncio.create_task(feed.run_websocket())
+        await asyncio.sleep(0.3)
+        assert (len(urls), feed.reconnects) == (1, 0)  # quiet, but no close passed: kept
+        now[0] = at(5.2)  # the 05:00 close went by without a word: stalled
         _, bar = await asyncio.wait_for(feed.queue.get(), 5)  # from the second socket
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

@@ -12,7 +12,7 @@ from tbot.backtest.engine import BacktestResult
 from tbot.backtest.runner import run_period
 from tbot.core.config import streams_of
 from tbot.core.models import Fill
-from tbot.core.text import price_text
+from tbot.core.text import clock_text, price_text
 from tbot.data.store import BarStore
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Ledger
@@ -22,6 +22,7 @@ MAX_EQUITY_GAP = 0.02  # larger gaps between session and backtest equity need a 
 # Both sides' prices already include the modeled slippage: what is left is real extra cost.
 EXTRA_COST_BPS = 1.0
 SHOWN_FILLS = 10
+MIN_MATCHED_FILLS = 10  # fewer matched fills say too little to call the session on track
 
 
 @dataclass(frozen=True)
@@ -105,7 +106,7 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
         timeframe, first = next_close(config, datetime.now(UTC))
         raise ValueError(
             f"the ledger has no bar events yet: run the session past a {timeframe} close "
-            f"(the next is {first:%H:%M} UTC)"
+            f"(the next is {clock_text(first)})"
         )
     start = points[0].time
     base = base_cash(config, ledger)  # the backtest starts with what the session started with
@@ -120,6 +121,12 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
     backtest_times = [t for t in result.equity["time"].to_list() if start <= t <= end]
     session_by_time = {p.time: p for p in points if p.time <= end}
     shared = [t for t in backtest_times if t in session_by_time]
+    if not shared and len(points) < 2:  # a decision at the first close fills at the next
+        timeframe, first = next_close(config, datetime.now(UTC))
+        raise ValueError(
+            f"one bar event so far: the first comparison is possible after the next "
+            f"{timeframe} close ({clock_text(first)})"
+        )
     if not shared:
         raise ValueError(
             "no bar close is in both the session and the stored bars yet; run "
@@ -277,6 +284,11 @@ def comparison_text(c: Comparison, ledger_path: str) -> str:
         lines.append("verdict: does not track the backtest yet; see the checks")
     elif not c.matched:
         lines.append("verdict: no trades to compare yet; let it run longer")
+    elif len(c.matched) < MIN_MATCHED_FILLS:
+        lines.append(
+            f"verdict: on track so far, but {len(c.matched)} matched fills are too few to "
+            f"judge; wait for {MIN_MATCHED_FILLS} (months on 4h bars)"
+        )
     else:
         lines.append("verdict: tracks the backtest")
     return "\n".join(lines)

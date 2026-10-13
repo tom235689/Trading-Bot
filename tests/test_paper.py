@@ -179,7 +179,7 @@ def test_summary_and_status_text(tmp_path: Path) -> None:
     status = status_text(paper_config(tmp_path), store)
     assert "fills 1, round trips 0, adjustments 0" in status
     assert "position BTC 5.000000" in status
-    assert "last stored bar BTC 1h: 2024-01-01 02:00" in status
+    assert "last closed bar BTC 1h: 2024-01-01 03:00 UTC" in status
     assert "HALTED: drawdown 50% (run `tbot resume`)" in status
 
 
@@ -536,6 +536,9 @@ def test_the_checkpoint_waits_for_the_event_to_finish(tmp_path: Path) -> None:
             raise RuntimeError("crash in the middle of the orders")
 
         async def after_event(self, *args: object) -> None:
+            return None
+
+        async def before_event(self, *args: object) -> None:
             return None
 
     trader.executor = Broken()  # type: ignore[assignment]

@@ -85,7 +85,11 @@ def format_report(r: ValidationReport) -> str:
         else:
             values = f"{check.value:.3g} vs {check.threshold:.3g}"
         lines.append(f"   {status}  {check.name}: {values}")
-    lines.append(f"   {'PASSED' if r.passed else 'FAILED'}")
+    lines.append(
+        "   PASSED: it held up out of sample; paper trade it before real money"
+        if r.passed
+        else "   FAILED: it did not hold up out of sample; do not trade it with money you need"
+    )
     return "\n".join(lines)
 
 

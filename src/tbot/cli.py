@@ -7,6 +7,8 @@ import hashlib
 import io
 import logging
 import os
+import platform
+import re
 import secrets
 import sys
 import webbrowser
@@ -29,6 +31,7 @@ from tbot.backtest.metrics import compute_metrics
 from tbot.backtest.report import format_metrics
 from tbot.backtest.runner import data_ends, history_bars, run_backtest
 from tbot.core.config import TradingConfig, load_yaml, normalize_symbol
+from tbot.core.text import clock_text
 from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.http import describe_error, retry_after
@@ -36,6 +39,7 @@ from tbot.data.quality import LONG_GAP, QualityReport, check_bars
 from tbot.data.store import BarStore
 from tbot.live.backup import backup_dir
 from tbot.live.clock import CLOSE_GRACE, ServerClock
+from tbot.live.commands import command_of
 from tbot.live.compare import compare_session, comparison_text
 from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings, save_settings
 from tbot.live.doctor import Check, checks_text, run_checks
@@ -112,7 +116,7 @@ def _problem(error: Any, prefix: str) -> str:
     where = prefix + ".".join(str(part) for part in error["loc"]) or "config"
     if error["type"] == "extra_forbidden":
         key = str(error["loc"][-1])
-        close = difflib.get_close_matches(key, known_keys(), n=1)
+        close = [k for k in difflib.get_close_matches(key, known_keys(), n=2) if k != key]
         return f"{where}: unknown key" + (f" (did you mean {close[0]}?)" if close else "")
     message = str(error["msg"])
     limit = (error.get("ctx") or {}).get("lt", (error.get("ctx") or {}).get("le"))
@@ -122,6 +126,10 @@ def _problem(error: Any, prefix: str) -> str:
 
 
 DEFAULT_TIMEFRAMES = [Timeframe.H1, Timeframe.H4]
+PAST_RESULTS = (
+    "Past results, not a forecast: settings picked on this data look better here than they "
+    "will trade (`tbot validate` tests them on data they were not picked on)."
+)
 DEFAULT_START = "2017-08-01"
 MAX_LISTED = 10
 CONFIG_DIR = Path("config")
@@ -220,8 +228,10 @@ def parse_date(value: str) -> datetime:
 
 
 def parse_timeframe(value: str) -> Timeframe:
-    # 4H or 1D as well, but never 1M: that is Binance's month, not a minute.
-    for candidate in (value, value[:-1] + value[-1:].lower() if value[-1:] in "HD" else value):
+    # 4H, 1D, or 15M as well, but never 1M: that is Binance's month, not a minute.
+    unit = value[-1:]
+    lower = unit in ("H", "D") or (unit == "M" and value[:-1] != "1")
+    for candidate in (value, value[:-1] + unit.lower() if lower else value):
         try:
             return Timeframe(candidate)
         except ValueError:
@@ -290,24 +300,30 @@ def load[T](path: Path, loader: Callable[[Path], T], kinds: tuple[str, ...]) -> 
         return loader(path)
     except (ValidationError, ValueError) as exc:
         kind = kind_of(raw)
-        if kind not in kinds and loads_as(path, kind):
+        if kind not in kinds:
             name = short_name(path)
             use = KIND_USE[kind].format(name=name)
             if kind == "live":
                 use = f"a {raw.get('mode')} config: run it with `{live_command(name, raw)}`"
-            raise ConfigError(f"{path} is {use}") from None
+            failure = load_failure(path, kind)
+            if failure is None:
+                raise ConfigError(f"{path} is {use}") from None
+            if kind != "paper":  # a paper config is only what is left: no sure sign
+                raise ConfigError(
+                    f"{path} is {use}, but it does not load as one: {brief(failure)}"
+                ) from None
         raise ConfigError(f"{path}: {brief(exc)}") from None
     except OSError as exc:  # a file the config points at, such as a validation's backtest
         raise ConfigError(f"{path}: {exc}") from None
 
 
-def loads_as(path: Path, kind: str) -> bool:
-    """Whether the file is a valid config of this kind: only then is it named one."""
+def load_failure(path: Path, kind: str) -> Exception | None:
+    """Why the file is no valid config of this kind, or None when it is one."""
     try:
         KIND_LOADERS[kind](path)
-    except (ValidationError, ValueError, OSError):
-        return False
-    return True
+    except (ValidationError, ValueError, OSError) as exc:
+        return exc
+    return None
 
 
 def check_strategies(path: Path, config: TradingConfig) -> None:
@@ -450,6 +466,7 @@ start here:
   tbot status         every session at a glance
   tbot log -f         follow what a session does
   tbot stop           stop the running session after the event in progress
+  tbot support        a report to share when asking for help
 
 A config is a file or a name from config/: `tbot status testnet` reads config/testnet.yaml.
 On Windows, tbot.cmd also runs `tbot setup`, `tbot update`, and `tbot autostart <config>`.
@@ -544,6 +561,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     session("resume", "clear the kill switch of a halted session", "the halted one")
+    support = command("support", "write a report to share when asking for help (no keys in it)")
+    support.add_argument("--out", default=None, help="a file or folder (default: reports/)")
+    support.add_argument(
+        "--data-dir", type=typed_path, default=Path("data"), help=SESSION_DATA_HELP
+    )
     session(
         "account",
         "show exchange balances and open orders (testnet or live)",
@@ -663,9 +685,16 @@ def print_report(symbol: str, timeframe: Timeframe, report: QualityReport, store
             f"{directory} and run {hint} again"
         )
     if report.gaps:
-        print(f"  gaps: {len(report.gaps)} ({report.missing_bars} missing bars)")
-        for gap in report.gaps[:MAX_LISTED]:
+        days = [gap for gap in report.gaps if gap.length >= timedelta(days=1)]
+        short = len(report.gaps) - len(days)
+        print(
+            f"  gaps: {len(report.gaps)} ({report.missing_bars} missing bars)"
+            + (f"; {short} shorter than a day: exchange pauses, normal" if short else "")
+        )
+        for gap in days[:MAX_LISTED]:
             print(f"    {fmt(gap.start)} .. {fmt(gap.end)} ({gap.missing})")
+        if len(days) > MAX_LISTED:
+            print(f"    and {len(days) - MAX_LISTED} more of a day or longer")
     if report.zero_volume:
         print(f"  zero volume bars: {report.zero_volume}")
     if report.large_moves:
@@ -678,13 +707,17 @@ def run_check(args: argparse.Namespace) -> int:
     # A minute of slack: this clock may run behind Binance's, which the download went by.
     now = datetime.now(UTC) + timedelta(minutes=1)
     failed = False
+    named = args.symbols is not DEFAULT_SYMBOLS or args.timeframes is not DEFAULT_TIMEFRAMES
     for symbol in args.symbols:
         for timeframe in args.timeframes:
             bars = store.read(symbol, timeframe)
             if bars.is_empty():
                 hint = store.download_hint([(symbol, timeframe)])
-                print(f"{symbol} {timeframe}: FAIL, no data ({hint} fetches it)")
-                failed = True
+                if named:  # asked for by name: missing is a failure
+                    print(f"{symbol} {timeframe}: FAIL, no data ({hint} fetches it)")
+                    failed = True
+                else:  # a default stream that no config may need
+                    print(f"{symbol} {timeframe}: not downloaded ({hint} fetches it)")
                 continue
             report = check_bars(bars, timeframe, now)
             print_report(symbol, timeframe, report, store)
@@ -700,24 +733,26 @@ def print_notes(config: BacktestConfig, store: BarStore) -> None:
     """What a backtest of this config cannot show, said before it runs."""
     ends = data_ends(config, store)
     stop = min(max(ends.values()), utc_day(config.end)) if config.end and ends else None
-    # A coarser stream closes up to one of its bars after a finer one: no sign of an end.
-    lag = max((timeframe.delta for _, timeframe in ends), default=timedelta(0))
-    if ends and (stop or max(ends.values())) - min(ends.values()) >= lag:
-        (symbol, timeframe), first = min(ends.items(), key=lambda item: item[1])
+    last = stop or max(ends.values(), default=None)
+    # A stream that misses a bar of its own ends early; a coarser one closing up to one of
+    # its bars before a finer one does not.
+    short = {key: end for key, end in ends.items() if last and end + key[1].delta <= last}
+    if short:
+        (symbol, timeframe), first = min(short.items(), key=lambda item: item[1])
         print(
             f"Note: {symbol} {timeframe} data ends {first:%Y-%m-%d %H:%M} (its last close); "
             f"every stream stops there. {store.download_hint([(symbol, timeframe)])} brings it "
             "up to date; a symbol Binance no longer lists stays short: leave it out or set end:"
         )
     start = utc_day(config.start)
-    for (symbol, timeframe), last in sorted(ends.items()):
+    for (symbol, timeframe), stream_end in sorted(ends.items()):
         first_open = store.first_open_time(symbol, timeframe)
         if first_open is not None and first_open > start + timedelta(days=1):
             print(
                 f"Note: {symbol} {timeframe} data starts {first_open:%Y-%m-%d}, after the period "
                 "starts: its share of the capital waits in cash until then"
             )
-        bars = store.read(symbol, timeframe, start, stop or last)
+        bars = store.read(symbol, timeframe, start, stop or stream_end)
         gaps = bars["open_time"].diff().drop_nulls() if bars.height > 1 else None
         longest = gaps.max() if gaps is not None else None
         if isinstance(longest, timedelta) and longest - timeframe.delta >= LONG_GAP:
@@ -751,6 +786,17 @@ def check_period(config: BacktestConfig, store: BarStore) -> None:
             raise ValueError(f"{stored}, before the period starts: run {hint}")
         if config.end is not None and utc_day(config.end) <= first:
             raise ValueError(f"{stored}, after the period ends: no download goes back further")
+    keys = list(history_bars(build_slots(config.strategies), config.risk))
+    firsts = [first for key in keys if (first := store.first_open_time(*key)) is not None]
+    begin = utc_day(config.start)
+    span = (utc_day(config.end) if config.end else datetime.now(UTC)) - begin
+    if firsts and min(firsts) - begin > max(timedelta(days=30), span / 10):
+        # Not one stream reaches back to the start: the history was never downloaded,
+        # and a short run would pass for the whole period.
+        raise ValueError(
+            f"the stored bars start {min(firsts):%Y-%m-%d}, long after the period's start "
+            f"{config.start}: run {store.download_hint(keys)}, or set start: later"
+        )
     ends = data_ends(config, store)
     if config.end is not None and ends:
         (symbol, timeframe), short = min(ends.items(), key=lambda item: item[1])
@@ -804,17 +850,23 @@ def html_file(value: str | None, folder: Path, name: str) -> Path:
 def run_backtest_command(args: argparse.Namespace) -> int:
     config = load(args.config, load_config, ("backtest",))
     check_strategies(args.config, config)
+    out = None  # a page named wrongly fails now, not after the run
+    if args.html is not None:
+        out = html_file(args.html, Path("reports"), f"{args.config.stem}.html")
     check_period(config, BarStore(args.data_dir))
     print_notes(config, BarStore(args.data_dir))
+    print("running the backtest...", file=sys.stderr, flush=True)
     result = run_backtest(config, BarStore(args.data_dir))
     metrics = compute_metrics(result)
     trial_log(args.data_dir).append([make_record(config, metrics, "backtest")])
     print(format_metrics(metrics))
+    print(PAST_RESULTS)
     for symbol, quantity in sorted(result.positions.items()):
         print(f"Open position {symbol} {quantity:.6f}")
     if result.halted:
         print(f"Kill switch  {result.halted}; flat from then on")
     if args.attribution:
+        print("running each strategy alone...", file=sys.stderr, flush=True)
         attribution = run_attribution(config, BarStore(args.data_dir))
         solo = [
             make_record(
@@ -829,10 +881,9 @@ def run_backtest_command(args: argparse.Namespace) -> int:
         trial_log(args.data_dir).append(solo)  # looks at the period, not selections
         print()
         print(format_attribution(attribution))
-    if args.html is not None:
+    if out is not None:
         subtitle = f"{args.config}, {config.start} to {config.end or 'latest'}"
         data = from_backtest(result, f"Backtest {args.config.stem}", subtitle)
-        out = html_file(args.html, Path("reports"), f"{args.config.stem}.html")
         write_dashboard(data, out, show=not args.no_open)
     return 0
 
@@ -893,7 +944,7 @@ def run_live_command(args: argparse.Namespace) -> int:
         raise ConfigError("--live is only for mode: live; this config trades on the testnet")
     check_strategies(args.config, config)
     settings = Settings()
-    if not settings.binance_api_key or not settings.binance_api_secret:
+    if settings.api_keys(config.mode) is None:
         raise ConfigError(KEYS_MISSING)  # every start would fail the same way
     not_running(config)
     log_file = args.log_file or log_path(args.config)
@@ -921,7 +972,7 @@ def announce(kind: str, path: Path, config: SessionConfig, log_file: Path) -> No
     timeframe, first = next_close(config, datetime.now(UTC))
     print(
         f"{kind} session {name} (tbot {__version__}): ledger {config.ledger}, log {log_file}\n"
-        f"its first decision comes with the next {timeframe} close, {first:%H:%M} UTC; "
+        f"its first decision comes with the next {timeframe} close, {clock_text(first)}; "
         f"`tbot status {name}` shows what it did\n"
         f"stop it with Ctrl+C here, or `tbot stop {name}` from another terminal"
         + (f"\nnote: {shared}" if shared else ""),
@@ -1083,6 +1134,70 @@ def run_backup_command(args: argparse.Namespace) -> int:
     return 0
 
 
+SECRET_SHAPES = (
+    re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"),  # a Telegram bot token
+    re.compile(r"\b[A-Za-z0-9]{64}\b"),  # a Binance key or secret
+    re.compile(r"https?://[^\s\"']*(?:ping|heartbeat|push)[^\s\"']*", re.IGNORECASE),
+)
+SUPPORT_LOG_LINES = 40
+
+
+def redact(text: str, secrets: list[str]) -> str:
+    """The text without the secrets given, nor anything shaped like a key or a ping URL."""
+    for secret in sorted((s for s in secrets if len(s) >= 6), key=len, reverse=True):
+        text = text.replace(secret, "[secret]")
+    for shape in SECRET_SHAPES:
+        text = shape.sub("[secret]", text)
+    return text
+
+
+def support_text(store: BarStore) -> str:
+    """Versions, configs, offline doctor checks, the overview, and recent problems in logs."""
+    settings = Settings()
+    found = [name.upper() for name, value in settings.model_dump().items() if value]
+    lines = [
+        f"tbot {__version__} support report, {datetime.now(UTC):%Y-%m-%d %H:%M} UTC",
+        f"python {platform.python_version()} on {platform.platform()}",
+        f"settings in .env: {', '.join(f'TBOT_{name}' for name in found) or 'none'}",
+        "",
+    ]
+    sessions, broken = scan_configs()
+    rows = [session_row(path.stem, config, store) for path, config in sessions]
+    rows += [broken_row(b.path.stem, b.problem, b.ledger) for b in broken]
+    lines += ["== sessions", overview_text(rows), ""]
+
+    async def offline(config: SessionConfig) -> list[Check]:
+        async with httpx.AsyncClient() as client:
+            return await run_checks(config, settings, client, store, offline=True)
+
+    for path, config in sessions:
+        lines += [f"== doctor --offline {path}", checks_text(asyncio.run(offline(config))), ""]
+    warning = LEVELS.index("warning")
+    for log in sorted(Path("logs").glob("*.jsonl")):
+        recent, _ = tail(log, SUPPORT_LOG_LINES, warning)
+        lines += [f"== {log}: the last {SUPPORT_LOG_LINES} warnings and errors", *recent, ""]
+    for journal in sorted(Path("logs").glob("*.supervisor.log")):
+        text = journal.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines += [f"== {journal}", *text[-SUPPORT_LOG_LINES:], ""]
+    secrets = [str(value) for value in settings.model_dump().values() if value]
+    return redact("\n".join(lines), secrets)
+
+
+def run_support_command(args: argparse.Namespace) -> int:
+    name = f"support-{datetime.now(UTC):%Y%m%d-%H%M%S}.txt"
+    out = output_file(args.out, Path("reports"), name)
+    if exists(out):
+        raise ConfigError(f"{out} exists: name a new file, or a folder")
+    text = support_text(BarStore(args.data_dir))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text + "\n", encoding="utf-8")
+    print(
+        f"wrote {out}: versions, configs, checks, and recent warnings, without keys or tokens. "
+        "Read it before you share it: it shows balances and trades."
+    )
+    return 0
+
+
 def run_resume_command(args: argparse.Namespace) -> int:
     path = args.config
     if path is None:
@@ -1118,10 +1233,15 @@ def is_halted(config: SessionConfig) -> bool:
 def existing_ledger[C: SessionConfig](config: C, path: Path) -> C:
     """Opening a ledger creates it; commands that only read must not leave one behind."""
     if not config.ledger.is_file():
-        start = live_command(short_name(path), config)
+        name = short_name(path)
+        start = (
+            f"real money: read README, Before real money, then `tbot doctor {name}`"
+            if isinstance(config, LiveConfig) and config.mode == "live"
+            else f"`{live_command(name, config)}` starts it"
+        )
         raise NothingYet(
             f"no ledger at {config.ledger}: nothing has run with this config yet "
-            f"(`{start}` starts it; `tbot status` lists every session)"
+            f"({start}; `tbot status` lists every session)"
         )
     return config
 
@@ -1129,7 +1249,7 @@ def existing_ledger[C: SessionConfig](config: C, path: Path) -> C:
 def run_account_command(args: argparse.Namespace) -> int:
     config = load_live_config(args.config or pick_config("account", live=True))
     settings = Settings()
-    if not settings.binance_api_key or not settings.binance_api_secret:
+    if settings.api_keys(config.mode) is None:
         raise ConfigError(KEYS_MISSING)
     print(asyncio.run(account_text(config, settings)))
     return 0
@@ -1196,8 +1316,9 @@ async def set_up_telegram(token: str, chat_id: str | None, new_token: bool, env:
 
 
 def one_time_code() -> str:
-    """Letters first: in a group it goes as a command, the only text bots there receive."""
-    return f"tb{secrets.randbelow(900_000) + 100_000}"
+    """Letters first: in a group it goes as a command, the only text bots there receive.
+    Eight hex digits: four billion codes, none a stranger can guess in two minutes."""
+    return f"tb{secrets.token_hex(4)}"
 
 
 async def find_chat(bot: Telegram, name: str) -> str | None:
@@ -1210,14 +1331,20 @@ async def find_chat(bot: Telegram, name: str) -> str | None:
     print(f"Now send this code to @{name} in Telegram: {code} (waiting up to 2 minutes)")
     print(f"For alerts in a group, add the bot to it and send /{code}@{name} there.")
     deadline = monotonic() + CHAT_WAIT_SECONDS
-    offset: int | None = None  # past what was read: the next long poll waits for news
+    shown = datetime.now(UTC).timestamp() - 60  # a minute of slack for this clock
     try:
+        # Only what is sent from now on counts: a stranger cannot have sent this code
+        # before, but could have sent every code of a shorter kind.
+        backlog = await bot.updates(-1, 0)
+        offset = int(backlog[-1]["update_id"]) + 1 if backlog else None
         while monotonic() < deadline:
             for update in await bot.updates(offset, 10):
                 offset = int(update["update_id"]) + 1
                 message = update.get("message") or {}
                 chat = message.get("chat") or {}
-                if "id" in chat and code in str(message.get("text", "")):
+                text = command_of(str(message.get("text") or "")).lstrip("/")
+                fresh = float(message.get("date") or 0) >= shown
+                if "id" in chat and fresh and text == code:
                     title = chat.get("title") or chat.get("first_name") or chat.get("username")
                     print(f"found chat {chat['id']} {title or ''}".rstrip())
                     return str(chat["id"])
@@ -1250,6 +1377,7 @@ COMMANDS = {
     "doctor": run_doctor_command,
     "stop": run_stop_command,
     "backup": run_backup_command,
+    "support": run_support_command,
     "resume": run_resume_command,
     "account": run_account_command,
     "dashboard": run_dashboard_command,
@@ -1293,7 +1421,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # one line; TBOT_DEBUG=1 shows the traceback
         if os.environ.get("TBOT_DEBUG", "").lower() in ("1", "true", "yes"):
             raise
-        return _fail(f"error: {brief(exc)}", EXIT_ERROR, alert=False)
+        # A session that dies before or after it could alert (a ledger it cannot write)
+        # says so here: a supervisor would restart it without a word.
+        return _fail(f"error: {brief(exc)}", EXIT_ERROR, alert=session, what="stopped")
 
 
 def run() -> int:
@@ -1310,10 +1440,10 @@ def run() -> int:
     return main()
 
 
-def _fail(message: str, code: int, *, alert: bool) -> int:
+def _fail(message: str, code: int, *, alert: bool, what: str = "cannot start") -> int:
     print(message, file=sys.stderr)
     if alert:  # a supervised bot that cannot start says so before the supervisor gives up
-        _alert(f"tbot cannot start: {message}")
+        _alert(f"tbot {what}: {message}")
     return code
 
 

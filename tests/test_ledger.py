@@ -1,5 +1,8 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from tbot.core.models import Fill
 from tbot.live.backup import backup_ledger, daily_backups
@@ -102,3 +105,12 @@ def test_atomic_writes_all_or_nothing(tmp_path: Path) -> None:
             crash_between_the_writes(ledger)
         assert ledger.get_meta("a") is None
         assert ledger.unresolved_orders() == []
+
+
+def test_an_event_that_cannot_be_written_never_stops_the_alert_after_it(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "paper.sqlite")
+    ledger.close()  # as unwritable as a full disk
+    ledger.add_event(T0, "error", "consume crashed")  # logged, not raised
+    ledger._atomic = True  # inside atomic() the whole transaction must fail
+    with pytest.raises(sqlite3.Error):
+        ledger.add_event(T0, "error", "consume crashed")

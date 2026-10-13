@@ -33,17 +33,17 @@ class RetryingRotatingFileHandler(RotatingFileHandler):
             self.stream = None
         pending = self.baseFilename + ".rotating"
         try:
-            os.replace(self.baseFilename, pending)
-        except FileNotFoundError:
-            pass
-        except PermissionError:
-            self.retry_at = time.monotonic() + ROTATE_RETRY_SECONDS
-        else:
+            if not os.path.exists(pending):  # else a rotation stopped halfway: finish it first
+                os.replace(self.baseFilename, pending)
             for index in range(self.backupCount - 1, 0, -1):
                 older = f"{self.baseFilename}.{index}"
                 if os.path.exists(older):
                     os.replace(older, f"{self.baseFilename}.{index + 1}")
             os.replace(pending, f"{self.baseFilename}.1")
+        except FileNotFoundError:
+            pass  # nothing written yet
+        except PermissionError:  # Windows: another process has one of the files open
+            self.retry_at = time.monotonic() + ROTATE_RETRY_SECONDS
         self.stream = self._open()
 
 

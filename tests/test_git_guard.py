@@ -1,7 +1,9 @@
 """Tests for scripts/git_guard.py. Test text is built with chr() so this file stays ASCII."""
 
+import io
 import os
 import subprocess
+import zipfile
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -249,3 +251,30 @@ def test_an_icon_is_not_read_as_utf16_text() -> None:
     assert list(gg.scan_blob("app.ico", icon)) == []
     text = "x = 1\n".encode("utf-16-le")  # UTF-16 without a byte order mark is still read
     assert gg.blob_text(text) == "x = 1\n"
+
+
+def test_a_zip_is_opened_and_utf32_is_read() -> None:
+    key = "Ab1" * 21 + "x"  # 64 characters, as a Binance key
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("backup/.env", f"TBOT_BINANCE_API_KEY={key}\n")
+        archive.writestr("notes.txt", f"note {SYLLABLE}\n")
+    found = kinds(gg.scan_blob("keys.zip", data.getvalue()))
+    assert "possible secret (api key)" in found
+    assert any("Hangul" in kind for kind in found)
+    assert any(f.where == "keys.zip!backup/.env" for f in gg.scan_blob("keys.zip", data.getvalue()))
+    utf32 = f"TBOT_BINANCE_API_KEY={key}\n".encode("utf-32")  # read as UTF-16: not found
+    assert "possible secret (api key)" in kinds(gg.scan_blob("note.txt", utf32))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Split, so this file holds no whole URL the audit would stop.
+        "https://uptime.betterstack.com/api/v1/heartbeat/" + "AbCdEf1234567890xyZ",
+        "TBOT_HEARTBEAT_URL=https://cronitor.link/p/" + "9f8e7d6c5b4a3f2e1d0c/backup",
+        "heartbeat_url: https://nosnch.in/" + "ab12cd34ef",
+    ],
+)
+def test_ping_urls_of_other_monitors_are_secrets(text: str) -> None:
+    assert "possible secret (monitor ping url)" in kinds(gg.scan_line("x", text))

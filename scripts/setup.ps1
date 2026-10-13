@@ -33,7 +33,11 @@ The config doctor checks at the end.
 
 .EXAMPLE
 .\tbot setup
+
+.EXAMPLE
 .\tbot setup -SkipDownload
+
+.EXAMPLE
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 #>
 [CmdletBinding()]
@@ -196,14 +200,20 @@ if (Test-Path ".env") {
     Write-Output ".env exists: left as it is"
 } else {
     Copy-Item ".env.example" ".env"
-    Write-Output "created .env from .env.example; tbot notify sets up Telegram alerts"
+    # Only this account may read the keys it will hold, whatever the folder allows.
+    $owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    & icacls ".env" /inheritance:r /grant:r "${owner}:F" | Out-Null
+    Write-Output "created .env from .env.example, readable by $owner only; tbot notify sets up Telegram alerts"
 }
 
 Step "market data"
 if ($SkipDownload) {
     Write-Output "skipped (-SkipDownload); sessions download what they need at start"
 } else {
-    Invoke-Checked $uv ($run + @("python", "-m", "tbot", "download"))
+    & $uv @run python -m tbot download
+    if ($LASTEXITCODE -ne 0) {  # a network or region problem: doctor below says more
+        Write-Output "the download did not finish; sessions download what they need at start, or run tbot download later"
+    }
 }
 
 Step "doctor $Config"

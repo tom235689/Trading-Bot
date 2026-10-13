@@ -2,11 +2,11 @@
 
 Multi-strategy crypto trading bot for Binance spot: data, backtests, a validation pipeline, paper trading, and live trading with a risk guard. See [docs/DESIGN.md](docs/DESIGN.md) for how it works, [docs/CONFIG.md](docs/CONFIG.md) for every setting, and [CHANGELOG.md](CHANGELOG.md) for what changed.
 
-**Risk**: trading crypto can lose all the money involved. No strategy here has passed the project's own validation gate (see Validation below). The software comes with no warranty; use real money only with an amount you can afford to lose.
+**Risk**: trading crypto can lose all the money involved. No strategy here has passed the project's own validation gate (see Validation below). The software comes with no warranty and is no financial advice; use real money only with an amount you can afford to lose.
 
 ## Quick start (Windows)
 
-You need [uv](https://docs.astral.sh/uv/) (`winget install --id astral-sh.uv -e`) and [Git](https://git-scm.com/download/win). In PowerShell:
+You need [uv](https://docs.astral.sh/uv/) (`winget install --id astral-sh.uv -e`) and [Git](https://git-scm.com/download/win); open a new terminal after installing them, so it finds them. In PowerShell:
 
 ```powershell
 git clone https://github.com/tom235689/Trading-Bot.git
@@ -24,9 +24,11 @@ tbot status      # from another terminal: every session at a glance
 
 `tbot` is `tbot.cmd` in the repository folder. It always runs in that folder, where `.env`, `config\`, `data\`, and `logs\` live, so it works from any directory; relative paths you pass are relative to the repository. `python -m tbot` from a clone (any system) also runs in the repository, but a file you name, such as `./my.yaml` or `--out x.html`, is taken from the folder you typed the command in. Before setup has changed PATH, or with `-NoPath`, type `.\tbot` in the folder. After Ctrl+C, cmd asks "Terminate batch job (Y/N)?": the bot has already stopped, so either answer is fine.
 
-Binance must serve your region: binance.com refuses some countries, including the US, and `tbot doctor` then fails its network check.
+Binance must serve your region: binance.com refuses some countries, including the US, and `tbot doctor` then fails its network check. Do not reach it through a VPN from such a region: that breaks Binance's terms, and accounts can be frozen.
 
-**Linux and macOS**: from the repository root, `uv sync --frozen`, `cp .env.example .env`, `uv run tbot download`, then `uv run tbot ...` wherever this README says `tbot ...`. An alias makes it work from any folder: `alias tbot='uv run --project ~/Trading-Bot --frozen python -m tbot'`. To run a session unattended, see [Linux and macOS](#linux-and-macos) below.
+**Behind a proxy**: set `HTTPS_PROXY` as a user environment variable (not in `.env`, which holds only `TBOT_` settings); with a proxy that inspects TLS, also `SSL_CERT_FILE` (its certificate) and `UV_NATIVE_TLS=1` for uv.
+
+**Linux and macOS**: from the repository root, `uv sync --frozen`, `cp .env.example .env && chmod 600 .env`, `uv run tbot download`, then `uv run tbot ...` wherever this README says `tbot ...`. An alias makes it work from any folder: `alias tbot='uv run --project ~/Trading-Bot --frozen python -m tbot'`. To run a session unattended, see [Linux and macOS](#linux-and-macos) below.
 
 ## Everyday use
 
@@ -43,9 +45,10 @@ Binance must serve your region: binance.com refuses some countries, including th
 | `tbot resume` | clears the kill switch of a halted session |
 | `tbot autostart paper` | runs the session at every boot and restarts it after crashes (asks for administrator rights) |
 | `tbot update` | pulls the new version and restarts scheduled sessions |
-| `tbot --version` | the version; `tbot status`, `tbot doctor`, and the start alert name it too |
+| `tbot --version` | the version; `tbot status`, `tbot doctor`, and the start alert name it too, and doctor and the daily summary say when a newer release is out |
+| `tbot support` | a report to share when asking for help: versions, configs, checks, recent warnings; no keys or tokens |
 
-**Configs by name**: a config is a file or a name from `config\`: `tbot status testnet` reads `config\testnet.yaml`, `tbot backtest donchian_voltarget` reads `config\donchian_voltarget.yaml`. Leave it out and session commands pick the running session, else the only one that has run, else paper; with two candidates they ask you to name one, and they print which config they used. `tbot paper` defaults to `config\paper.yaml`, `tbot stop` to the running session, and `tbot resume` to the halted one, unless it trades real money; `tbot live` always needs the config named. A config that no longer loads (a typo while its session runs) shows in `tbot status` as invalid, and `tbot stop` still reaches its session. Configs may end in `.yaml` or `.yml`, and a key given twice in one is an error, not a silent override. Every config that is no backtest (`start:`) or validation (`backtest:`) config is a session config; a copied one needs its own `ledger:`, or both keep one book, and `tbot status` and `tbot doctor` point that out. A mistyped key gets a suggestion (`initial_cahs: unknown key (did you mean initial_cash?)`), and a config given to the wrong command names the right one. [docs/CONFIG.md](docs/CONFIG.md) explains every setting. `tbot -h` or `tbot help` lists every command, `tbot <command> -h` or `tbot help <command>` explains one (`tbot setup -h`, `tbot update -h`, and `tbot autostart -h` too).
+**Configs by name**: a config is a file or a name from `config\`: `tbot status testnet` reads `config\testnet.yaml`, `tbot backtest donchian_voltarget` reads `config\donchian_voltarget.yaml`. Leave it out and session commands pick the running session, else the only one that has run, else paper; with two candidates they ask you to name one, and they print which config they used. `tbot paper` defaults to `config\paper.yaml`, `tbot stop` to the running session, and `tbot resume` to the halted one, unless it trades real money; `tbot live` always needs the config named. A config that no longer loads (a typo while its session runs) shows in `tbot status` as invalid, and `tbot stop` still reaches its session. Configs may end in `.yaml` or `.yml`, and a key given twice in one is an error, not a silent override. Every config that is no backtest (`start:`) or validation (`backtest:`) config is a session config; a copied one needs its own `ledger:`, or both keep one book, and `tbot status` and `tbot doctor` point that out. Edit a shipped config in place for its own session: `tbot update` keeps your edits, and stops only when a release changes the same lines, saying how to go on. A mistyped key gets a suggestion (`initial_cahs: unknown key (did you mean initial_cash?)`), and a config given to the wrong command names the right one. [docs/CONFIG.md](docs/CONFIG.md) explains every setting. `tbot -h` or `tbot help` lists every command, `tbot <command> -h` or `tbot help <command>` explains one (`tbot setup -h`, `tbot update -h`, and `tbot autostart -h` too).
 
 ## Setup details
 
@@ -82,7 +85,7 @@ tbot backtest donchian_voltarget --html reports/voltarget.html   # opened in the
 tbot validate donchian_voltarget_validation
 ```
 
-Runs the in-sample baseline, cost stress, parameter sweep, walk-forward, Monte Carlo, deflated Sharpe, and a single holdout evaluation, then checks the promotion gate. Exit code 1 means the gate failed. Every `tbot backtest` and `tbot validate` run is appended to `data/trials.jsonl`, which is kept in git: it is the record of how many things were tried, and the deflated Sharpe depends on it. See [docs/reports/](docs/reports/).
+Runs the in-sample baseline, cost stress, parameter sweep, walk-forward, Monte Carlo, deflated Sharpe, and a single holdout evaluation, then checks the promotion gate. Exit code 1 means the gate failed. Every `tbot backtest` and `tbot validate` run is appended to `data/trials.jsonl`, which is kept in git: it is the record of how many things were tried, and the deflated Sharpe depends on it. So `git status` shows it changed after a run; that is expected, and `tbot update` keeps the lines of both sides. A backtest whose stored bars start long after its period's start (only what a session fetched) is refused: download the history first. See [docs/reports/](docs/reports/).
 
 **Status**: no configuration has passed the gate ([report](docs/reports/donchian_voltarget_2026-10-05.md)). Both Donchian candidates fail it out of sample:
 
@@ -91,7 +94,7 @@ Runs the in-sample baseline, cost stress, parameter sweep, walk-forward, Monte C
 | volatility targeting 0.4 (configured) | 0.79 | -43.5% | -29% / -45%, -34% / -55% | -24.9% |
 | full exposure | 0.95 | -28.5% | -48% / -69%, -41% / -63% | -40.1% |
 
-The Monte Carlo resamples the returns of every 4h bar in 20-day blocks, as the kill switch sees them: the in-sample column covers 7 years of the chosen params, the out-of-sample column the 4 years of walk-forward test segments, which the params were not chosen on. The in-sample edge is significant after 115 logged trials. The paper, testnet, and live configs use the volatility-targeted settings, which carry far less risk in every in-sample measure; its weaker walk-forward result comes from one 2022 parameter choice that a near tie decided. Over four years, expect a worst drawdown around 34% and, in a bad stretch, about 55%. The design rule is that real money waits for a candidate that passes; trading this one anyway is the owner's decision.
+The Monte Carlo resamples the returns of every 4h bar in 20-day blocks, as the kill switch sees them: the in-sample column covers 7 years of the chosen params, the out-of-sample column the 4 years of walk-forward test segments, which the params were not chosen on. The in-sample edge is significant after 115 logged trials. The paper, testnet, and live configs use the volatility-targeted settings, which carry far less risk in every in-sample measure; its weaker walk-forward result comes from one 2022 parameter choice that a near tie decided. Over four years, the simulation puts the worst drawdown around 34% and, in a bad stretch, about 55%: history, not a bound. The design rule is that real money waits for a candidate that passes; trading this one anyway is the owner's decision.
 
 ## Paper trading
 
@@ -106,7 +109,7 @@ tbot backup          # a copy of the ledger now, also while it runs
 tbot stop            # a running session finishes its event and stops
 ```
 
-The bot syncs the bar store, rebuilds its book from the ledger (`data/paper.sqlite`) and its strategy state from stored bars plus the targets saved at the last event, then trades on closed 4h bars from the Binance WebSocket with simulated fills at the live book price. A bar that closed while the bot was down for a few minutes (a restart, a crash) is still traded when it comes back, as long as it is within the guard's `stale_seconds`. On start it prints the ledger, the log file, and how to stop it.
+The bot syncs the bar store, rebuilds its book from the ledger (`data/paper.sqlite`) and its strategy state from stored bars plus the targets saved at the last event, then trades on closed 4h bars from the Binance WebSocket with simulated fills at the live book price. A bar that closed while the bot was down for a few minutes (a restart, a crash) is still traded when it comes back, as long as it is within the guard's `stale_seconds`. On start it prints the ledger, the log file, when its first decision comes (in UTC and your local time), and how to stop it. Keep the PC awake for the whole paper run (see Before real money): bars missed while it sleeps make `tbot compare` fail.
 
 **Telegram**: run `tbot notify` in a terminal and follow it. It asks for the token of a new bot (in Telegram, open [@BotFather](https://t.me/BotFather) and send `/newbot`), checks it, shows a one-time code to send your bot, takes the chat that sends it (bot names are public: a stranger who wrote to your bot first never gets your alerts), saves both in `.env` (`TBOT_TELEGRAM_TOKEN`, `TBOT_TELEGRAM_CHAT_ID`; the rest of the file stays as it was), and sends a test message. For alerts in a group, add the bot to the group and send the code there as a command, `/<code>@<bot name>` (`tbot notify` shows it): bots in groups receive commands only. Run it again at any time for a test message. To edit `.env` by hand, save it as UTF-8 (Notepad's default; PowerShell 5.1's `Out-File` writes UTF-16, which the bot rejects with a clear message).
 
@@ -119,7 +122,9 @@ Alerts cover starts and stops, fills, the kill switch, paused trading, stops and
 ## Testnet and live trading
 
 ```sh
-# .env: TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET (testnet keys from testnet.binance.vision)
+# .env: TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET; testnet ones may go in
+# TBOT_BINANCE_TESTNET_API_KEY and _SECRET instead, so testnet keeps running once the
+# main pair is a live key
 tbot doctor testnet             # keys, trading permission, budget, alerts
 tbot account testnet            # balances and open orders
 tbot live testnet               # real order path, fake money
@@ -128,17 +133,19 @@ tbot status live
 tbot resume live                # clear the kill switch; a running bot picks it up
 ```
 
+**Testnet keys**: sign in at [testnet.binance.vision](https://testnet.binance.vision) with GitHub, choose "Generate HMAC_SHA256 Key", and copy the key and secret into `.env`; the testnet account comes with test funds.
+
 **What the bot owns**: with `ownership: budget` (the default) the bot manages `initial_cash` USDT and what it buys with it. Everything else in the account, including BTC or ETH you bought yourself, is left alone. `initial_cash` is therefore the most the bot can lose; keep at least that much free USDT in the account. Changing `initial_cash` later moves money into or out of the bot's book at the next start, like a deposit or a withdrawal: the guard, the dashboard, `tbot status`, and `tbot compare` do not count it as a profit or a loss. `ownership: account` hands the bot the whole spot account and is only for a dedicated account.
 
 **Before real money**:
 
 - You have read the validation status above and accept that the strategy has not passed the gate.
-- API key with spot trading only and withdrawals off, created as a system-generated (HMAC) key: tbot does not sign with Ed25519 or RSA keys. Restrict it to your IP only if the IP is static; otherwise every signed call fails after your provider changes it. `tbot doctor live` reads the key's permissions and fails if it can withdraw.
+- API key with spot trading only and withdrawals off, created as a system-generated (HMAC) key: tbot does not sign with Ed25519 or RSA keys. Restrict it to your IP only if the IP is static; otherwise every signed call fails after your provider changes it. `tbot doctor live` reads the key's permissions and fails if it can withdraw, and a live session refuses to start with such a key.
 - A budget (`initial_cash`) of at least about 300 USDT: below that, Binance's 10 USDT order minimum skips small rebalances and results drift from the backtest. Fees are assumed at 0.1% per fill (spot taker, VIP 0); with a BNB discount or a higher VIP level, lower `costs.fee_rate`.
-- Windows time sync on (Settings, Time & language, Sync now). The bot uses Binance's clock either way; `tbot doctor` warns when this computer is more than a second ahead of or behind it.
+- Windows time sync on (Settings, Time & language, Sync now). The bot uses Binance's clock either way; `tbot doctor` warns when this computer is more than three seconds ahead of or behind it.
 - Sleep and hibernation off, so the PC keeps running: `powercfg /change standby-timeout-ac 0` and `powercfg /change hibernate-timeout-ac 0`.
-- Autostart (below), Telegram, and the heartbeat. `tbot doctor` fails a live config without Telegram: a real-money bot must be able to say that something went wrong. Online, it also asks Telegram whether it knows the token and the chat (nothing is sent).
-- Two weeks of paper and a testnet run without surprises: `tbot compare` says the paper run tracks the backtest. A gap in fills or prices means the backtest, and so the validation, is too optimistic.
+- Autostart (below), Telegram, and the heartbeat. `tbot doctor` fails a live config without Telegram, and `tbot live` refuses to start one: a real-money bot must be able to say that something went wrong. Online, it also asks Telegram whether it knows the token and the chat (nothing is sent).
+- Paper and a testnet run without surprises, until `tbot compare` says the paper run tracks the backtest over at least 10 matched fills (with about one trade every two weeks, months). A gap in fills or prices means the backtest, and so the validation, is too optimistic.
 - `tbot doctor live` reports 0 problems.
 
 Every position carries an exchange-side stop `protective_stop_pct` below the last close, so a dead bot still has bounded loss. Stops are replaced after every bar and whenever reconciliation books something that changed the position (an order whose result came late, a stop that executed). The stop is a stop-market order: once triggered it sells at the market, so a gap cannot leave it unfilled, though in a crash it can fill well under the trigger (Binance refuses a stop-limit priced that far under the market). A stop that cannot be placed is alerted and retried at every reconciliation; one that covers only part of a position (other orders lock the rest) is alerted too. Paper and the backtest have no such stop. At 20% it would have fired twice on 2018-2026 history (ETH, January 2018 and August 2020), each time selling well under the bar's close before the strategy bought back.
@@ -148,20 +155,20 @@ Every position carries an exchange-side stop `protective_stop_pct` below the las
 - **Autostart**: `tbot autostart paper` (add `-Live` for a config with `mode: live`, `-DryRun` to only show the task, `-NoStart` to wait for the next boot) runs `tbot doctor`, refuses while it reports a problem (when only its network checks fail, it says so: try again later, or pass `-SkipDoctor`), registers a scheduled task that starts the session at boot, whether anyone is logged on or not, at normal priority, starts it now, and checks ten seconds later that it still runs. Tasks that start at boot need administrator rights: from a normal terminal it checks everything first, then asks for them, goes on in a new window, and keeps that window open until you press Enter. If a session started by hand already runs on the config, the task waits for the next boot. The task runs `scripts\run_bot.ps1`, which starts the bot again after a crash (Task Scheduler's own restart option only covers a task that fails to launch). `tbot autostart paper -Remove` stops the bot gracefully and removes the task (`-Remove -DryRun` only says so); the ledger, data, and logs stay. The scripts behind these commands are `scripts\install_task.ps1` and `scripts\remove_task.ps1`.
 - **Working directory**: `.env`, `data/`, `logs/`, and the ledger paths are relative to the repository folder. `tbot`, `python -m tbot` from a clone, and the scheduled task always run there, wherever the command is typed (`uv run --project <repo> python -m tbot paper` works from any folder).
 - **Exit codes**: `1` is a crash, a failed start, or no network yet: the supervisor starts the bot again after a minute, then after twice the previous wait, up to 15 minutes, and every failed start is alerted on Telegram. `0` (stopped on purpose), `3` (the ledger is in use by another process, damaged, or SQLite cannot load), and `4` (the config, the command line, or `.env` is wrong, including missing API keys, a key whose signature Binance rejects (a wrong secret, or an Ed25519 or RSA key), a symbol Binance does not list, or a ledger kept for another mode) end the supervisor, since retrying cannot help; the reason goes to Telegram when it can be sent. If uv cannot be found (moved or reinstalled), the supervisor says so in its log, tries twice more, and ends (exit 4): install uv, then run `tbot autostart <config>` again.
-- **Logs**: `tbot log <config>` shows the bot's own log, `logs/<config>.jsonl` (a config outside `config\` adds a short hash of its folder to the name), rotated at 20 MB with 5 backups (`tbot log --file logs/paper.jsonl.1` reads one; a session started with `--log-file` is read with `tbot log --file <that file>`). Each config also has supervisor files, `logs\<config>.supervisor.log` (every start and exit, moved to `.1` at 5 MB) and `logs\<config>.console.txt` (the last run's warnings and errors, the run before in `.1`; the full log is the JSON file). Set `TBOT_DEBUG=1` to see a full traceback instead of the one-line error a command prints.
+- **Logs**: `tbot log <config>` shows the bot's own log, `logs/<config>.jsonl` (a config outside `config\` adds a short hash of its folder to the name), rotated at 20 MB with 5 backups (`tbot log --file logs/paper.jsonl.1` reads one; a session started with `--log-file` is read with `tbot log --file <that file>`). On Windows each scheduled config also has supervisor files, `logs\<config>.supervisor.log` (every start and exit, moved to `.1` at 5 MB) and `logs\<config>.console.txt` (the last run's warnings and errors, the run before in `.1`; the full log is the JSON file). For a full traceback instead of the one-line error a command prints, set `TBOT_DEBUG` (PowerShell: `$env:TBOT_DEBUG = 1`, cmd: `set TBOT_DEBUG=1`).
 - **Stopping**: `tbot stop` lets the event in progress finish its orders and stops the session, which also ends the supervisor. A bot the supervisor is about to restart (after a crash) stops as it starts, if that is within 20 minutes of the request; `tbot stop` with no session running leaves such a request when only one session has run, and `tbot stop --cancel` withdraws it. A session you start by hand drops a waiting request instead of stopping. To start a scheduled session again, run `tbot autostart <config>` (it withdraws the request), or reboot. `Stop-ScheduledTask` is a hard kill. Stopping never sells anything; exchange stops stay in place. After a hard kill or a reboot, the next start books any order whose result was not recorded and reconciles with the exchange.
-- **Updating**: `tbot update` (`-DryRun` shows what would change) stops the scheduled sessions gracefully, pulls, syncs the packages, and starts every task again, whatever happened in between, unless the session could no longer start: `tbot doctor --offline` fails only on that (a config the new version rejects, a ledger of another mode, missing API keys) and shows everything else, such as a missing Telegram setup or a halted kill switch, as a warning (the network checks are the bot's to retry); with scheduled tasks it asks for administrator rights like autostart. It ends with the old and new version. Local changes to tracked files, such as an edited config, are set aside for the pull and put back; lines appended to the trial log on both sides are both kept. If the update changes the same lines as yours, or any step fails, everything stays at the old version with your changes, and the script says "update NOT applied" and exits with 1. A bot started by hand in a console must be stopped by hand first. Read [CHANGELOG.md](CHANGELOG.md) for what changed.
+- **Updating**: `tbot update` (`-DryRun` shows what would change) stops the scheduled sessions gracefully, pulls, syncs the packages, and starts every task again, whatever happened in between, unless the session could no longer start: `tbot doctor --offline` fails only on that (a config the new version rejects, a ledger of another mode, missing API keys) and shows everything else, such as a missing Telegram setup or a halted kill switch, as a warning (the network checks are the bot's to retry); with scheduled tasks it asks for administrator rights like autostart. It ends with the old and new version. Local changes to tracked files, such as an edited config, are set aside for the pull and put back; lines appended to the trial log on both sides are both kept. If the update changes the same lines as yours, or any step fails, everything stays at the old version with your changes, and the script says "update NOT applied", how to go on, and exits with 1. Updates follow the main branch, which holds the latest release. A bot started by hand in a console must be stopped by hand first. Read [CHANGELOG.md](CHANGELOG.md) for what changed.
 - **Backups**: a running session copies its ledger every 6 hours to `data/backups/<ledger>-<date>.sqlite` and keeps `backup_days` days (14). `tbot backup` makes an extra copy at any time (`--out` to put it elsewhere: a new file name, or a folder such as a synced one; an existing file is never written over); those are never deleted. `tbot doctor` warns when the newest copy is far behind the ledger. To restore: stop the bot, copy the backup over the ledger (`data/paper.sqlite`; delete any `-wal` and `-shm` files next to it), start. In live mode a restored ledger misses what happened after the copy: budget reconciliation lowers the book to the exchange but never raises it, so coins bought after the copy become yours, not the bot's.
 - **One process per ledger**: a second session on the same config refuses to start. Paper and testnet can run side by side; they share `data/` safely.
 - **Kill switch**: a 45% drawdown from the peak sells everything and halts (`guard.max_drawdown`, also the default). It is meant to catch a broken strategy, not a bad month: in the Monte Carlo the configured strategy goes past 45% in 5% of in-sample paths and in 17% of four-year out-of-sample paths (at 55%: 0.5% and 5.5%), so a level closer to the strategy's normal drawdowns stops it for good in an ordinary bad stretch; at 15% the backtest halts in November 2018 and never trades again. `tbot doctor` warns when the configured level would have halted on the stored history. It stays halted across restarts until `tbot resume`, which also restarts the drawdown count from the current equity. `initial_cash` is still the most the bot can lose. The daily rule (`daily_loss_limit`, 3%) only blocks new entries while equity is that far below the day's open (UTC; the bar that closes at midnight counts for the day it ends); on the 2018-2026 backtest it changes no trade and the final equity by less than 0.01%.
 - **Deposits and withdrawals**: in budget mode extra money in the account is ignored. Taking out more than the bot's cash shrinks its book, and the guard treats that as a transfer, not a loss. Lowering `initial_cash` by more than the cash the bot holds leaves its book owing the rest: it buys nothing until sales have repaid it. A cut larger than everything the book is worth is refused at start, with the lowest value `initial_cash` can take.
 - **One ledger per mode**: a ledger remembers whether it keeps a paper, testnet, or live book, and a session of another mode refuses it (exit 4), so a testnet book never trades real money. Promote a config by giving it a new `ledger:`. Two sessions may share one account in budget mode: each tells its orders and stops apart from the other's.
 - **Binance pauses a pair** (testnet and live): while Binance does not trade a symbol (status `BREAK`, during maintenance or before a delisting), its orders and stops wait, the rest trades on, and Telegram says when it stops and when it trades again. Symbol rules (price and lot steps, minimums) are read again every hour and after Binance refuses an order for them. A pair Binance stops listing is treated the same way (status `UNLISTED`), and the others go on.
-- **Network outages**: a lost connection is retried for every read; an order is never sent twice (it is looked up by its id instead). A rate limit or IP ban Binance asks the bot to wait out is waited out without further requests. The session reconnects and catches up on its own, however long the outage; a socket that stays open but goes silent for two minutes is replaced. An order whose answer was lost counts as never sent only once Binance still does not know it two minutes after it went out.
+- **Network outages**: a lost connection is retried for every read; an order is never sent twice (it is looked up by its id instead). A rate limit or IP ban Binance asks the bot to wait out is waited out without further requests. The session reconnects and catches up on its own, however long the outage; a socket that stays open but goes silent for two minutes is replaced. An order whose answer was lost counts as never sent only once Binance still does not know it two minutes after it went out (one a crash left behind: after its event); meanwhile reconciliation does not compare balances, which could take its trade for a transfer.
 
 ### Linux and macOS
 
-The Windows scripts (setup, update, autostart) have no Linux counterparts; systemd does the supervisor's job. A unit for the paper session, `/etc/systemd/system/tbot-paper.service` (replace `you` and the paths):
+The Windows scripts (setup, update, autostart) have no Linux counterparts; systemd does the supervisor's job. CI tests Windows and Linux; macOS is untested. A unit for the paper session, `/etc/systemd/system/tbot-paper.service` (replace `you` and the paths):
 
 ```ini
 [Unit]
@@ -185,7 +192,7 @@ TimeoutStopSec=120
 WantedBy=multi-user.target
 ```
 
-`sudo systemctl daemon-reload && sudo systemctl enable --now tbot-paper` starts it now and at every boot; `journalctl -u tbot-paper -f` shows its console. `Restart=on-failure` with `RestartPreventExitStatus=3 4` is the exit code policy above (`RestartSteps` and `RestartMaxDelaySec` need systemd 254 or later; older versions ignore them and wait a minute each time). For testnet the command is `tbot live testnet`, for real money `tbot live live --live`. `TBOT_SUPERVISED=1` makes a restart obey a `tbot stop`. `systemctl stop` lets the event in progress finish, like `tbot stop`. To update: `sudo systemctl stop tbot-paper`, `git pull`, `uv sync --frozen`, `tbot doctor --offline paper`, `sudo systemctl start tbot-paper`. Keep the machine from sleeping. On macOS, a launchd agent with the same command, `WorkingDirectory`, and `KeepAlive` set to restart on a non-zero exit does the same.
+`sudo systemctl daemon-reload && sudo systemctl enable --now tbot-paper` starts it now and at every boot; `journalctl -u tbot-paper -f` shows its warnings and errors (a supervised session prints no more), and `tbot log paper -f` everything. `Restart=on-failure` with `RestartPreventExitStatus=3 4` is the exit code policy above (`RestartSteps` and `RestartMaxDelaySec` need systemd 254 or later; older versions ignore them and wait a minute each time). For testnet the command is `tbot live testnet`, for real money `tbot live live --live`. `TBOT_SUPERVISED=1` makes a restart obey a `tbot stop`. `systemctl stop` lets the event in progress finish, like `tbot stop`. To update: `sudo systemctl stop tbot-paper`, `git pull --autostash` (a backtest's lines in the trial log are kept), `uv sync --frozen`, `uv run tbot doctor --offline paper`, `sudo systemctl start tbot-paper`. Keep the machine from sleeping. On macOS, a launchd agent with the same command and `WorkingDirectory` can keep it running, but `KeepAlive` restarts it after every exit, 3 and 4 too, and only `ThrottleInterval` (set it to 60 or more) spaces the tries: watch its log.
 
 ### Moving to another PC
 
@@ -213,15 +220,27 @@ WantedBy=multi-user.target
 | No Telegram messages | `tbot notify` sends a test message and says what is wrong; a running session with `telegram_commands` blocks `tbot notify` from reading messages (stop it, or turn the option off). |
 | The monitor says the bot is down, but it runs | Pings pause while a stream is stale or reconciliation fails: `tbot log <config> --level warning` says which. |
 | `tbot status` shows a config as invalid | The file does not load: `tbot doctor <config>` names the key (and the line, for a YAML syntax error). |
-| `only network checks failed` from `tbot autostart` | Binance could not be reached or refused this region: try again when `tbot doctor` passes, or pass `-SkipDoctor`. |
+| `only network checks failed` from `tbot autostart` | Binance, Telegram, or the heartbeat monitor could not be reached: try again when `tbot doctor` passes, or pass `-SkipDoctor`. |
+| `was written by tbot X, newer than this tbot` (exit 3) | The ledger was kept by a newer version: `tbot update`, or restore a backup made before. |
+| `.env, with the keys, can be read by ...` (doctor) | Limit `.env` to your account: see Security below. |
+| `the stored bars start ..., long after the period's start` | Only recent bars are stored: run the `tbot download` it names, or set a later `start:`. |
 | `tbot check` reports gaps of a week or more | Data is missing (a deleted file, an interrupted copy): delete the stream's folder under `data/binance/spot/klines/` and run `tbot download`. |
 
-Run any command with `TBOT_DEBUG=1` set in the terminal for a full traceback, and `tbot log <config> --level warning` for the problems a session logged.
+Run any command with `TBOT_DEBUG` set in the terminal (PowerShell: `$env:TBOT_DEBUG = 1`) for a full traceback, and `tbot log <config> --level warning` for the problems a session logged. To ask for help, attach the report `tbot support` writes (no keys or tokens in it; read it first: it shows balances and trades).
+
+### Words used here
+
+- **Bar**: one candle of a timeframe (4h: open, high, low, close, volume); a **bar event** is the moment one closes and the strategies decide.
+- **Ledger**: the session's SQLite file (`data/paper.sqlite`); the **book** is what it says the bot holds (cash and coins), rebuilt from it at every start.
+- **Reconciliation**: comparing the book with the exchange's balances every few minutes, and booking what changed from outside.
+- **Kill switch** (guard): sells everything and halts after a set drawdown from the peak, until `tbot resume`.
+- **In-sample / out-of-sample**: data the settings were chosen on, and data they were not; only the second says how a strategy may trade.
+- **Supervisor**: `scripts\run_bot.ps1` under the scheduled task (systemd on Linux), which starts the bot again after a crash.
 
 ## Security
 
-- `.env` holds the API keys and the Telegram token; it is never committed (the git hooks refuse it and scan every commit for keys). The ledgers and logs hold no secrets.
-- The API key needs spot trading only: withdrawals off, so a stolen key cannot move money out. `tbot doctor live` fails a key that can withdraw.
+- `.env` holds the API keys and the Telegram token; it is never committed (the git hooks refuse it and scan every commit for keys). Setup and `tbot notify` make a new `.env` readable by your account only and keep that when they change it; `tbot doctor` warns when other accounts can read it. The ledgers and logs hold no secrets, and `tbot support` leaves any key-shaped text out of its report.
+- The API key needs spot trading only: withdrawals off, so a stolen key cannot move money out. `tbot doctor live` fails a key that can withdraw, and a live session refuses to start with one.
 - On a PC that other people use, restrict the repository folder to your account, so nobody else can read `.env` or change the code the bot runs. Once, in PowerShell in the folder: `icacls . /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"` (you, SYSTEM, and administrators; files created later inherit it).
 - To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
@@ -229,13 +248,14 @@ Run any command with `TBOT_DEBUG=1` set in the terminal for a full traceback, an
 
 ```sh
 git config core.hooksPath .githooks     # once per clone (setup does it)
+uv sync --group dev                     # the tools below; users need none of them
 uv run python -m ruff check .
 uv run python -m ruff format .
 uv run python -m mypy
 uv run python -m pytest
 ```
 
-GitHub Actions runs the same checks, the git guard's audit, and the tests on Windows and Linux for every push to main, every release tag, and every pull request, and every Monday against the newest versions of the dependencies (`.github/workflows/ci.yml`).
+GitHub Actions runs the same checks, the git guard's audit, and the tests on Windows and Linux for every push to main, every release tag, and every pull request (on Windows also the PowerShell scripts, with the scheduled-task and elevation commands stubbed); a release tag also publishes a GitHub release with that version's CHANGELOG section, and every Monday against the newest versions of the dependencies (`.github/workflows/ci.yml`).
 
 The hooks are shell scripts (Git for Windows runs them):
 

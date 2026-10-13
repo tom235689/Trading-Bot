@@ -95,3 +95,13 @@ def test_writers_take_turns(tmp_path: Path) -> None:
         assert other.is_alive()  # it waits instead of merging into a stale read
     other.join(5)
     assert store.read("BTCUSDT", H4).height == 4
+
+
+def test_a_temporary_file_a_dead_writer_left_is_removed(tmp_path: Path) -> None:
+    store = BarStore(tmp_path)
+    directory = store.directory("BTCUSDT", H4)
+    directory.mkdir(parents=True)
+    stale = directory / "2023.4242.tmp"  # a crash between writing and renaming
+    stale.write_bytes(b"partial")
+    store.write("BTCUSDT", H4, make_bars(NEW_YEAR_EVE, 3, H4))
+    assert not stale.exists()

@@ -3,6 +3,6 @@
 # Tools run through python -m: generated launcher .exe files can be blocked on Windows.
 set -e
 uv run --quiet --frozen python scripts/git_guard.py pre-commit
-uv run --quiet --frozen python -m ruff check .
-uv run --quiet --frozen python -m ruff format --check .
-uv run --quiet --frozen python -m mypy
+uv run --quiet --frozen --group dev python -m ruff check .
+uv run --quiet --frozen --group dev python -m ruff format --check .
+uv run --quiet --frozen --group dev python -m mypy

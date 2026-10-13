@@ -1,6 +1,14 @@
 """Number formats shared by messages and pages."""
 
 import math
+from datetime import datetime
+
+
+def clock_text(moment: datetime) -> str:
+    """`08:00 UTC`, with the local time beside it where this computer is not on UTC."""
+    local = moment.astimezone()
+    here = "" if local.utcoffset() == moment.utcoffset() else f" ({local:%H:%M} here)"
+    return f"{moment:%H:%M} UTC{here}"
 
 
 def price_text(price: float) -> str:

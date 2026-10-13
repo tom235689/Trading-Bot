@@ -16,7 +16,7 @@ from tbot.execution.sim_broker import CostModel, SimulatedBroker
 from tbot.live.compare import compare_session, comparison_text, match_fills
 from tbot.live.config import PaperConfig
 from tbot.live.executor import PaperExecutor
-from tbot.live.ledger import Adjustment, Ledger
+from tbot.live.ledger import Adjustment, EquityPoint, Ledger
 from tbot.live.runner import SessionTrader, build_session, restore_portfolio
 from tbot.risk.guard import GuardConfig, RiskGuard
 
@@ -98,7 +98,10 @@ def run_session(
     return cfg, store
 
 
-def test_a_paper_session_tracks_its_backtest(tmp_path: Path) -> None:
+def test_a_paper_session_tracks_its_backtest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.live.compare.MIN_MATCHED_FILLS", 8)  # the fills this run has
     cfg, store = run_session(tmp_path)
     with Ledger(cfg.ledger) as ledger:
         comparison = compare_session(cfg, ledger, store)
@@ -148,7 +151,8 @@ def test_compare_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     path = tmp_path / "paper.yaml"
     path.write_text(cfg.model_dump_json(), encoding="utf-8")
     assert main(["compare", str(path), "--data-dir", str(tmp_path / "data")]) == 0
-    assert "verdict: tracks the backtest" in capsys.readouterr().out
+    out = capsys.readouterr().out  # 8 matched fills: on track, not proven yet
+    assert "verdict: on track so far, but 8 matched fills are too few to judge" in out
     fresh = cfg.model_copy(update={"ledger": tmp_path / "never_ran.sqlite"})
     path.write_text(fresh.model_dump_json(), encoding="utf-8")
     assert main(["compare", str(path)]) == EXIT_ERROR
@@ -210,3 +214,15 @@ def test_a_few_bps_of_extra_cost_are_flagged(tmp_path: Path) -> None:
     with Ledger(cfg.ledger) as ledger:
         checks = compare_session(cfg, ledger, store).checks()
     assert any("beyond the 5 bps of slippage it already assumes" in check for check in checks)
+
+
+def test_one_bar_event_says_when_the_first_comparison_comes(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    values = closes()[:50]
+    store = BarStore(tmp_path / "data")
+    store.write(*KEY, price_bars(T0, H4, values, values))
+    first = T0 + H4.delta * 51  # a close the store does not have yet
+    with Ledger(cfg.ledger) as ledger:
+        ledger.add_equity(EquityPoint(first, 10_000.0, 10_000.0, 0.0))
+        with pytest.raises(ValueError, match="one bar event so far"):
+            compare_session(cfg, ledger, store)

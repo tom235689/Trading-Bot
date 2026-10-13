@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.8.0 (2026-10-13)
+
+Product readiness, from six reviews of 0.7.0: its own changes, months of unattended running, security, a new user following the README on a fresh clone, a randomized simulation of live trading with injected faults (12,800 bars, 28,877 reconciliations, 915 crashes), and what a shippable product lacks. Upgrade notes:
+- A live session (`mode: live`) refuses to start without Telegram, or with an API key that can withdraw or cannot trade spot; `tbot doctor` already failed these.
+- Ledgers now record their schema version and the tbot that wrote them; an older tbot refuses a ledger a newer one wrote (exit 3) instead of misreading it.
+- `uv sync` installs the bot only: ruff, mypy, and pytest come with `uv sync --group dev` (the git hooks and CI ask for them). uv 0.12 or later is required.
+- `tbot doctor` warns about the clock from 3 seconds (was 1), and calls a running session OK.
+- Testnet keys may go in `TBOT_BINANCE_TESTNET_API_KEY` and `_SECRET`, so a testnet session keeps running once the main pair is a live key.
+
+**Live trading**
+- An order whose answer was lost is no longer taken for a transfer: while one is in doubt, reconciliation does not compare balances (0.7.0's two minutes of patience let it book the trade a second time).
+- After a crash during a sell, the restart puts the stop back at once: the patience runs from the order's event, not from the restart.
+- A pair Binance stops listing with a stop or an order in doubt on it no longer fails every reconciliation and pauses all trading.
+- Each event first books stops that executed since the last look, so the kill switch never values coins a stop already sold.
+- A changed `initial_cash` rescales the guard at the first reconciliation, once stops that executed while the bot was down are booked.
+- A stop refused for a filter Binance changed is placed again on reloaded rules at once; a finer step found by a reload gets the remainder a stop; a book less than a step above the account gets no false "locked" alert.
+- The saved strategy targets keep moving while a pair is paused or a stream is stale.
+
+**Alerts and monitoring**
+- A ledger that cannot be written (a full disk) no longer silences the crash alert, and a session that dies outside its own alerts is alerted by the command.
+- A websocket silent across a bar close is replaced; quiet pairs that send nothing between closes are left alone (0.7.0 reconnected them every two minutes).
+- A log backup held open by another program no longer loses a whole log generation at the next rotation.
+- Doctor and the daily summary say when a newer release is out (`git ls-remote` on the clone's remote, once a day).
+- The clock counts a Linux suspend; the clock warning is logged once, not every ten minutes.
+
+**Security**
+- `tbot notify` pairs only with the exact code (8 hex digits) sent after it was shown: a stranger can no longer flood the bot with every code to take the alerts.
+- `.env` is created readable by your account only (setup, `tbot notify`), keeps its permissions when changed, and doctor warns when others can read it.
+- Spaces around a key in `.env` are dropped, so an HTTP error can no longer carry the key into the log.
+- The git guard opens zip files (also docx, xlsx), reads UTF-32, and knows the ping URLs of other monitors.
+
+**Command line**
+- `tbot support` writes a report for a help request: versions, configs, offline doctor checks, the overview, recent warnings, without keys or tokens.
+- A backtest whose stored bars start long after its period's start is refused instead of passing a few months off as years.
+- `tbot check` names short gaps as normal exchange pauses and lists only gaps of a day or more; default streams never downloaded are not failures.
+- `tbot compare` needs 10 matched fills before it says a session tracks its backtest, and after one bar event says when the first comparison comes.
+- A -2015 key error says what to check; a never-started live config no longer suggests starting it; times of the next decision show local time too; status names the last closed bar.
+- A backtest prints a reminder that past results are no forecast, and a failed validation says plainly not to trade it with money you need.
+- A config of another kind that does not load as one says both; `--timeframes 15M` is 15 minutes (only `1M` is refused); `--html` with a wrong name fails before the run.
+- `tbot help`, the doctor timeframe warning for sessions under 15m bars, and progress lines for long runs.
+
+**Windows scripts**
+- `tbot autostart` calls a Telegram or API outage a network failure too.
+- `tbot update` says how to go on when a release changes lines you edited.
+- Setup goes on to doctor when the download fails, and makes `.env` private.
+
+**Project**
+- CI tests the PowerShell scripts on Windows (every script parses; arguments survive the elevated hand-over; dry runs) and publishes a GitHub release with the CHANGELOG section for every version tag.
+- README: a glossary, proxy and VPN notes, testnet keys, `git pull --autostash` for Linux, macOS marked untested, and the systemd journal described as it is.
+
+**Tests**
+- 48 new tests (563 in all); undoing any of 42 fixes makes a test fail.
+
 ## 0.7.0 (2026-10-12)
 
 A line-by-line review of the whole code base in six parts: the order path, the session runner and its state, the command line, backtest and research, data and monitoring, and the scripts and documents. Upgrade notes:

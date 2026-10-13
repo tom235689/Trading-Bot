@@ -22,7 +22,7 @@ from tbot import __version__
 from tbot.backtest.runner import WARMUP_MARGIN, history_bars
 from tbot.core.config import TradingConfig
 from tbot.core.models import Fill
-from tbot.core.text import price_text
+from tbot.core.text import clock_text, price_text
 from tbot.core.timeframe import Timeframe, to_millis
 from tbot.data.downloader import NotListed, sync
 from tbot.data.store import BarStore
@@ -44,6 +44,7 @@ from tbot.live.feed import Batch, LiveFeed, bars_since, close_time, utc_now
 from tbot.live.history import MAX_BARS, BarHistory
 from tbot.live.ledger import Adjustment, Ledger, config_hash
 from tbot.live.reconcile import reconcile
+from tbot.live.release import newest_release, update_note
 from tbot.live.session import Checkpoint, StreamKey, TradingSession, replay_history
 from tbot.monitoring.heartbeat import heartbeat_loop
 from tbot.monitoring.telegram import LogNotifier, Notifier, QueuedNotifier, Telegram
@@ -69,17 +70,38 @@ BUDGET_NOTE = "initial_cash changed"  # adjustments that book a changed budget
 OWED_META = "budget_owed"  # what a lowered budget took beyond the book's cash (<= 0)
 # The book's value after the last transfer, with the equity snapshot it follows.
 MOVED_META = "equity_after_transfer"
+# A live budget change the guard is rescaled for once the first reconciliation has booked
+# what traded meanwhile (stops, orders in doubt).
+SHIFT_META = "budget_shift_pending"
 HEARTBEAT_URL_HINT = "TBOT_HEARTBEAT_URL must be a full http(s):// URL"
 MODE_META = "mode"  # paper, testnet, or live: what the book is
 EXIT_REFUSED = 4  # as the command line's config error: the supervisor gives up
 KEYS_MISSING = (
     "set TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET in .env: testnet keys from "
-    "testnet.binance.vision, live keys from API Management on binance.com"
+    "testnet.binance.vision (or TBOT_BINANCE_TESTNET_API_KEY and _SECRET), live keys from "
+    "API Management on binance.com"
 )
+RELEASE_FIRST = 600.0  # seconds after a start before asking whether a newer release is out
+RELEASE_EVERY = 86400.0
 KEY_REJECTED = (
     "check TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET in .env; tbot signs with HMAC, so "
     "the key must be a system-generated (HMAC) one, not Ed25519 or RSA"
 )
+KEY_REFUSED = -2015  # wrong key, wrong network, missing permission, or IP not allowed
+KEY_REFUSED_HINT = (
+    "the key is mistyped, made for the other network (testnet keys work only on testnet), "
+    "lacks spot trading permission, or allows only other IP addresses"
+)
+
+
+def key_hint(exc: Exception) -> str:
+    """What to check when Binance refuses the key, or ""."""
+    code = getattr(exc, "code", None)
+    if code in KEY_ERRORS:
+        return KEY_REJECTED
+    return KEY_REFUSED_HINT if code == KEY_REFUSED else ""
+
+
 TARGETS_META = "targets"
 OPERATIONAL = {"ledger", "backup_days", "telegram_commands"}  # not in the config hash
 _background: set[asyncio.Task[bool]] = set()
@@ -122,6 +144,9 @@ class SessionTrader:
         self.health = health or Health()
         self._paused = False  # a blocked bar was announced; later ones are only logged
         self._handled: tuple[datetime | None, set[StreamKey]] = (None, set())
+        # Streams a close may never bring (stale, or a pair Binance does not trade): the
+        # checkpoint does not wait for them.
+        self.quiet: Callable[[], set[StreamKey]] = set
 
     async def handle(self, batch: Batch) -> list[Fill]:
         async with self.lock:
@@ -130,6 +155,7 @@ class SessionTrader:
     async def _handle(self, batch: Batch) -> list[Fill]:
         session = self.session
         now = max(close_time(key, bar) for key, bar in batch.items())
+        await self.executor.before_event(session.portfolio)  # a stop that sold meanwhile
         orders = session.ingest(batch, now)
         for slot in session.slots:
             if any((s, slot.timeframe) in batch for s in slot.strategy.symbols):
@@ -216,7 +242,7 @@ class SessionTrader:
             self._handled = (now, set())
         self._handled[1].update(batch)
         due = {key for key in self.session.keys if to_millis(now) % key[1].millis == 0}
-        return due <= self._handled[1]
+        return due - self.quiet() <= self._handled[1]
 
     def save_guard(self) -> None:
         self.ledger.set_meta(GUARD_META, self.guard.state.model_dump_json())
@@ -277,7 +303,7 @@ def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard, now: d
             ledger.set_meta(BASE_META, stored if stored is not None else repr(config.initial_cash))
         if stored is not None and float(stored) != config.initial_cash:
             change = config.initial_cash - float(stored)
-            equity = book_equity(config, ledger)
+            equity = book_equity(config, ledger) + pending_shift(ledger)
             if equity + change < 0:
                 raise StartRefused(
                     f"initial_cash {config.initial_cash:,.2f} takes {-change:,.2f} out of a "
@@ -290,9 +316,12 @@ def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard, now: d
             note = f"{BUDGET_NOTE} from {float(stored):,.2f} to {config.initial_cash:,.2f}"
             ledger.add_adjustment(Adjustment(now, "", 0.0, change, note))
             ledger.set_meta(OWED_META, repr(owed))
-            guard.shift(change, equity)
-            ledger.set_meta(GUARD_META, guard.state.model_dump_json())
-            note_transfer(ledger, equity + change)
+            if isinstance(config, LiveConfig):  # stops may have sold since the last bar
+                ledger.set_meta(SHIFT_META, repr(pending_shift(ledger) + change))
+            else:
+                guard.shift(change, equity)
+                ledger.set_meta(GUARD_META, guard.state.model_dump_json())
+                note_transfer(ledger, equity + change)
             ledger.add_event(now, "warning", f"{note}; booked as a transfer")
         ledger.set_meta(BUDGET_META, repr(config.initial_cash))
 
@@ -310,6 +339,25 @@ def book_equity(config: SessionConfig, ledger: Ledger) -> float:
     last = {fill.symbol: fill.price for fill in ledger.fills()}  # no bar event valued it yet
     book = restore_portfolio(config, ledger)
     return book.cash + sum(qty * last.get(s, 0.0) for s, qty in book.positions.items())
+
+
+def pending_shift(ledger: Ledger) -> float:
+    raw = ledger.get_meta(SHIFT_META)
+    return float(raw) if raw is not None else 0.0
+
+
+def apply_budget_shift(guard: RiskGuard, ledger: Ledger, equity: float) -> None:
+    """Rescale the guard for budget changes booked at the start, now that the book holds
+    what executed meanwhile; `equity` is the book's value with the changes."""
+    change = pending_shift(ledger)
+    if not change:
+        return
+    with ledger.atomic():
+        adopt_resume(guard, ledger)
+        guard.shift(change, equity - change)
+        ledger.set_meta(GUARD_META, guard.state.model_dump_json())
+        ledger.delete_meta(SHIFT_META)
+        note_transfer(ledger, equity)
 
 
 def note_transfer(ledger: Ledger, equity: float) -> None:
@@ -554,6 +602,16 @@ async def summary_loop(
             log.error("summary_failed", error=repr(exc))
 
 
+async def release_loop(found: list[str]) -> None:
+    """Once a day, see whether a newer release is out; the daily summary says so."""
+    await asyncio.sleep(RELEASE_FIRST)
+    while True:
+        note = update_note(await asyncio.to_thread(newest_release))
+        if note:
+            found[:] = [note]
+        await asyncio.sleep(RELEASE_EVERY)
+
+
 async def clock_loop(clock: ServerClock, interval: float) -> None:
     while True:
         await asyncio.sleep(interval)
@@ -785,6 +843,7 @@ async def run_session(
             if problem:
                 raise LedgerModeError(problem)
             ledger.set_meta(MODE_META, session_mode(config))
+            ledger.mark_written()
             return await _run_session(
                 config,
                 settings,
@@ -897,13 +956,13 @@ async def _trade(
         except Exception as exc:  # tell the operator; a supervisor would restart silently
             log.error("start_failed", error=repr(exc))
             ledger.add_event(utc_now(), "error", f"failed to start: {exc!r}")
+            hint = f"; {key_hint(exc)}" if key_hint(exc) else ""
             if permanent(exc):  # the same at every try: say so, and let the supervisor stop
-                hint = f"; {KEY_REJECTED}" if getattr(exc, "code", None) in KEY_ERRORS else ""
                 await notifier.send(
                     f"[{label}] cannot start: {exc}{hint}; fix the config, then start"
                 )
                 return EXIT_REFUSED
-            await notifier.send(f"[{label}] failed to start: {start_problem(exc)}")
+            await notifier.send(f"[{label}] failed to start: {start_problem(exc)}{hint}")
             return 1
         trader = SessionTrader(
             session,
@@ -930,6 +989,7 @@ async def _trade(
             on_stale=lambda key, last: _report_stale(ledger, notifier, label, key, last),
             on_fresh=lambda key: _report_fresh(ledger, notifier, label, key),
         )
+        trader.quiet = lambda: quiet_streams(feed, getattr(executor, "spot", None))
         point = session.snapshot(now)
         where = config.ledger.resolve()
         ledger.add_event(now, "info", f"started ({label}), tbot {__version__}, ledger {where}")
@@ -942,8 +1002,11 @@ async def _trade(
             f"ledger {where}{fresh}{halted}"
         )
 
+        release: list[str] = []  # an update note, once a newer release is found
+
         def notes() -> list[str]:
             found = [f"PAUSED: {health.blocked}"] if health.blocked else []
+            found.extend(f"UPDATE: {note}" for note in release)
             unprotected = sorted(getattr(executor, "unprotected", ()))
             if unprotected:
                 found.append(f"NO EXCHANGE STOP: {', '.join(unprotected)}")
@@ -963,6 +1026,7 @@ async def _trade(
             asyncio.create_task(feed.run_watchdog(), name="watchdog"),
             asyncio.create_task(consume(feed, trader), name="consume"),
             asyncio.create_task(summary, name="summary"),
+            asyncio.create_task(release_loop(release), name="release"),
             *(asyncio.create_task(coro, name=f"extra{i}") for i, coro in enumerate(extra)),
             asyncio.create_task(
                 watch_stop_request(stop_path(config.ledger), stop), name="stop-request"
@@ -1018,6 +1082,14 @@ async def _trade(
     return code
 
 
+def quiet_streams(feed: LiveFeed, spot: BinanceSpot | None) -> set[StreamKey]:
+    """Streams a close may never bring: stale ones, and pairs Binance does not trade."""
+    found = set(feed.stale())
+    if spot is not None:
+        found |= {key for key in feed.keys if not spot.trading(key[0])}
+    return found
+
+
 def heartbeat_problem(
     stale: Sequence[StreamKey], blocked: str, spot: BinanceSpot | None = None
 ) -> str:
@@ -1062,12 +1134,12 @@ def make_spot(
     clock: Callable[[], datetime],
     resync: Callable[[], Awaitable[object]] | None = None,
 ) -> BinanceSpot:
-    if not settings.binance_api_key or not settings.binance_api_secret:
+    keys = settings.api_keys(config.mode)
+    if keys is None:
         raise StartRefused(KEYS_MISSING)
     return BinanceSpot(
         client,
-        settings.binance_api_key,
-        settings.binance_api_secret,
+        *keys,
         base_url=TESTNET_URL if config.mode == "testnet" else PRODUCTION_URL,
         clock=clock,
         recv_window=config.recv_window,
@@ -1094,11 +1166,17 @@ async def reconcile_round(
     await executor.check_rules()
     booked = await executor.settle(portfolio)
     balances = await spot.balances()
-    if await executor.settle(portfolio):
-        # Something executed while the balances were read: they may show it or not,
-        # and comparing them now could count it twice. Next round.
-        log.info("reconcile_deferred")
-        await executor.after_event(portfolio, marks)
+    late = await executor.settle(portfolio)
+    apply_budget_shift(guard, ledger, portfolio.equity(marks))
+    if late or executor.in_doubt():
+        # Something executed while the balances were read (they may show it or not), or
+        # an order Binance may still list: comparing now would take a trade for a
+        # transfer and book it twice. Next round.
+        log.info("reconcile_deferred", in_doubt=not late)
+        if booked or late:
+            await executor.after_event(portfolio, marks)
+        elif executor.unprotected:
+            await executor.protect(portfolio, marks)
         return
 
     def shift_guard(adjustments: list[Adjustment]) -> None:
@@ -1173,8 +1251,13 @@ async def run_live(
 ) -> int:
     if config.mode == "live" and not confirmed:
         raise ValueError("config mode is live: pass --live to trade real money")
-    if not settings.binance_api_key or not settings.binance_api_secret:
+    if settings.api_keys(config.mode) is None:
         raise StartRefused(KEYS_MISSING)  # before a ledger exists for nothing
+    if config.mode == "live" and not (settings.telegram_token and settings.telegram_chat_id):
+        raise StartRefused(
+            "a real-money session must be able to send alerts: set up Telegram with "
+            "`tbot notify` first"
+        )
     label = config.mode
 
     async def setup(ctx: Context) -> tuple[Executor, list[Coroutine[Any, Any, None]]]:
@@ -1184,6 +1267,8 @@ async def run_live(
         spot = make_spot(config, settings, ctx.aclient, ctx.clock.now, resync)
         symbols = symbols_of(config)
         await spot.load_rules(symbols)
+        if config.mode == "live":
+            await check_key_rights(spot)
         executor = LiveExecutor(
             spot,
             ctx.ledger,
@@ -1223,6 +1308,22 @@ async def run_live(
         return executor, [loop]
 
     return await run_session(config, settings, data_dir, label=label, setup=setup, stop=stop)
+
+
+async def check_key_rights(spot: BinanceSpot) -> None:
+    """Real money only with a key that cannot withdraw: a stolen one could empty the
+    account. Rights Binance does not show leave the start to go on; doctor says so."""
+    try:
+        rights = await spot.api_restrictions()
+    except (httpx.HTTPError, BinanceError) as exc:
+        log.warning("key_rights_unknown", error=repr(exc))
+        return
+    if rights.get("enableWithdrawals", True):
+        raise StartRefused(
+            "the API key can withdraw: turn off withdrawals for it in Binance API Management"
+        )
+    if not rights.get("enableSpotAndMarginTrading", False):
+        raise StartRefused("the API key cannot trade spot: turn on spot trading for it")
 
 
 def resume(config: SessionConfig) -> str:
@@ -1328,7 +1429,7 @@ def status_text(config: SessionConfig, store: BarStore) -> str:
                 f"cash {point.cash:,.2f}, exposure {point.exposure:.1%}"
                 if point
                 else f"no bar event yet: the first comes with the next {timeframe} close, "
-                f"{first:%H:%M} UTC"
+                f"{clock_text(first)}"
             ),
             f"fills {len(portfolio.fills)}, round trips {len(portfolio.trades)}, "
             f"adjustments {len(ledger.adjustments())}",
@@ -1343,7 +1444,7 @@ def status_text(config: SessionConfig, store: BarStore) -> str:
         for symbol, timeframe in stream_keys(config):
             last = store.last_open_time(symbol, timeframe)
             lines.append(
-                f"last stored bar {symbol} {timeframe}: {last:%Y-%m-%d %H:%M}"
+                f"last closed bar {symbol} {timeframe}: {last + timeframe.delta:%Y-%m-%d %H:%M} UTC"
                 if last
                 else f"no bars {symbol} {timeframe}"
             )

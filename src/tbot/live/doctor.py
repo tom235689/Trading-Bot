@@ -4,6 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
@@ -12,25 +13,26 @@ from pydantic import ValidationError
 from tbot import __version__
 from tbot.backtest.runner import run_period
 from tbot.core.config import streams_of
+from tbot.core.timeframe import Timeframe
 from tbot.data.http import describe_error
 from tbot.data.store import BarStore
 from tbot.exchange.binance import (
-    KEY_ERRORS,
     PRODUCTION_URL,
     TESTNET_URL,
     BinanceError,
     BinanceSpot,
 )
 from tbot.live.backup import daily_backups
-from tbot.live.config import LiveConfig, SessionConfig, Settings
+from tbot.live.config import LiveConfig, SessionConfig, Settings, env_readers
 from tbot.live.ledger import Ledger, LedgerUnavailable
+from tbot.live.release import newest_release, update_note
 from tbot.live.runner import (
     HEARTBEAT_URL_HINT,
-    KEY_REJECTED,
     KEYS_MISSING,
     AlreadyRunning,
     StartRefused,
     instance_lock,
+    key_hint,
     load_guard,
     make_spot,
     mode_problem,
@@ -43,7 +45,7 @@ from tbot.live.runner import (
 from tbot.monitoring.telegram import Telegram, migrated_to
 from tbot.portfolio.allocation import build_slots
 
-MAX_CLOCK_OFFSET = 1.0  # seconds; the bot corrects for it, but a drifting clock needs a fix
+MAX_CLOCK_OFFSET = 3.0  # seconds; the bot corrects for it, but a drifting clock needs a fix
 # Failures a session starts despite: offline they warn, so `tbot update` restarts a bot
 # that ran before it (only what stops a start keeps it down).
 STARTS_ANYWAY = frozenset({"telegram", "heartbeat", "kill switch"})
@@ -72,10 +74,19 @@ async def run_checks(
     fails only on what stops a session from starting."""
     real_money = isinstance(config, LiveConfig) and config.mode == "live"
     checks = strategy_checks(config) + ledger_checks(config) + alert_checks(settings, real_money)
-    if isinstance(config, LiveConfig) and not (
-        settings.binance_api_key and settings.binance_api_secret
-    ):
+    if isinstance(config, LiveConfig) and settings.api_keys(config.mode) is None:
         checks.append(Check("fail", "api key", KEYS_MISSING))
+    env = Path(".env")
+    readers = env_readers(env) if env.is_file() else []
+    if readers:
+        checks.append(
+            Check(
+                "warn",
+                "env",
+                f".env, with the keys, can be read by {', '.join(readers)}: limit it to "
+                "your account (README, Security)",
+            )
+        )
     if offline:
         checks = [
             Check("warn", c.name, c.detail) if c.status == "fail" and c.name in STARTS_ANYWAY else c
@@ -111,7 +122,11 @@ async def run_checks(
             "ok" if abs(offset) <= MAX_CLOCK_OFFSET else "warn",
             "clock",
             f"this computer is {abs(offset):.2f} s {side} Binance"
-            + ("" if abs(offset) <= MAX_CLOCK_OFFSET else "; turn on the system's time sync"),
+            + (
+                ""
+                if abs(offset) <= MAX_CLOCK_OFFSET
+                else "; turn on time sync (Windows: Settings, Time & language, Sync now)"
+            ),
         )
     )
     if live is None:
@@ -121,6 +136,9 @@ async def run_checks(
     if settings.telegram_token and settings.telegram_chat_id:
         verified = await telegram_check(settings.telegram_token, settings.telegram_chat_id, client)
         checks = [verified if c.name == "telegram" else c for c in checks]
+    note = update_note(await asyncio.to_thread(newest_release))
+    if note:
+        checks.append(Check("warn", "version", note))
     return checks
 
 
@@ -134,12 +152,14 @@ async def telegram_check(token: str, chat: str, client: httpx.AsyncClient) -> Ch
             return Check(
                 "fail", "telegram", "Telegram does not know TBOT_TELEGRAM_TOKEN (`tbot notify`)"
             )
-        return Check("fail", "telegram", f"cannot check the token: {describe_error(exc)}")
+        return Check("fail", "telegram", f"unreachable: {describe_error(exc)}")
     except httpx.HTTPError as exc:  # the token is in the URL: never print it
         return Check("fail", "telegram", f"unreachable: {describe_error(exc)}")
     try:
         await bot.chat()
     except httpx.HTTPStatusError as exc:
+        if exc.response.status_code >= 500 or exc.response.status_code == 429:
+            return Check("fail", "telegram", f"unreachable: {describe_error(exc)}")
         moved = migrated_to(exc.response)
         if moved:
             return Check(
@@ -167,7 +187,18 @@ def strategy_checks(config: SessionConfig) -> list[Check]:
     except ValueError as exc:
         return [Check("fail", "strategies", str(exc))]
     names = ", ".join(f"{s.strategy.name} {s.timeframe}" for s in slots)
-    return [Check("ok", "strategies", names)]
+    checks = [Check("ok", "strategies", names)]
+    finest = min((s.timeframe for s in slots), key=lambda t: t.millis)
+    if finest.millis < Timeframe.M15.millis:
+        checks.append(
+            Check(
+                "warn",
+                "timeframe",
+                f"{finest} bars: every closed bar rewrites a year of stored bars, and the "
+                "ledger grows by about 150 MB a year; sessions are made for 15m bars and up",
+            )
+        )
+    return checks
 
 
 def guard_check(config: SessionConfig, store: BarStore) -> Check:
@@ -264,7 +295,7 @@ def ledger_checks(config: SessionConfig) -> list[Check]:
         with instance_lock(config.ledger):
             pass
     except AlreadyRunning:
-        checks.append(Check("warn", "process", "a session is running on this ledger now"))
+        checks.append(Check("ok", "process", "a session is running on this ledger now"))
     else:
         if stop_path(config.ledger).exists():
             checks.append(
@@ -321,6 +352,8 @@ async def symbol_checks(config: SessionConfig, spot: BinanceSpot) -> list[Check]
         rules = await spot.load_rules(symbols)
     except BinanceError as exc:
         return [Check("fail", "symbols", exc.message)]
+    except httpx.HTTPError as exc:
+        return [Check("fail", "symbols", f"unreachable: {describe_error(exc)}")]
     paused = [f"{s} {spot.status[s]}" for s in sorted(rules) if not spot.trading(s)]
     if paused:
         return [
@@ -360,9 +393,12 @@ async def account_checks(
     checks = await symbol_checks(config, spot)
     try:
         account = await spot.account()
-    except (httpx.HTTPError, BinanceError) as exc:
-        key = isinstance(exc, BinanceError) and exc.code in KEY_ERRORS
-        hint = f"; {KEY_REJECTED}" if key else ""
+    except httpx.HTTPError as exc:
+        return [*checks, Check("fail", "api key", f"unreachable: {describe_error(exc)}")]
+    except BinanceError as exc:
+        if exc.status >= 500 or exc.status == 429:
+            return [*checks, Check("fail", "api key", f"unreachable: {exc}")]
+        hint = f"; {key_hint(exc)}" if key_hint(exc) else ""
         return [*checks, Check("fail", "api key", f"rejected: {exc}{hint}")]
     checks.append(
         Check("ok", "api key", f"valid on {spot.base_url}")

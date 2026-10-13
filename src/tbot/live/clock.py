@@ -1,6 +1,7 @@
 """Clock corrected to Binance server time. Local clocks drift by seconds; bars do not."""
 
 import json
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -10,7 +11,7 @@ import structlog
 from tbot.data.http import get_bytes
 
 SERVER_TIME_URL = "https://data-api.binance.vision/api/v3/time"
-WARN_OFFSET = 1.0  # seconds
+WARN_OFFSET = 3.0  # seconds; the bot corrects any offset, but a large one needs a fix
 ATTEMPTS = 4
 MAX_ROUND_TRIP = 2.0  # seconds; a slower sample says little about the offset
 # A REST bar counts as closed only this long after its close: the corrected clock can
@@ -18,6 +19,17 @@ MAX_ROUND_TRIP = 2.0  # seconds; a slower sample says little about the offset
 CLOSE_GRACE = timedelta(seconds=5)
 
 log = structlog.get_logger(__name__)
+
+if sys.platform == "linux":
+
+    def _ticks() -> float:
+        """Monotonic time that also counts a suspend (Linux's monotonic clock stops)."""
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+else:
+
+    def _ticks() -> float:
+        return time.monotonic()  # Windows and macOS count sleep already
 
 
 class ServerClock:
@@ -30,6 +42,7 @@ class ServerClock:
         self.offset = timedelta(0)  # server minus local wall clock, as last measured
         self.synced = False
         self.anchor: tuple[float, float] | None = None  # server time at a monotonic time
+        self.reported: float | None = None  # the offset last logged as a warning
 
     def sync(self) -> float:
         """Measure the offset with one quick round trip; return it in seconds.
@@ -40,7 +53,7 @@ class ServerClock:
         # Round trip, server time, and the monotonic and wall clocks at the midpoint.
         best: tuple[float, float, float, float] | None = None
         for attempt in range(ATTEMPTS):
-            before, wall_before = time.monotonic(), time.time()
+            before, wall_before = _ticks(), time.time()
             try:
                 body = get_bytes(self.client, SERVER_TIME_URL, retries=1)
             except httpx.HTTPError:
@@ -48,7 +61,7 @@ class ServerClock:
                     raise
                 time.sleep(2**attempt)
                 continue
-            after, wall_after = time.monotonic(), time.time()
+            after, wall_after = _ticks(), time.time()
             if body is None:
                 raise LookupError(f"not found: {SERVER_TIME_URL}")
             server = json.loads(body)["serverTime"] / 1000
@@ -65,7 +78,12 @@ class ServerClock:
         self.offset = timedelta(seconds=best[1] - best[3])
         self.synced = True
         seconds = self.offset.total_seconds()
-        level = log.warning if abs(seconds) > self.warn_offset else log.info
+        # Warned once, and again when it moves: every resync would repeat it otherwise.
+        large = abs(seconds) > self.warn_offset
+        moved = self.reported is None or abs(seconds - self.reported) > 1.0
+        if large and moved:
+            self.reported = seconds
+        level = log.warning if large and moved else log.info
         level("clock_synced", offset_seconds=round(seconds, 3))
         return seconds
 
@@ -73,4 +91,4 @@ class ServerClock:
         if self.anchor is None:
             return datetime.now(UTC)
         server, at = self.anchor
-        return datetime.fromtimestamp(server + time.monotonic() - at, UTC)
+        return datetime.fromtimestamp(server + _ticks() - at, UTC)
