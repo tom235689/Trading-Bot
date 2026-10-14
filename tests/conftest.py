@@ -27,4 +27,7 @@ def _own_turns(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Mon
 def _private_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Doctor's check of who can read the developer's own .env is no part of a test."""
     monkeypatch.setattr("tbot.live.doctor.env_readers", lambda path: [])
+    monkeypatch.setattr("tbot.cli.env_readers", lambda path: [])
     monkeypatch.setattr("tbot.live.doctor.synced_folder", lambda folder: "")
+    # Nor are the books of the developer's own config/ on the same account.
+    monkeypatch.setattr("tbot.live.doctor.other_books_cash", lambda config: (0.0, []))

@@ -13,8 +13,8 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.ref }}
+concurrency:  # a newer push replaces a running check; weekly runs and pushes never cancel each other
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

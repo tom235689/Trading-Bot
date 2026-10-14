@@ -19,6 +19,7 @@ from tbot.exchange.binance import (
     BinanceSpot,
     Order,
     SymbolRules,
+    parse_rules,
 )
 from tbot.live.config import LiveConfig
 from tbot.live.executor import (
@@ -1335,3 +1336,130 @@ def test_a_budget_change_after_a_withdrawal_scales_from_what_is_left(tmp_path: P
 
     guard = run(fake, tmp_path, action, stop_pct=0.0)
     assert guard.state.peak_equity == pytest.approx(300.0)  # 600 left, then 300 taken
+
+
+def stops(fake: FakeSpot) -> list[tuple[str, str]]:
+    return [(o["stopPrice"], o["status"]) for o in fake.orders if o["type"] == "STOP_LOSS"]
+
+
+def test_a_stop_stays_when_the_price_fell_through_the_new_level(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.01}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)  # a stop at 40,000
+        fake.prices[BTC] = 47000.0  # down from a close at 60,000 since
+        await executor.after_event(portfolio, {BTC: 60000.0})  # 48,000 would trigger at once
+        assert executor.unprotected == set()
+        return notifier.messages
+
+    assert run(fake, tmp_path, action) == []
+    assert stops(fake) == [("40000.00", "NEW")]
+
+
+def test_a_missing_stop_goes_below_the_price_when_it_fell_through_the_level(
+    tmp_path: Path,
+) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.01}, prices={BTC: 47000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> None:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        await executor.after_event(portfolio, {BTC: 60000.0})
+        assert executor.unprotected == set()
+
+    run(fake, tmp_path, action)
+    [(stop, status)] = stops(fake)
+    assert status == "NEW"
+    assert float(stop) == pytest.approx(47000.0 * 0.9999 * 0.8, abs=0.01)  # 20% under the bid
+
+
+def test_a_stop_a_failed_sale_cancelled_is_said_to_be_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.01}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)  # a stop is in place
+
+        async def limited(*args: object, **kwargs: object) -> Order:
+            async def down(symbol: str) -> list[Order]:
+                raise BinanceError(-1003, "Too many requests.", 429)
+
+            monkeypatch.setattr(executor.spot, "open_orders", down)  # paused from now on
+            raise BinanceError(-1003, "Too many requests.", 429)
+
+        monkeypatch.setattr(executor.spot, "market_order", limited)
+        assert await executor.execute({BTC: -0.01}, T0, portfolio, MARKS) == []
+        await executor.after_event(portfolio, MARKS)
+        return notifier.messages
+
+    messages = run(fake, tmp_path, action)
+    assert stops(fake) == [("40000.00", "CANCELED")]
+    [alert] = [m for m in messages if "protective stop failed" in m]  # none for ETH, not held
+    assert alert.startswith("[live] protective stop failed for BTCUSDT")
+    assert "The position has no exchange stop" in alert
+
+
+def test_turning_stops_off_cancels_the_one_placed_before(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.01}, prices={BTC: 50000.0})
+
+    def portfolio() -> Portfolio:
+        book = Portfolio(0.0)
+        book.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        return book
+
+    async def place(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> None:
+        await executor.after_event(portfolio(), MARKS)
+
+    async def off(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        book = portfolio()
+        await executor.after_event(book, MARKS)
+        await executor.after_event(book, MARKS)
+        return notifier.messages
+
+    run(fake, tmp_path, place)
+    messages = run(fake, tmp_path, off, stop_pct=0.0)
+    assert stops(fake) == [("40000.00", "CANCELED")]  # it would sell the coins later
+    assert fake.locked["BTC"] == pytest.approx(0.0)
+    assert [m for m in messages if "protective stops are off" in m] == [
+        "[live] protective stops are off (protective_stop_pct 0): cancelled the exchange "
+        "stop of BTCUSDT"
+    ]
+
+
+def test_the_largest_order_is_the_smaller_of_both_lot_limits() -> None:
+    lot = {"filterType": "LOT_SIZE", "stepSize": "0.00001", "minQty": "0.00001"}
+    market = {"filterType": "MARKET_LOT_SIZE", "stepSize": "0", "minQty": "0", "maxQty": "85.5"}
+    others = [
+        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+        {"filterType": "NOTIONAL", "minNotional": "5"},
+    ]
+
+    def rules(*filters: dict[str, str]) -> SymbolRules:
+        return parse_rules(
+            {"baseAsset": "BTC", "quoteAsset": "USDT", "filters": [*others, *filters]}
+        )
+
+    capped = rules({**lot, "maxQty": "9000"}, market)
+    assert capped.cap_quantity(-100.0) == -85.5
+    assert capped.cap_quantity(2.0) == 2.0
+    assert rules(lot).cap_quantity(1e6) == 1e6  # no limit given
+
+
+def test_a_market_order_above_the_exchange_maximum_sells_what_it_may(tmp_path: Path) -> None:
+    rules = fake_rules()
+    rules[BTC] = {**rules[BTC], "marketMaxQty": "1.00000"}
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 3.0}, prices={BTC: 50000.0}, rules=rules)
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        portfolio = Portfolio(0.0)
+        portfolio.positions[BTC] = 3.0
+        [fill] = await executor.execute({BTC: -3.0}, T0, portfolio, MARKS)
+        assert fill.quantity == pytest.approx(-1.0)  # the rest at the next decision
+        return portfolio
+
+    assert run(fake, tmp_path, action, stop_pct=0.0).position(BTC) == pytest.approx(2.0)

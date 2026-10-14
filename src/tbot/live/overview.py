@@ -9,6 +9,7 @@ from tbot.data.store import BarStore
 from tbot.live.config import SessionConfig
 from tbot.live.ledger import Ledger
 from tbot.live.runner import (
+    DAY_REFERENCE,
     GUARD_META,
     base_cash,
     is_running,
@@ -81,7 +82,7 @@ def _row(
     invested = base_cash(config, ledger) + sum(value for _, value in flows)
     earlier = ledger.equity_before(point.time - timedelta(days=1))
     day_change = None
-    if earlier and earlier.equity > 0:
+    if earlier and earlier.equity > 0 and earlier.time >= point.time - DAY_REFERENCE:
         moved = sum(value for at, value in flows if at > earlier.time)
         day_change = (point.equity - moved) / earlier.equity - 1
     positions = restore_portfolio(config, ledger).positions

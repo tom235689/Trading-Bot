@@ -36,7 +36,7 @@ param(
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 $repo = Split-Path -Parent $PSScriptRoot
-Set-Location $repo
+Set-Location -LiteralPath $repo
 if (-not $Uv) {
     $found = Get-Command uv -ErrorAction SilentlyContinue
     if ($found) { $Uv = $found.Source; $PSBoundParameters["Uv"] = $Uv }

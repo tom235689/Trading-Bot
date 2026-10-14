@@ -68,6 +68,7 @@ class SymbolRules:
     step_size: Decimal
     min_qty: Decimal
     min_notional: Decimal
+    max_qty: Decimal = Decimal(0)  # the largest market order; 0: no limit
 
     def round_quantity(self, quantity: float) -> float:
         """Round the magnitude down to the step size; the sign is kept.
@@ -80,6 +81,13 @@ class SymbolRules:
         if abs(nearest - exact) > self.step_size * NOISE:
             nearest = exact.quantize(self.step_size, rounding=ROUND_DOWN)
         return math.copysign(float(nearest), quantity) if nearest else 0.0
+
+    def cap_quantity(self, quantity: float) -> float:
+        """At most the largest order Binance takes, sign kept; the rest waits for the next."""
+        if not self.max_qty or Decimal(str(abs(quantity))) <= self.max_qty:
+            return quantity
+        largest = self.max_qty.quantize(self.step_size, rounding=ROUND_DOWN)
+        return math.copysign(float(largest), quantity)
 
     def floor_quantity(self, quantity: float) -> float:
         """Round a balance down to the step size: never more than is there."""
@@ -165,6 +173,10 @@ def parse_order(data: Mapping[str, Any]) -> Order:
 def parse_rules(info: Mapping[str, Any]) -> SymbolRules:
     filters = {f["filterType"]: f for f in info["filters"]}
     notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
+    limits = [
+        Decimal(f.get("maxQty", "0"))
+        for f in (filters["LOT_SIZE"], filters.get("MARKET_LOT_SIZE", {}))
+    ]
     return SymbolRules(
         base=info["baseAsset"],
         quote=info["quoteAsset"],
@@ -172,6 +184,7 @@ def parse_rules(info: Mapping[str, Any]) -> SymbolRules:
         step_size=Decimal(filters["LOT_SIZE"]["stepSize"]).normalize(),
         min_qty=Decimal(filters["LOT_SIZE"]["minQty"]),
         min_notional=Decimal(notional.get("minNotional", "0")),
+        max_qty=min((limit for limit in limits if limit > 0), default=Decimal(0)),
     )
 
 

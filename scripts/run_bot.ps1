@@ -25,7 +25,7 @@ param(
 )
 
 $repo = Split-Path -Parent $PSScriptRoot
-Set-Location $repo  # .env, data/, logs/, and ledgers are relative to the repository
+Set-Location -LiteralPath $repo  # .env, data/, logs/, and ledgers are relative to the repository
 $env:TBOT_SUPERVISED = "1"  # a restart obeys a `tbot stop` left for it; a start by hand does not
 New-Item -ItemType Directory -Force logs | Out-Null
 $name = [IO.Path]::GetFileNameWithoutExtension($Config)
@@ -33,23 +33,23 @@ $journal = Join-Path $repo "logs\$name.supervisor.log"
 $console = Join-Path $repo "logs\$name.console.txt"  # the bot logs to the console on stderr
 
 function Write-Journal([string] $text) {
-    if ((Test-Path $journal) -and (Get-Item $journal).Length -gt $MaxJournalBytes) {
-        Move-Item -Force $journal "$journal.1"
+    if ((Test-Path -LiteralPath $journal) -and (Get-Item -LiteralPath $journal).Length -gt $MaxJournalBytes) {
+        Move-Item -Force -LiteralPath $journal -Destination "$journal.1"
     }
     $line = (Get-Date).ToUniversalTime().ToString("s") + "Z " + $text
     Write-Output $line
-    Add-Content -Path $journal -Value $line -Encoding UTF8
+    Add-Content -LiteralPath $journal -Value $line -Encoding UTF8
 }
 
 function Find-Uv {
-    if ($Uv -and (Test-Path $Uv -PathType Leaf)) { return $Uv }
+    if ($Uv -and (Test-Path -LiteralPath $Uv -PathType Leaf)) { return $Uv }
     $found = Get-Command uv -ErrorAction SilentlyContinue  # moved or reinstalled
     if ($found) { return $found.Source }
     return ""
 }
 
 try {
-    $text = Get-Content -Raw $Config -ErrorAction Stop
+    $text = Get-Content -Raw -LiteralPath $Config -ErrorAction Stop
 } catch {  # renamed or deleted since the task was registered: say so where it is looked for
     Write-Journal "cannot read $Config ($($_.Exception.Message)); not starting. Register it again: tbot autostart <config>"
     exit 4
@@ -76,7 +76,9 @@ while ($true) {
         }
     } else {
         $missing = 0
-        if (Test-Path $console) { Move-Item -Force $console "$console.1" }  # the run before stays
+        if (Test-Path -LiteralPath $console) {
+            Move-Item -Force -LiteralPath $console -Destination "$console.1"  # the run before stays
+        }
         Write-Journal "starting: $exe $line"
         try {
             $process = Start-Process -FilePath $exe -ArgumentList $line -NoNewWindow -PassThru `
@@ -84,7 +86,7 @@ while ($true) {
             $null = $process.Handle  # keeps the exit code readable after the wait
             $process.WaitForExit()
             $code = $process.ExitCode
-            $last = Get-Content -Path $console -Tail 1 -ErrorAction SilentlyContinue
+            $last = Get-Content -LiteralPath $console -Tail 1 -ErrorAction SilentlyContinue
         } catch {
             $last = "could not start uv: $_"
         }

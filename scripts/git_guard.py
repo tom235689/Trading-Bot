@@ -73,6 +73,11 @@ HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 ZIP_MEMBERS = 1000  # files of an archive scanned
 ZIP_MEMBER_BYTES = 50_000_000
 ASCII_RUN = re.compile(rb"[\x20-\x7e]{16,}")  # the strings in a binary file
+# Three or more Hangul syllables in UTF-8 (U+AC00-U+D7A3): random bytes, as in an image,
+# almost never hold them (none in 200 MB), while two turn up about every 5 MB.
+HANGUL_UTF8 = re.compile(
+    rb"(?:\xea[\xb0-\xbf][\x80-\xbf]|[\xeb\xec][\x80-\xbf]{2}|\xed[\x80-\x9e][\x80-\xbf]){3,}"
+)
 SCISSORS = re.compile(r"^# -+ >8 -+$")
 
 
@@ -99,8 +104,8 @@ def scan_text(where: str, text: str) -> Iterator[Finding]:
 
 
 def blob_text(data: bytes) -> str | None:
-    """The text of a file git treats as binary, when it is UTF-16 (PowerShell 5.1 writes
-    it with `>` and Out-File); None for other binary files."""
+    """The text of a file git treats as binary: UTF-16 (PowerShell 5.1 writes it with `>`
+    and Out-File), or UTF-8 with a stray NUL byte; None for other binary files."""
     marks = (
         (b"\xff\xfe\x00\x00", "utf-32-le"),  # before UTF-16-LE, whose mark starts it
         (b"\x00\x00\xfe\xff", "utf-32-be"),
@@ -110,7 +115,11 @@ def blob_text(data: bytes) -> str | None:
     for bom, codec in marks:
         if data.startswith(bom):
             return data[len(bom) :].decode(codec, errors="replace")
-    if len(data) >= 2 and data[1::2].count(0) > len(data) // 4:  # ASCII as UTF-16-LE
+    try:  # text with NUL bytes, ASCII as UTF-16 among it
+        return data.replace(b"\x00", b"").decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    if len(data) >= 2 and len(data) % 2 == 0:  # UTF-16-LE without a mark, in any script
         text = data.decode("utf-16-le", errors="replace")
         printable = sum(char.isprintable() or char in "\t\r\n" for char in text)
         if "\x00" not in text and printable >= 0.95 * len(text):  # not an icon or bitmap
@@ -146,6 +155,8 @@ def scan_blob(where: str, data: bytes, depth: int = 0) -> Iterator[Finding]:
         return
     for run in ASCII_RUN.findall(data):
         yield from scan_line(where, run.decode("ascii"))
+    if HANGUL_UTF8.search(data):  # a name in a database, say
+        yield Finding(where, "Hangul in a binary file")
 
 
 def is_blocked_path(path: str) -> bool:

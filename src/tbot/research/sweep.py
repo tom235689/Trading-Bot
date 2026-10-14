@@ -32,6 +32,12 @@ class SweepRun:
     metrics: Metrics
 
 
+def in_order(values: Sequence[Any]) -> list[Any]:
+    """Numbers sorted, so list neighbors are neighbors in value; other values as given."""
+    numeric = all(isinstance(v, int | float) and not isinstance(v, bool) for v in values)
+    return sorted(values) if numeric else list(values)
+
+
 def grid_points(grid: Grid) -> list[dict[str, Any]]:
     names = list(grid)
     combos = product(*(grid[name] for name in names))
@@ -108,10 +114,8 @@ def select_run(
 
 
 def sweep_table(runs: Sequence[SweepRun], objective: str) -> pl.DataFrame:
-    rows = [
-        {**run.params, **{name: getattr(run.metrics, name) for name in TABLE_METRICS}}
-        for run in runs
-    ]
+    names = dict.fromkeys((*TABLE_METRICS, objective))  # an objective outside the table too
+    rows = [{**run.params, **{name: getattr(run.metrics, name) for name in names}} for run in runs]
     # NaN sorts above every number in polars; treat it as missing so it lands at the bottom.
     return pl.DataFrame(rows).sort(
         pl.col(objective).fill_nan(None), descending=True, nulls_last=True
@@ -132,7 +136,10 @@ def neighborhood_mean(
     at the edge averages as many cells as one inside: else the center would weigh more
     there, and a lone peak in a corner would outscore a plateau.
     """
-    index = {name: {value: i for i, value in enumerate(values)} for name, values in grid.items()}
+    index = {
+        name: {value: i for i, value in enumerate(in_order(values))}
+        for name, values in grid.items()
+    }
 
     def near(params: Mapping[str, Any]) -> bool:
         return all(abs(index[n][params[n]] - index[n][center[n]]) <= 1 for n in grid)

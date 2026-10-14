@@ -189,6 +189,7 @@ class LiveExecutor:
         self.alerted: set[str] = set()  # stop failures already sent, until one works
         self.statuses: dict[str, str] = {}  # each symbol's Binance status as last reported
         self.partial: dict[str, float] = {}  # held beyond a stop: other orders lock it
+        self.stopless: set[str] = set()  # their stop was cancelled and not yet replaced
         self.missing_since: dict[str, datetime] = {}  # client id -> when it was sent
         self.skipped: set[str] = set()  # orders in doubt on pairs no longer traded, logged once
         self.tag = session_tag(ledger)
@@ -315,6 +316,11 @@ class LiveExecutor:
             quantity = max(quantity, -max(portfolio.position(symbol), 0.0))
             quantity = max(rules.round_quantity(quantity), -rules.floor_quantity(free))
         quantity = rules.round_quantity(quantity)
+        if rules.cap_quantity(quantity) != quantity:
+            log.warning(
+                "order_capped", symbol=symbol, quantity=quantity, largest=str(rules.max_qty)
+            )
+            quantity = rules.cap_quantity(quantity)  # the rest at the next decision
         if quantity == 0 or not rules.acceptable(quantity, reference):
             self.ledger.add_order(now, symbol, quantity, "skipped", "below exchange minimum")
             return None
@@ -605,6 +611,7 @@ class LiveExecutor:
                 log.info("stop_already_gone", symbol=symbol, order_id=order.order_id)
                 continue
             count += 1
+            self.stopless.add(symbol)
         return count
 
     async def after_event(self, portfolio: Portfolio, marks: Mapping[str, float]) -> None:
@@ -650,6 +657,8 @@ class LiveExecutor:
         if not self.protective_stop_pct:
             self.unprotected.discard(symbol)
             self.partial.pop(symbol, None)
+            if self._stop_state(symbol) is not None:  # turned off: a stop from before goes
+                await self._drop_stop(symbol, portfolio)
             return
         if not self.spot.trading(symbol):
             return  # no orders until Binance trades it again; a stop in place stays
@@ -665,12 +674,21 @@ class LiveExecutor:
             return
         cancelled = False
         try:
+            bid = 0.0
+            if portfolio.position(symbol) > 0 and symbol in marks:
+                bid = await self.spot.book_price(symbol, -1)
+                level = marks[symbol] * (1 - self.protective_stop_pct)
+                if state is not None and 0 < bid <= level:
+                    # The price fell through the new level since the close, and Binance
+                    # refuses a stop that would trigger at once: the one working stays.
+                    log.warning("stop_kept", symbol=symbol, level=level, bid=bid)
+                    return
             await self._cancel_own_stops(symbol)
             cancelled = True  # from here on, a failure leaves the position without a stop
             await self._settle_stop(symbol, portfolio)
             for retry in (False, True):
                 try:
-                    await self._place_stop(symbol, portfolio, marks)
+                    await self._place_stop(symbol, portfolio, marks, bid)
                     break
                 except BinanceError as exc:
                     if retry or exc.code not in RULE_ERRORS:
@@ -681,11 +699,13 @@ class LiveExecutor:
             log.error("stop_failed", symbol=symbol, error=repr(exc))
             self.unprotected.add(symbol)
             self.partial.pop(symbol, None)
-            if symbol not in self.alerted:
+            gone = cancelled or symbol in self.stopless  # here, or by a sale
+            # A pair the book holds nothing of loses no protection: the log is enough.
+            if symbol not in self.alerted and (gone or portfolio.position(symbol) > 0):
                 self.alerted.add(symbol)
                 left = (
                     "The position has no exchange stop"
-                    if cancelled
+                    if gone
                     else "The stop in place, if any, was not replaced and stays"
                 )
                 await self.notifier.send(
@@ -693,9 +713,22 @@ class LiveExecutor:
                     "retrying at every reconciliation"
                 )
 
+    async def _drop_stop(self, symbol: str, portfolio: Portfolio) -> None:
+        """Cancel a stop placed while stops were on, and book what it sold first."""
+        try:
+            if await self.cancel_stops(symbol, portfolio):
+                await self.notifier.send(
+                    f"[{self.label}] protective stops are off (protective_stop_pct 0): "
+                    f"cancelled the exchange stop of {symbol}"
+                )
+        except Exception as exc:  # tried again after the next event
+            log.warning("stop_cancel_failed", symbol=symbol, error=repr(exc))
+
     async def _place_stop(
-        self, symbol: str, portfolio: Portfolio, marks: Mapping[str, float]
+        self, symbol: str, portfolio: Portfolio, marks: Mapping[str, float], bid: float = 0.0
     ) -> None:
+        """A stop below the last close; below the bid when the price fell through that
+        since the close (Binance refuses a stop that would trigger at once)."""
         rules = self.spot.rules[symbol]
         position = portfolio.position(symbol)
         if position <= 0 or symbol not in marks:
@@ -704,7 +737,10 @@ class LiveExecutor:
         balances = await self.spot.balances()
         balance = balances.get(rules.base)
         free = balance.free if balance is not None else 0.0
-        stop = rules.round_price(marks[symbol] * (1 - self.protective_stop_pct))
+        stop = marks[symbol] * (1 - self.protective_stop_pct)
+        if 0 < bid <= stop:
+            stop = bid * (1 - self.protective_stop_pct)
+        stop = rules.round_price(stop)
         if not self._stoppable(rules, position, stop):
             self._covered(symbol)  # dust: nothing an exchange stop can hold
             return
@@ -724,6 +760,7 @@ class LiveExecutor:
         self._set_stop_state(symbol, StopState(id=client_id, qty=0.0, quote=0.0))
         await self.spot.stop_loss_order(symbol, quantity, stop, client_id)
         self.unprotected.discard(symbol)
+        self.stopless.discard(symbol)
         await self._note_partial(symbol, position, quantity, stop)
         if symbol in self.alerted:
             self.alerted.discard(symbol)
@@ -733,6 +770,7 @@ class LiveExecutor:
     def _covered(self, symbol: str) -> None:
         """Nothing for a stop to hold: no alert and no flag for this symbol."""
         self.unprotected.discard(symbol)
+        self.stopless.discard(symbol)
         self.alerted.discard(symbol)
         self.partial.pop(symbol, None)
 

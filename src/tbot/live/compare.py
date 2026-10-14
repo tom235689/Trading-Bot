@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from tbot.backtest.engine import BacktestResult
-from tbot.backtest.runner import run_period
+from tbot.backtest.runner import data_ends, run_period
 from tbot.core.config import streams_of
 from tbot.core.models import Fill
 from tbot.core.text import clock_text, price_text
@@ -117,7 +117,8 @@ def compare_session(config: SessionConfig, ledger: Ledger, store: BarStore) -> C
     # The backtest fills a decision at the next bar's open, so decisions at the last stored
     # close have no fill yet; compare up to the last decision both sides could execute.
     step = min(c.timeframe.delta for c in config.strategies)
-    end = min(points[-1].time, _last_open(config, store))
+    common = min(data_ends(config, store).values())  # the backtest stops at the earliest
+    end = min(points[-1].time, _last_open(config, store), common - step)
     backtest_times = [t for t in result.equity["time"].to_list() if start <= t <= end]
     session_by_time = {p.time: p for p in points if p.time <= end}
     shared = [t for t in backtest_times if t in session_by_time]

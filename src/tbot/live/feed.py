@@ -28,6 +28,7 @@ Batch = dict[StreamKey, pl.DataFrame]
 log = structlog.get_logger(__name__)
 FETCH_ERRORS = (httpx.HTTPError, LookupError, ValueError, OSError)  # REST failures, retried
 HEALTHY_SECONDS = 60.0  # a socket open this long resets the reconnect backoff
+STORE_WAIT_SECONDS = 5.0  # for another process's merge into a stream, which takes under 1 s
 # Binance pushes a kline stream with every trade, about every 2 s on busy pairs. A socket
 # silent this long across a bar close has stalled while still answering pings, and is
 # replaced; quiet pairs may send nothing for minutes between closes.
@@ -108,7 +109,9 @@ class LiveFeed:
         if bars.is_empty():
             return bars
         bars = bars.sort("open_time")
-        self.store.write(*key, bars)
+        # This runs on the event loop: a long wait for another writer would hold up the
+        # trader. StoreBusy leaves the bars to the next catch-up.
+        self.store.write(*key, bars, wait=STORE_WAIT_SECONDS)
         self.last[key] = bars["open_time"][-1]
         if key in self._stale_reported:
             self._stale_reported.discard(key)

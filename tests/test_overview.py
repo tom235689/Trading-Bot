@@ -26,6 +26,15 @@ def paper(tmp_path: Path) -> PaperConfig:
     return PaperConfig(initial_cash=1000.0, strategies=[strategy], ledger=tmp_path / "p.sqlite")
 
 
+def test_no_24h_change_against_an_older_snapshot(tmp_path: Path) -> None:
+    config = paper(tmp_path)
+    with Ledger(config.ledger) as ledger:
+        ledger.set_meta(BASE_META, "1000")
+        ledger.add_equity(EquityPoint(T0, 1000.0, 1000.0, 0.0))
+        ledger.add_equity(EquityPoint(T0 + timedelta(days=4), 1100.0, 1100.0, 0.0))  # down 4 days
+    assert session_row("paper", config, BarStore(tmp_path / "data")).day_change is None
+
+
 def test_a_row_counts_money_put_in_apart_from_profit(tmp_path: Path) -> None:
     config = paper(tmp_path)
     store = BarStore(tmp_path / "data")

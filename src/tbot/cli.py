@@ -42,7 +42,15 @@ from tbot.live.backup import backup_dir
 from tbot.live.clock import CLOSE_GRACE, ServerClock
 from tbot.live.commands import RANK_PAIRING, PollTurn, command_of
 from tbot.live.compare import compare_session, comparison_text
-from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings, save_settings
+from tbot.live.config import (
+    LiveConfig,
+    PaperConfig,
+    SessionConfig,
+    Settings,
+    env_readers,
+    named_ledger,
+    save_settings,
+)
 from tbot.live.doctor import Check, checks_text, key_checks, run_checks, works_on_testnet
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.overview import broken_row, overview_text, session_row
@@ -57,11 +65,11 @@ from tbot.live.runner import (
     account_text,
     halt_book,
     halt_path,
+    held_positions,
     instance_lock,
     is_running,
     load_guard,
     next_close,
-    restore_portfolio,
     resume,
     run_live,
     run_paper,
@@ -83,6 +91,7 @@ DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 EXIT_ERROR = 1  # a crash, a failed start, or an error worth retrying
 EXIT_LEDGER = 3  # the ledger cannot be used: another process has it, it is damaged, no SQLite
 EXIT_CONFIG = 4  # the command or the config is wrong: retrying cannot help
+ALERT_RETRY_WAITS = (0.0, 10.0, 20.0, 30.0, 60.0)  # a last alert's tries, about two minutes
 
 
 class ConfigError(SystemExit):
@@ -400,10 +409,7 @@ def scan_configs() -> tuple[list[tuple[Path, SessionConfig]], list[Broken]]:
         try:
             config = load_session_config(path)
         except ConfigError as exc:
-            named = raw.get("ledger")
-            broken.append(
-                Broken(path, str(exc.code), Path(named) if isinstance(named, str) else None)
-            )
+            broken.append(Broken(path, str(exc.code), named_ledger(raw)))
             continue
         found.setdefault(config.ledger.resolve(), (path, config))
     return list(found.values()), broken
@@ -427,9 +433,9 @@ def stop_ledger(path: Path) -> Path:
     try:
         return load_session_config(path).ledger
     except ConfigError:
-        named = read_yaml(path).get("ledger")
-        if isinstance(named, str):
-            return Path(named)
+        named = named_ledger(read_yaml(path))
+        if named is not None:
+            return named
         raise
 
 
@@ -731,8 +737,8 @@ def print_report(symbol: str, timeframe: Timeframe, report: QualityReport, store
 
 def run_check(args: argparse.Namespace) -> int:
     store = BarStore(args.data_dir)
-    # A minute of slack: this clock may run behind Binance's, which the download went by.
-    now = datetime.now(UTC) + timedelta(minutes=1)
+    # Slack for a clock behind Binance's, which the download went by; under a 1m bar.
+    now = datetime.now(UTC) + timedelta(seconds=10)
     failed = False
     named = args.symbols is not DEFAULT_SYMBOLS or args.timeframes is not DEFAULT_TIMEFRAMES
     for symbol in args.symbols:
@@ -953,7 +959,8 @@ def run_validate_command(args: argparse.Namespace) -> int:
 def run_paper_command(args: argparse.Namespace) -> int:
     config = load_session_config(args.config)
     if not isinstance(config, PaperConfig):
-        raise ConfigError(f"this is a live config; use `tbot live {short_name(args.config)}`")
+        name, mode = short_name(args.config), getattr(config, "mode", "live")
+        raise ConfigError(f"this is a {mode} config; use `{live_command(name, config)}`")
     check_strategies(args.config, config)
     settings = Settings()  # a broken .env fails here, before the session says it starts
     not_running(config)
@@ -1231,7 +1238,7 @@ def after_stop(path: Path, ledger: Path) -> str:
     name = short_name(path)
     with Ledger(ledger) as book:
         scheduled = book.get_meta(SUPERVISED_META) == "1"
-        positions = restore_portfolio(config, book).positions
+        positions = held_positions(config, book)
     notes = []
     if scheduled:
         keep = (
@@ -1345,7 +1352,7 @@ def run_resume_command(args: argparse.Namespace) -> int:
         halted = [
             path
             for path, config in session_configs()
-            if config.ledger.is_file() and is_halted(config)
+            if config.ledger.is_file() and (is_halted(config) or halt_path(config.ledger).exists())
         ]
         if len(halted) > 1:
             raise ConfigError(which("resume", halted, "halted"))
@@ -1394,9 +1401,11 @@ def run_halt_command(args: argparse.Namespace) -> int:
     """The panic button: the session sells what the bot holds and trades no more."""
     path = args.config
     if path is None:
-        path = pick_config("halt")
-        picked_config = load_session_config(path)
-        if isinstance(picked_config, LiveConfig) and picked_config.mode == "live":
+        running = running_configs()  # a config edited into errors included
+        if len(running) > 1:
+            raise ConfigError(which("halt", running, "running"))
+        path = picked(running[0]) if running else pick_config("halt")
+        if read_yaml(path).get("mode") == "live":
             raise ConfigError(
                 f"it trades real money: name it to sell and halt it: tbot halt {short_name(path)}"
             )
@@ -1428,11 +1437,19 @@ def run_halt_command(args: argparse.Namespace) -> int:
                 return 0
             with Ledger(ledger_path) as ledger:
                 halted = load_guard(config, ledger).state.halted
-                positions = restore_portfolio(config, ledger).positions
+                positions = held_positions(config, ledger)
             if not halted:
                 print(f"the session did not halt: `tbot log {name}` says why", file=sys.stderr)
                 return EXIT_ERROR
-            print(f"halted: {held_names(positions)}; `tbot resume {name}` trades again")
+            if positions:
+                print(
+                    f"halted, but not sold yet: {', '.join(held_list(positions))} (see the "
+                    f"alerts); the session tries again within minutes, `tbot log {name} -f` "
+                    "follows it",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
+            print(f"halted: the bot holds nothing; `tbot resume {name}` trades again")
             return 0
         if config is not None and not is_running(ledger_path):  # it ended first
             try:
@@ -1452,11 +1469,6 @@ def run_halt_command(args: argparse.Namespace) -> int:
 
 def held_list(positions: dict[str, float]) -> list[str]:
     return [f"{symbol} {qty:.6f}" for symbol, qty in sorted(positions.items()) if qty]
-
-
-def held_names(positions: dict[str, float]) -> str:
-    held = held_list(positions)
-    return f"still held: {', '.join(held)} (see the alerts)" if held else "nothing held"
 
 
 def halted_text(
@@ -1542,6 +1554,17 @@ def run_notify_command(args: argparse.Namespace) -> int:
     return code
 
 
+def save_env(env: Path, values: dict[str, str]) -> None:
+    """Save in .env, and say so when the environment sets one of them: it wins."""
+    save_settings(env, values)
+    shadowed = sorted(name for name in values if name in os.environ)
+    if shadowed:
+        print(
+            f"note: the environment also sets {', '.join(shadowed)}, which wins over {env}: "
+            "remove it there"
+        )
+
+
 def print_restart_note() -> None:
     """Sessions read .env when they start."""
     running = [short_name(path) for path in running_configs()]
@@ -1573,13 +1596,13 @@ async def set_up_telegram(token: str, chat_id: str | None, new_token: bool, env:
             print(f"cannot reach Telegram ({describe_error(exc)})")
             return EXIT_ERROR
         if new_token:
-            save_settings(env, {"TBOT_TELEGRAM_TOKEN": token})
+            save_env(env, {"TBOT_TELEGRAM_TOKEN": token})
             print(f"saved the token of @{name} in {env}")
         if not chat_id:
             chat_id = await find_chat(bot, name, token)
             if chat_id is None:
                 return EXIT_ERROR
-            save_settings(env, {"TBOT_TELEGRAM_CHAT_ID": chat_id})
+            save_env(env, {"TBOT_TELEGRAM_CHAT_ID": chat_id})
             print(f"saved chat {chat_id} in {env}")
             bot.chat_id = chat_id
         if await bot.send("tbot: test alert. Alerts from the bot arrive in this chat."):
@@ -1716,13 +1739,22 @@ def run_keys_command(args: argparse.Namespace) -> int:
     else:
         names = ("TBOT_BINANCE_API_KEY", "TBOT_BINANCE_API_SECRET")
     values = dict(zip(names, (key, secret), strict=True))
-    if old_is_testnet and current.binance_api_key and current.binance_api_secret:
+    if old_is_testnet is not False and current.binance_api_key and current.binance_api_secret:
         values["TBOT_BINANCE_TESTNET_API_KEY"] = current.binance_api_key
         values["TBOT_BINANCE_TESTNET_API_SECRET"] = current.binance_api_secret
     env = Path(".env")
-    save_settings(env, values)
-    print(f"saved in {env} as {names[0]} and {names[1]}, readable by your account only")
-    if old_is_testnet:
+    save_env(env, values)
+    readers = env_readers(env)
+    print(f"saved in {env} as {names[0]} and {names[1]}")
+    if readers:
+        print(f"warning: {env} can be read by {', '.join(readers)}: limit it to your account")
+        print("(README, Security)")
+    if old_is_testnet is None:
+        print(
+            "the key pair there before could not be tried on the testnet; it stays as "
+            "TBOT_BINANCE_TESTNET_API_KEY and _SECRET: delete those lines if it is no testnet key"
+        )
+    elif old_is_testnet:
         print("the testnet keys there before now are TBOT_BINANCE_TESTNET_API_KEY and _SECRET")
     print_restart_note()
     return 0
@@ -1730,9 +1762,10 @@ def run_keys_command(args: argparse.Namespace) -> int:
 
 async def check_new_keys(
     config: LiveConfig, trial: Settings, current: Settings
-) -> tuple[list[Check], bool]:
+) -> tuple[list[Check], bool | None]:
     """Doctor's checks of the new key, and whether the live key it replaces in the main
-    pair is a testnet key, which then moves to the testnet pair so testnet keeps working."""
+    pair is a testnet key, which then moves to the testnet pair so testnet keeps working
+    (None: the testnet could not tell, so it moves too)."""
     async with httpx.AsyncClient(timeout=15.0) as client:
         checks = await key_checks(config, trial, client)
         old = (current.binance_api_key, current.binance_api_secret)
@@ -1742,7 +1775,9 @@ async def check_new_keys(
             and all(old)
             and old[0] != trial.binance_api_key
         )
-        return checks, moves and await works_on_testnet(old[0] or "", old[1] or "", client)
+        if not moves:
+            return checks, False
+        return checks, await works_on_testnet(old[0] or "", old[1] or "", client)
 
 
 COMMANDS = {
@@ -1784,6 +1819,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
     session = args.command in ("paper", "live")
+    if isinstance(sys.stdout, io.TextIOWrapper):  # a name the console's code page lacks
+        sys.stdout.reconfigure(errors="replace")
     if not session:
         configure_quiet()  # warnings only, readable; a session sets up its own log
     try:
@@ -1800,6 +1837,9 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(f"error: {brief(exc)}", EXIT_CONFIG, alert=False)
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
+        return EXIT_ERROR
+    except EOFError:  # a question no one can answer: the input was closed
+        print("no answer (the input ended): nothing changed", file=sys.stderr)
         return EXIT_ERROR
     except Exception as exc:  # one line; TBOT_DEBUG=1 shows the traceback
         if os.environ.get("TBOT_DEBUG", "").lower() in ("1", "true", "yes"):
@@ -1838,8 +1878,15 @@ def _alert(text: str) -> None:
             return
 
         async def send() -> None:
+            # A supervisor that gives up (exit 3 or 4) leaves no one else to tell: at a
+            # boot the network may come up a minute after the task.
+            waits = ALERT_RETRY_WAITS if supervised() else (0.0,)
             async with httpx.AsyncClient() as client:
-                await Telegram(token, chat_id, client).send(text)
+                bot = Telegram(token, chat_id, client)
+                for wait in waits:
+                    await asyncio.sleep(wait)
+                    if await bot.deliver(text) is None:
+                        return
 
         asyncio.run(send())
     except Exception:  # best effort: the message is already on stderr

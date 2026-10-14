@@ -226,3 +226,34 @@ def test_one_bar_event_says_when_the_first_comparison_comes(tmp_path: Path) -> N
         ledger.add_equity(EquityPoint(first, 10_000.0, 10_000.0, 0.0))
         with pytest.raises(ValueError, match="one bar event so far"):
             compare_session(cfg, ledger, store)
+
+
+def test_a_symbol_on_two_timeframes_is_compared_up_to_where_the_backtest_ends(
+    tmp_path: Path,
+) -> None:
+    hour = Timeframe.H1.delta
+    cfg = PaperConfig(
+        initial_cash=10_000.0,
+        strategies=[
+            StrategyConfig(
+                name="donchian_trend",
+                symbols=["BTCUSDT"],
+                timeframe=timeframe,
+                allocation=0.5,
+                params={"entry": 10, "exit": 5},
+            )
+            for timeframe in (Timeframe.H1, H4)
+        ],
+        ledger=tmp_path / "paper.sqlite",
+    )
+    store = BarStore(tmp_path / "data")
+    flat = [100.0] * 200  # no breakout: the backtest trades nothing
+    store.write("BTCUSDT", Timeframe.H1, price_bars(T0, Timeframe.H1, flat[:198], flat[:198]))
+    store.write("BTCUSDT", H4, price_bars(T0, H4, flat[:49], flat[:49]))  # to 196:00
+    with Ledger(cfg.ledger) as ledger:
+        for hours in range(150, 199):
+            ledger.add_equity(EquityPoint(T0 + hour * hours, 10_000.0, 10_000.0, 0.0))
+        ledger.add_fill(Fill(T0 + hour * 197, "BTCUSDT", 0.01, 100.0, 0.0), 100.0)
+        comparison = compare_session(cfg, ledger, store)
+    assert comparison.end == T0 + hour * 195  # the 4h stream's last close, less a bar
+    assert comparison.session_only == []  # decided after the backtest's last bar

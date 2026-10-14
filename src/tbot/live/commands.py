@@ -30,6 +30,11 @@ TURN_DIR = Path("data")  # every tbot process of a clone runs in its repository
 TURN_SECONDS = 10.0  # how often a process waiting for its turn looks again
 WANT_FRESH = 60.0  # a request for the turn this old was left by a process that ended
 RANK_SESSION, RANK_REAL_MONEY, RANK_PAIRING = 0, 1, 2  # who reads the messages first
+CONFLICT_ALERT = (
+    "Telegram commands paused: another program reads this bot's messages (a second clone "
+    "or computer with the same bot, or a webhook), so /halt may not reach this session. "
+    "Give each clone its own bot: `tbot notify` with a new token"
+)
 HELP = (
     "/status: equity, drawdown, positions, kill switch\n"
     "/fills: the last fills\n"
@@ -114,7 +119,11 @@ class PollTurn:
 
 
 async def command_loop(
-    telegram: Telegram, answer: Answer, started: datetime, turn: PollTurn | None = None
+    telegram: Telegram,
+    answer: Answer,
+    started: datetime,
+    turn: PollTurn | None = None,
+    label: str = "",
 ) -> None:
     offset: int | None = None
     failing = False
@@ -141,6 +150,10 @@ async def command_loop(
                     error = describe_error(exc) if isinstance(exc, httpx.HTTPError) else repr(exc)
                     hint = "another process polls this bot token" if conflict else "retrying"
                     log.warning("telegram_commands_failed", error=error, hint=hint)
+                    if conflict:  # outside this clone's turns: the owner must hear of it
+                        await telegram.send(
+                            f"[{label}] {CONFLICT_ALERT}" if label else CONFLICT_ALERT
+                        )
                 failing = True
                 if turn is not None and (conflict or turn.wanted()):
                     turn.release()  # nobody waits through this sleep for a turn not used

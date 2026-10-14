@@ -4,6 +4,8 @@ from collections.abc import Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+MAX_TARGET_VOLATILITY = 3.0  # 300% a year: above any coin's, so a larger value is a typo
+
 
 class RiskLimits(BaseModel):
     """Backtest defaults are permissive; live configs should tighten them."""
@@ -15,6 +17,16 @@ class RiskLimits(BaseModel):
     long_only: bool = True  # spot trading cannot sell short
     target_volatility: float = Field(default=0.0, ge=0)  # annualized; 0 disables scaling
     volatility_lookback_days: int = Field(default=30, ge=1)
+
+    @field_validator("target_volatility")
+    @classmethod
+    def a_fraction(cls, value: float) -> float:
+        if value > MAX_TARGET_VOLATILITY:  # 40 meant as 40% would turn scaling off
+            raise ValueError(
+                f"must be at most {MAX_TARGET_VOLATILITY:g}: annualized, as a fraction "
+                "(0.4 means 40%)"
+            )
+        return value
 
     @field_validator("long_only")
     @classmethod

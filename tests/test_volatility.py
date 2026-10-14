@@ -157,3 +157,9 @@ def test_an_infinite_budget_is_refused() -> None:
         TradingConfig.model_validate(
             {"initial_cash": "inf", "strategies": [{**strategy, "allocation": 1.0}]}
         )
+
+
+def test_a_volatility_target_typed_as_a_percent_is_refused() -> None:
+    with pytest.raises(ValidationError, match=r"at most 3: annualized, as a fraction \(0\.4"):
+        RiskLimits(target_volatility=40)  # would never scale anything down
+    assert RiskLimits(target_volatility=0.4).target_volatility == 0.4

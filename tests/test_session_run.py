@@ -12,17 +12,18 @@ import httpx
 import polars as pl
 import pytest
 
+from binance_spot_fake import DEFAULT_RULES, FakeSpot
 from factories import price_bars
 from tbot.core.config import StrategyConfig
 from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.data.schema import empty_bars
 from tbot.data.store import BarStore
-from tbot.exchange.binance import INVALID_SYMBOL, BinanceError, BinanceSpot
+from tbot.exchange.binance import INVALID_SYMBOL, TESTNET_URL, BinanceError, BinanceSpot
 from tbot.execution.sim_broker import SimulatedBroker
 from tbot.live import runner
 from tbot.live.clock import ServerClock
-from tbot.live.config import PaperConfig, Settings
+from tbot.live.config import LiveConfig, PaperConfig, Settings
 from tbot.live.executor import Executor, PaperExecutor
 from tbot.live.feed import LiveFeed
 from tbot.live.ledger import Ledger
@@ -391,3 +392,38 @@ def test_the_heartbeat_ignores_a_pair_binance_pauses() -> None:
     assert runner.heartbeat_problem([paused], "", spot) == ""
     assert runner.heartbeat_problem([KEY, paused], "", spot) == "stale streams: BTCUSDT 4h"
     assert runner.heartbeat_problem([], "reconciliation failing") == "reconciliation failing"
+
+
+def test_a_live_session_of_two_quote_assets_ends_for_good(
+    tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notifier, _ = offline
+    rules = {**DEFAULT_RULES, "ETHBUSD": DEFAULT_RULES["ETHUSDT"]}
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={"BTCUSDT": 100.0}, rules=rules)
+
+    def spot(*args: Any) -> BinanceSpot:  # config, settings, client, clock, resync
+        return BinanceSpot(fake.client(), "key", "secret", base_url=TESTNET_URL, clock=args[3])
+
+    monkeypatch.setattr(runner, "make_spot", spot)
+    end = H4.floor(datetime.now(UTC))
+    store = BarStore(tmp_path / "data")
+    for symbol in ("BTCUSDT", "ETHBUSD"):
+        store.write(symbol, H4, price_bars(end - H4.delta * 40, H4, [100.0] * 40, [100.0] * 40))
+    config = LiveConfig(
+        mode="testnet",
+        ownership="account",  # no budget to check first: the setup must see it
+        strategies=[
+            StrategyConfig(
+                name="donchian_trend",
+                symbols=["BTCUSDT", "ETHBUSD"],
+                timeframe=H4,
+                allocation=1.0,
+                params={"entry": 5, "exit": 3},
+            )
+        ],
+        ledger=tmp_path / "testnet.sqlite",
+        backup_days=0,
+    )
+    settings = Settings(_env_file=None, binance_api_key="key", binance_api_secret="secret")  # type: ignore[call-arg]
+    assert asyncio.run(runner.run_live(config, settings, tmp_path / "data")) == 4
+    assert "the symbols are quoted in BUSD, USDT" in notifier.messages[-1]

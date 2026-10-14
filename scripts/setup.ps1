@@ -51,12 +51,12 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
-Set-Location $repo
+Set-Location -LiteralPath $repo
 
 function Step([string] $text) { Write-Output "== $text" }
 
 function Test-Signed([string] $exe) {
-    if (-not (Test-Path $exe -PathType Leaf)) { return $false }
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return $false }
     $signature = Get-AuthenticodeSignature $exe
     return $signature.Status -eq "Valid" -and
         $signature.SignerCertificate.Subject -match "O=Python Software Foundation"
@@ -147,20 +147,22 @@ if (-not $busy -and -not $Python -and $smartAppControl -ne 0) {
                 throw "the downloaded python.exe is not signed by the Python Software Foundation"
             }
             New-Item -ItemType Directory -Force (Split-Path -Parent $PythonHome) | Out-Null
-            if (Test-Path $PythonHome) { Remove-Item -Recurse -Force $PythonHome }
-            Move-Item $unpacked $PythonHome
+            if (Test-Path -LiteralPath $PythonHome) { Remove-Item -Recurse -Force -LiteralPath $PythonHome }
+            Move-Item -LiteralPath $unpacked -Destination $PythonHome
         } finally {
-            Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force -LiteralPath $temp -ErrorAction SilentlyContinue
         }
         $Python = Join-Path $PythonHome "python.exe"
     }
 }
 if (-not $busy -and $Python) {
-    if (-not (Test-Path $Python -PathType Leaf)) { throw "no python.exe at $Python" }
-    $wanted = Split-Path -Parent (Resolve-Path $Python).Path
+    if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "no python.exe at $Python" }
+    $wanted = Split-Path -Parent (Resolve-Path -LiteralPath $Python).Path
     $current = ""
-    if (Test-Path ".venv\pyvenv.cfg") {
-        $line = Get-Content ".venv\pyvenv.cfg" | Where-Object { $_ -match "^home\s*=" } | Select-Object -First 1
+    if (Test-Path -LiteralPath ".venv\pyvenv.cfg") {
+        # uv writes it in UTF-8: read as ANSI, a user name like C:\Users\<non-ASCII> never matches.
+        $line = Get-Content -LiteralPath ".venv\pyvenv.cfg" -Encoding UTF8 |
+            Where-Object { $_ -match "^home\s*=" } | Select-Object -First 1
         if ($line) { $current = ($line -split "=", 2)[1].Trim() }
     }
     if ($current -ne $wanted) {
@@ -181,7 +183,7 @@ if ($busy) {
 Invoke-Checked $uv ($run + @("python", "-m", "tbot", "--version"))
 
 Step "git hooks"
-if (Test-Path ".git") {
+if (Test-Path -LiteralPath ".git") {
     Invoke-Checked "git" @("config", "core.hooksPath", ".githooks")
     Write-Output "hooks from .githooks"
 } else {
@@ -196,10 +198,10 @@ if ($NoPath) {
 }
 
 Step ".env"
-if (Test-Path ".env") {
+if (Test-Path -LiteralPath ".env") {
     Write-Output ".env exists: left as it is"
 } else {
-    Copy-Item ".env.example" ".env"
+    Copy-Item -LiteralPath ".env.example" -Destination ".env"
     # Only this account may read the keys it will hold, whatever the folder allows.
     $owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     & icacls ".env" /inheritance:r /grant:r "${owner}:F" | Out-Null

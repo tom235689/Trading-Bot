@@ -7,7 +7,7 @@ There are four kinds of configs:
 | Kind | Recognized by | Used by | Shipped examples |
 |---|---|---|---|
 | backtest | `start` | `tbot backtest` | `donchian_trend.yaml`, `donchian_voltarget.yaml`, `multi.yaml` |
-| validation | `backtest` and `grid` | `tbot validate` | `*_validation.yaml` |
+| validation | `backtest` or `grid` | `tbot validate` | `*_validation.yaml` |
 | paper session | anything else (no `start`, `backtest`, or `mode`) | `tbot paper` and the session commands | `paper.yaml` |
 | testnet or live session | `mode` | `tbot live` and the session commands | `testnet.yaml`, `live.yaml` |
 
@@ -15,13 +15,13 @@ There are four kinds of configs:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `initial_cash` | 10000; required in live mode | Quote currency (USDT) the bot trades with. In live mode with `ownership: budget` it is the most the bot can lose, and a real-money config must set it. Changing it later moves money into or out of the book at the next start, like a transfer (Telegram says so); a cut larger than the book is worth is refused, and so is a new budget, or a raise, that the account's free USDT does not cover. A first real-money start, or one after a raise, started by hand asks you to type the amount. With less than about 300 USDT, Binance's 10 USDT order minimum makes small rebalances impossible and results drift from the backtest. |
+| `initial_cash` | 10000; required in live mode | Quote currency (USDT) the bot trades with. In live mode with `ownership: budget` it is the most the bot can lose, and a real-money config must set it. Changing it later moves money into or out of the book at the next start, like a transfer (Telegram says so); a cut larger than the book is worth at the latest closes is refused, and so is a new budget, or a raise, that the account's free USDT does not cover. A first real-money start, or one after a raise, started by hand asks you to type the amount. With less than about 300 USDT, Binance's 10 USDT order minimum makes small rebalances impossible and results drift from the backtest. |
 | `costs.fee_rate` | 0.001 | Fee per fill, as a fraction: 0.1% is Binance spot taker at VIP 0 without the BNB discount. Backtests and paper trading charge it; live trading books what Binance charged. |
 | `costs.slippage_bps` | 5 | Price paid beyond the quoted price in backtests and paper trading, in basis points (5 = 0.05%). Below 10000. |
 | `risk.max_symbol_weight` | 1.0 | Largest share of equity in one symbol (above 0, up to 1). |
 | `risk.max_gross_exposure` | 1.0 | Largest share of equity invested in all symbols together; above 1 changes nothing on spot, which has no leverage. |
 | `risk.long_only` | true | Must stay true: spot trading cannot sell short. |
-| `risk.target_volatility` | 0 | Annualized volatility each symbol is scaled down to (0.4 = 40%); 0 turns scaling off. |
+| `risk.target_volatility` | 0 | Annualized volatility each symbol is scaled down to (0.4 = 40%); 0 turns scaling off; at most 3 (a value such as 40, meant as 40%, is refused). |
 | `risk.volatility_lookback_days` | 30 | Days of returns the volatility is measured on; with `target_volatility` set, at least 10 bars of every strategy's timeframe (10 days for 1d). |
 | `rebalance.min_notional` | 10 | Smallest order value in quote currency; Binance refuses smaller orders. |
 | `rebalance.rebalance_threshold` | 0.02 | Weight changes smaller than this (2% of equity) are not traded. |
@@ -32,7 +32,7 @@ Each strategy:
 | Key | Meaning |
 |---|---|
 | `name` | A registered strategy: `donchian_trend` or `rsi_reversion`. |
-| `symbols` | Binance spot symbols such as `BTC/USDT`, `BTC-USDT`, or `BTCUSDT` (all mean `BTCUSDT`); none twice. Testnet and live need one quote asset for all. |
+| `symbols` | Binance spot symbols such as `BTC/USDT`, `BTC-USDT`, or `BTCUSDT` (all mean `BTCUSDT`); none twice. Testnet and live need one quote asset for all: a start refuses symbols quoted in two (exit 4), and doctor fails them. |
 | `timeframe` | Bar length the strategy trades on: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, or `1d`; the shipped configs use `4h`. |
 | `allocation` | Share of equity for this strategy, more than 0 and at most 1. |
 | `params` | The strategy's own settings. `donchian_trend`: `entry` (55, bars of the breakout high) and `exit` (20, bars of the exit low). `rsi_reversion`: `period` (14), `low` (30), `high` (70), `trend_period` (0 = off, else 2 or more; buy only above this moving average). |
@@ -51,7 +51,7 @@ Each strategy:
 |---|---|---|
 | `backtest` | required | The backtest config to vary, relative to this file. It must have one strategy, no `guard`, and an `end` after `holdout_start`, or none. |
 | `holdout_start` | required | Data from this day on is used once, by the final holdout run; after the backtest's start, and with stored bars after it (checked before anything runs). |
-| `grid` | required | Params of the first strategy and the values to try, e.g. `entry: [20, 55, 90]`. |
+| `grid` | required | Params of the first strategy and the values to try, e.g. `entry: [20, 55, 90]`. Numbers are put in order, so grid neighbors are neighbors in value. |
 | `objective` | sharpe | What the sweep maximizes: `sharpe`, `sortino`, `cagr`, `calmar`, or `total_return`. |
 | `min_trades` | 30 | Runs with fewer trades cannot be selected. |
 | `selection` | best | `best` grid point, or `neighborhood`: the point whose neighbors do best on average. |
@@ -73,7 +73,7 @@ Each strategy:
 | `batch_wait_seconds` | 5 | How long an event waits for the other streams closing at the same time. |
 | `heartbeat_seconds` | 300 | How often `TBOT_HEARTBEAT_URL` is pinged (at least 30). |
 | `summary_hour_utc` | 0 | Hour of the daily Telegram summary, UTC (0 to 23). |
-| `backup_days` | 14 | Daily ledger copies kept in `data/backups/`; 0 turns them off. |
+| `backup_days` | 14 | Daily ledger copies kept in `backups/` next to the ledger (`data/backups/` for the shipped configs); 0 turns them off. |
 | `telegram_commands` | true | Answer `/status`, `/fills`, and `/halt` in the Telegram chat. Telegram lets one process read a bot's messages, so the sessions of a clone take turns: a real-money session first, else the one that started first. |
 
 Testnet and live only:
@@ -82,7 +82,7 @@ Testnet and live only:
 |---|---|---|
 | `mode` | required | `testnet` (fake money on testnet.binance.vision) or `live` (real money; `tbot live` then needs `--live`). |
 | `ownership` | budget | `budget`: the bot owns `initial_cash` and what it buys; the rest of the account is left alone. `account`: the bot owns the whole spot account; only for a dedicated account. |
-| `protective_stop_pct` | 0.2 | An exchange-side stop-market order this far below the last close protects every position, also while the bot is down. 0 turns stops off. |
+| `protective_stop_pct` | 0.2 | An exchange-side stop-market order this far below the last close protects every position, also while the bot is down. 0 turns stops off and cancels one placed before. |
 | `reconcile_seconds` | 300 | How often the book is compared with the exchange, stops are checked, and symbol rules are refreshed (hourly, and at once after Binance refuses an order for them). At least 30. |
 | `reconcile_tolerance` | 0.002 | A relative difference between book and exchange smaller than this is noise. |
 | `recv_window` | 5000 | Milliseconds a signed request stays valid (1000 to 60000). |

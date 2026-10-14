@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.9.1 (2026-10-14)
+
+Fixes from a review of the whole code base in seven parts: the session core, orders and the exchange, the command line, market data, research, operations, and the documents against the code. Upgrade notes:
+- `tbot halt` exits 1 when the sale did not go through, and names what is not sold yet; the session tries again within minutes.
+- `risk.target_volatility` above 3 is refused: it is a fraction (0.4 means 40%), and a value such as 40 turned the scaling off without a word.
+- A testnet or live config whose symbols are quoted in two assets (BTCUSDT with ETHBTC) is refused at start (exit 4) and by doctor; the book keeps one cash.
+- `tbot doctor --offline` fails a real-money config without Telegram, as `tbot live` does, so `tbot update` no longer says it started a task that ends at once.
+- Paper and live sessions replay one bar less at start, so their first event sees what a backtest starting there sees.
+
+**Getting out**
+- A halt whose sale fails (a rate limit, an exchange outage) is tried again a minute later, then less often, up to every 15 minutes, until it goes through; before, nothing tried again until the next close, a day away on 1d bars.
+- Telegram's `/halt` also halts the sessions a supervisor starts again (between its restarts, or at the next boot) and those whose config broke without a `ledger:` line; the answer names those that halt at their next start.
+- `tbot resume` withdraws a halt request no session took, also when the book is not halted; `tbot resume` without a name finds such a request, and `tbot status <config>` shows it. Before, the next start, maybe days later, sold everything.
+- `tbot halt` without a name takes the running session (one whose config no longer loads included) before a stopped book, and `tbot stop` and `tbot halt` reach a session whose config broke and names no `ledger:`.
+- Dust below the exchange minimum is no longer sent as an order at every halted bar, nor named as a holding by `tbot halt`, `tbot stop`, and the alerts.
+
+**Real money**
+- A changed `initial_cash` is checked against the book valued at the latest stored closes, not at the last bar before the bot stopped: a cut after a fall could leave a live book with negative equity and a kill switch that never trips, and halted a paper book at once.
+- A protective stop refitted after the price fell through its new level (at a restart, or a reconciliation between bars) cancelled the working stop and was then refused, leaving the position without one until the next close: the working stop now stays, and a missing one goes under the current price.
+- `protective_stop_pct: 0` cancels the stop an earlier run placed, which could still sell the whole position.
+- After a sale cancelled the stop and then failed, the alert said the stop stays: it now says the position has none. A failed refit for a pair the book does not hold is logged, not alerted.
+- Market orders are capped at the largest order Binance takes (`MARKET_LOT_SIZE`, `LOT_SIZE` maximum); the rest goes at the next decision instead of failing at every bar.
+- Dust of a pair the config no longer trades no longer blocks every start; more than dust is refused for good (exit 4) instead of being retried every 15 minutes.
+- Doctor's budget check counts the cash of the other budget books on the account, as the start does.
+
+**Messages and commands**
+- The daily summary and `tbot status` no longer call a change against a snapshot days old a 24-hour change.
+- `tbot keys` warns when other accounts can read `.env` instead of saying it is yours only, keeps an old key it could not try on the testnet (no network) as the testnet pair, and it and `tbot notify` say when an environment variable overrides what they saved.
+- The hint for a key Binance rejects names the pair the session uses (the testnet pair on testnet).
+- `tbot paper` given a live config names the whole command, `--live` included. Output piped from a console no longer fails on a name its code page cannot show, and a question whose input was closed says so in one line.
+- A supervised start that gives up (exit 3 or 4) tries its last alert for about two minutes, since at a boot the network may come up after the task.
+- A session says once when another program reads the bot's messages (a second clone or computer with the same bot, a webhook), which keeps /halt from reaching it.
+- `tbot check` finds a 1m bar that is still open.
+
+**Research**
+- `objective: calmar` ended the validation with an error after the whole run, its holdout look included, had been made.
+- `selection: neighborhood` compared neighbors in the grid as typed: numeric grid values are put in order.
+- `tbot compare` with a symbol on two timeframes compared fills past where the backtest stopped and flagged right ones as only in the session.
+
+**Operations**
+- `tbot update` run as another administrator (a standard user's prompt) refuses before it stops anything when that account cannot read `.env`, and names the repository safe for git; before, it stopped every session and started none.
+- The scripts work in a folder whose name has brackets, and setup no longer rebuilds `.venv` at every run when the Python path has non-ASCII letters.
+- The git hooks find Hangul in UTF-8 text with a NUL byte, in UTF-16 without a byte order mark, and three or more Hangul syllables in other binary files.
+- A weekly CI run and a push no longer cancel each other.
+- A live feed waits at most 5 seconds for another process's write to the store, and a busy store is no longer reported as a silent socket.
+
+**Documents**
+- README: uninstalling while a session is stopped, the clock warning, which exits are alerted, where backups go, group chats and one bot per clone, and new troubleshooting rows; DESIGN and CONFIG follow the code.
+
+**Tests**
+- 36 new tests (641 in all); undoing any of 52 changes makes a test fail.
+
 ## 0.9.0 (2026-10-14)
 
 Safer and easier trading, from three reviews: what real money could suffer, a new user's way from paper to live, and the changes of this release themselves. Upgrade notes:

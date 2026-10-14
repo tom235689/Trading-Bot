@@ -41,7 +41,13 @@ param(
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 $repo = Split-Path -Parent $PSScriptRoot
-Set-Location $repo
+Set-Location -LiteralPath $repo
+# Elevated with another administrator's password, this run is that account: git refuses a
+# repository another account owns unless it is named safe (as `git -c` would).
+$env:GIT_CONFIG_COUNT = "1"
+$env:GIT_CONFIG_KEY_0 = "safe.directory"
+$env:GIT_CONFIG_VALUE_0 = $repo -replace '\\', '/'
+
 $runner = (Join-Path $PSScriptRoot "run_bot.ps1").ToLowerInvariant()
 $venv = (Join-Path $repo ".venv").ToLowerInvariant()
 $StashName = "tbot update"
@@ -84,6 +90,21 @@ function Get-OtherProcesses([string[]] $configs) {
         $line = if ($process) { [string] $process.CommandLine } else { "" }
         -not ($configs | Where-Object { $_ -and $line.ToLowerInvariant().Contains($_.ToLowerInvariant()) })
     })
+}
+
+function Assert-EnvReadable {
+    # The restart checks each config with .env; an account that cannot read it (setup lets
+    # only the owner) would stop every session and start none again.
+    $file = Join-Path $repo ".env"
+    if (-not (Test-Path -LiteralPath $file)) { return }
+    try {
+        [IO.File]::OpenRead($file).Dispose()
+    } catch {
+        throw ("$([Environment]::UserName) cannot read .env, which only the account that set up " +
+            "the bot may read, so its sessions would stop and not start again. Update as that " +
+            "account: tbot stop <config> for each session, git pull, uv sync --frozen, then " +
+            "tbot autostart <config>")
+    }
 }
 
 function Format-Busy($processes) {
@@ -138,6 +159,9 @@ try {
         return
     }
     if ($others) { throw (Format-Busy $others) }  # before any task is stopped for nothing
+    Assert-EnvReadable
+    $null = git rev-parse HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git cannot use $repo as $([Environment]::UserName) (see above)" }
 
     $failed = $false
     $notStarted = @()

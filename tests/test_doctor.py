@@ -14,8 +14,9 @@ from factories import price_bars
 from tbot.core.config import StrategyConfig
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
+from tbot.exchange.binance import BinanceError, BinanceSpot
 from tbot.live.backup import backup_ledger, daily_backups
-from tbot.live.config import LiveConfig, PaperConfig, Settings
+from tbot.live.config import ONE_QUOTE, LiveConfig, PaperConfig, Settings
 from tbot.live.doctor import (
     Check,
     backup_check,
@@ -23,14 +24,18 @@ from tbot.live.doctor import (
     guard_check,
     run_checks,
     synced_folder,
+    works_on_testnet,
 )
 from tbot.live.ledger import Ledger
 from tbot.live.runner import (
+    BUDGET_META,
     GUARD_META,
     KEYS_MISSING,
     MODE_META,
     halt_path,
+    key_hint,
     mode_problem,
+    other_books_cash,
     stop_path,
 )
 from tbot.risk.guard import GuardConfig, GuardState
@@ -120,6 +125,68 @@ def test_dangerous_key_and_short_budget_fail(tmp_path: Path) -> None:
     assert "USDT 400.00 free, the bot needs 1,000.00" in found["budget"][0][1]
 
 
+def test_the_budget_check_counts_free_cash_other_books_keep_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.live.doctor.other_books_cash", other_books_cash)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "eth.yaml").write_text(
+        "mode: live\ninitial_cash: 1000\nledger: eth.sqlite\nstrategies:\n"
+        "  - {name: donchian_trend, symbols: [ETHUSDT], timeframe: 4h, allocation: 1}\n",
+        "utf-8",
+    )
+    with Ledger(tmp_path / "eth.sqlite") as book:
+        book.set_meta(BUDGET_META, repr(1000.0))
+    spot = fake(balances={"USDT": 1500.0})
+    found = by_name(check(live(tmp_path), settings(**ALERTS, **KEYS), spot))
+    [(status, detail)] = found["budget"]
+    assert status == "fail"  # as the start refuses it
+    assert detail.startswith(
+        "USDT 1,500.00 free (1,000.00 of it the cash of eth), the bot needs 1,000.00"
+    )
+
+
+def test_symbols_quoted_in_two_assets_fail(tmp_path: Path) -> None:
+    spot = fake()
+    spot.rules = {**spot.rules, "ETHBUSD": spot.rules["ETHUSDT"]}
+    mixed = StrategyConfig(
+        name="donchian_trend",
+        symbols=["BTCUSDT", "ETHBUSD"],
+        timeframe=Timeframe.H4,
+        allocation=1.0,
+    )
+    found = by_name(check(live(tmp_path, strategies=[mixed]), settings(**ALERTS, **KEYS), spot))
+    assert found["symbols"] == [("fail", f"quoted in BUSD, USDT: {ONE_QUOTE}")]
+
+
+def test_a_rejected_key_names_the_pair_the_session_uses() -> None:
+    error = BinanceError(-2014, "API-key format invalid.")
+    both = settings(**KEYS, binance_testnet_api_key="k", binance_testnet_api_secret="s")
+    assert "check TBOT_BINANCE_TESTNET_API_KEY and" in key_hint(error, both.key_names("testnet"))
+    assert "check TBOT_BINANCE_API_KEY and" in key_hint(error, both.key_names("live"))
+    assert "check TBOT_BINANCE_API_KEY and" in key_hint(
+        error, settings(**KEYS).key_names("testnet")
+    )
+
+
+def test_whether_a_key_works_on_the_testnet_can_be_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run(key: str) -> bool | None:
+        async with fake().client() as client:
+            return await works_on_testnet(key, "secret", client)
+
+    assert asyncio.run(run("key")) is True
+    assert asyncio.run(run("other")) is False
+
+    async def unreachable(public: BinanceSpot) -> float:
+        raise httpx.ConnectError("no network")
+
+    monkeypatch.setattr("tbot.live.doctor.server_offset", unreachable)
+    assert asyncio.run(run("key")) is None  # an outage says nothing about the key
+
+
 def test_rights_the_bot_never_uses_are_warned_about(tmp_path: Path) -> None:
     spot = fake()
     spot.restrictions = {**spot.restrictions, "enableFutures": True}
@@ -162,6 +229,7 @@ def test_a_synced_folder_is_named(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert synced_folder(tmp_path / "OneDrive - Contoso" / "Trading-Bot") == "OneDrive"
     monkeypatch.setenv("OneDrive", str(tmp_path / "Cloud"))  # a renamed OneDrive folder
     assert synced_folder(tmp_path / "Cloud" / "bots" / "Trading-Bot") == "OneDrive"
+    assert synced_folder(tmp_path / "CloudArchive" / "Trading-Bot") == ""  # beside it
 
 
 def test_testnet_skips_permissions_and_flags_a_wrong_key(tmp_path: Path) -> None:
@@ -360,8 +428,16 @@ def test_offline_doctor_fails_only_on_what_stops_a_start(tmp_path: Path) -> None
             return await run_checks(config, values, client, offline=True)
 
     found = by_name(asyncio.run(offline(settings(**KEYS))))
-    assert found["telegram"][0][0] == "warn"  # `tbot update` restarts a bot that ran so
+    assert found["telegram"][0][0] == "fail"  # `tbot live` refuses real money without it
     assert found["kill switch"][0][0] == "warn"  # a halted bot runs, halted
+    testnet = live(tmp_path, mode="testnet")
+
+    async def offline_testnet(values: Settings) -> list[Check]:
+        async with httpx.AsyncClient() as client:
+            return await run_checks(testnet, values, client, offline=True)
+
+    found = by_name(asyncio.run(offline_testnet(settings(**KEYS, telegram_token="t"))))
+    assert found["telegram"][0][0] == "warn"  # `tbot update` restarts a bot that ran so
     no_keys = by_name(asyncio.run(offline(settings())))
     assert no_keys["api key"][0][0] == "fail"  # the start would fail
 

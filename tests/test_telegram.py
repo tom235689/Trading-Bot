@@ -282,3 +282,34 @@ def test_alerts_follow_a_group_that_became_a_supergroup() -> None:
 
     assert asyncio.run(run()) == (True, True, "-1009876")
     assert chats == ["-4001", "-1009876", "-1009876"]
+
+
+def test_a_second_reader_of_the_bot_is_told_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tbot.live.commands.CONFLICT_SECONDS", 0.01)
+    sent: list[str] = []
+    polls: list[int] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getUpdates"):
+            polls.append(1)
+            return httpx.Response(409, json={"ok": False, "description": "Conflict"})
+        sent.append(json.loads(request.content)["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    async def echo(text: str) -> str:
+        return text
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            telegram = Telegram("token", "42", client)
+            started = datetime(2024, 1, 1, tzinfo=UTC)
+            task = asyncio.create_task(command_loop(telegram, echo, started, label="live"))
+            async with asyncio.timeout(5):
+                while len(polls) < 5:
+                    await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert len(sent) == 1  # once, not at every try
+    assert sent[0].startswith("[live] Telegram commands paused: another program reads this bot")

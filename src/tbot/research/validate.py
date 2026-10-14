@@ -38,6 +38,7 @@ from tbot.research.sweep import (
     best_run,
     evaluate,
     grid_points,
+    in_order,
     neighborhood_mean,
     rank_of,
     run_sweep,
@@ -95,6 +96,12 @@ class ValidationConfig(BaseModel):
     monte_carlo: MonteCarloConfig = MonteCarloConfig()
     cost_multiplier: float = Field(default=2.0, ge=1)
     gate: GateConfig = GateConfig()
+
+    @field_validator("grid")
+    @classmethod
+    def numbers_in_order(cls, grid: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        """Numbers in order however they were typed, as the report's grid shows them."""
+        return {name: in_order(values) for name, values in grid.items()}
 
     @field_validator("objective")
     @classmethod

@@ -9,14 +9,14 @@ import pytest
 
 from binance_spot_fake import FakeSpot
 from factories import Scripted, price_bars
-from tbot.cli import EXIT_CONFIG, main
+from tbot.cli import EXIT_CONFIG, EXIT_ERROR, main
 from tbot.core.config import StrategyConfig
 from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.exchange.binance import TESTNET_URL, BinanceSpot
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
-from tbot.live.config import LiveConfig, PaperConfig
+from tbot.live.config import LiveConfig, PaperConfig, named_ledger
 from tbot.live.executor import LiveExecutor, PaperExecutor
 from tbot.live.history import BarHistory
 from tbot.live.ledger import Ledger
@@ -24,13 +24,16 @@ from tbot.live.runner import (
     GUARD_META,
     HALT_BY_HAND,
     HALT_BY_TELEGRAM,
+    SUPERVISED_META,
     SessionTrader,
     command_answer,
     halt_path,
+    halt_retry_loop,
+    halt_targets,
+    held_text,
     instance_lock,
     load_guard,
     resume,
-    running_sessions,
     watch_halt_request,
 )
 from tbot.live.session import TradingSession
@@ -50,7 +53,14 @@ def at(hours: int) -> datetime:
 
 
 class Prices:
+    """A book price of 100; none while the exchange is down."""
+
+    def __init__(self) -> None:
+        self.down = False
+
     async def price(self, symbol: str, side: int) -> float:
+        if self.down:
+            raise OSError("no route to the exchange")
         return 100.0
 
 
@@ -63,11 +73,13 @@ class Collect:
         return True
 
 
-def paper_trader(tmp_path: Path) -> tuple[SessionTrader, Ledger, Collect]:
+def paper_trader(
+    tmp_path: Path, prices: Prices | None = None, minimum: float = 0.0
+) -> tuple[SessionTrader, Ledger, Collect]:
     config = PaperConfig(
         initial_cash=1000.0,
         costs=CostModel(fee_rate=0.001, slippage_bps=0),
-        rebalance=RebalanceRules(min_notional=0, rebalance_threshold=0),
+        rebalance=RebalanceRules(min_notional=minimum, rebalance_threshold=0),
         strategies=[StrategyConfig(name="scripted", symbols=["BTC"], timeframe=H1, allocation=1)],
         ledger=tmp_path / "paper.sqlite",
         guard=NO_GUARD,
@@ -80,7 +92,7 @@ def paper_trader(tmp_path: Path) -> tuple[SessionTrader, Ledger, Collect]:
     )
     ledger, notifier = Ledger(config.ledger), Collect()
     broker = SimulatedBroker(config.costs)
-    executor = PaperExecutor(broker, Prices(), ledger, notifier, lambda: at(9))
+    executor = PaperExecutor(broker, prices or Prices(), ledger, notifier, lambda: at(9))
     trader = SessionTrader(
         session, ledger, executor, notifier, RiskGuard(NO_GUARD), clock=lambda: at(9)
     )
@@ -160,13 +172,17 @@ def test_telegram_halt_halts_the_other_sessions_too(tmp_path: Path) -> None:
         assert halt_path(other).exists()  # asked first: both sell at once
         return []
 
-    others = [("live", other)]
+    stopped = tmp_path / "eth.sqlite"  # between a supervisor's restarts
+    others = [("live", other, True), ("eth", stopped, False)]
     answer = command_answer(
         trader.session, ledger, "paper", lambda: at(1), list, None, halt, "paper", lambda: others
     )
     code = asyncio.run(answer("/halt")).split("send /halt ")[1].split()[0]
     reply = asyncio.run(answer(f"/halt {code}"))
-    assert reply.endswith("Also halting: live; their alerts follow.")
+    assert reply.endswith(
+        "Also halting: live; their alerts follow. Halting at their next start: eth."
+    )
+    assert halt_path(stopped).exists()
     assert "`tbot resume paper`" in reply
     seen: list[str] = []
 
@@ -186,7 +202,7 @@ def test_telegram_halt_halts_the_other_sessions_too(tmp_path: Path) -> None:
     ledger.close()
 
 
-def test_other_running_sessions_are_found_by_their_configs(
+def test_the_sessions_a_halt_reaches_are_found_by_their_configs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -196,18 +212,38 @@ def test_other_running_sessions_are_found_by_their_configs(
         "live": f"mode: live\ninitial_cash: 500\nledger: live.sqlite\nstrategies:\n{STRATEGY}",
         "typo": f"ledger: typo.sqlite\ninitial_cahs: 5\nstrategies:\n{STRATEGY}",
         "idle": f"ledger: idle.sqlite\nstrategies:\n{STRATEGY}",
+        "sup": f"ledger: sup.sqlite\nstrategies:\n{STRATEGY}",
+        "nameless": f"mode: testnet\ninitial_cahs: 5\nstrategies:\n{STRATEGY}",
         "backtest": f"start: 2024-01-01\nstrategies:\n{STRATEGY}",
     }.items():
         (tmp_path / "config" / f"{name}.yaml").write_text(body, "utf-8")
-    for ledger in ("paper", "live", "typo", "idle"):
+    (tmp_path / "data").mkdir()
+    for ledger in ("paper", "live", "typo", "idle", "sup", "data/testnet"):
         Ledger(tmp_path / f"{ledger}.sqlite").close()
+    with Ledger(tmp_path / "sup.sqlite") as book:
+        book.set_meta(SUPERVISED_META, "1")  # its supervisor may start it again
     with (
         instance_lock(tmp_path / "paper.sqlite"),
         instance_lock(tmp_path / "live.sqlite"),
         instance_lock(tmp_path / "typo.sqlite"),
+        instance_lock(tmp_path / "data" / "testnet.sqlite"),
     ):
-        found = running_sessions(tmp_path / "paper.sqlite")
-    assert [name for name, _ in found] == ["live", "typo"]  # a broken config still runs
+        found = halt_targets(tmp_path / "paper.sqlite")
+    assert [(name, running) for name, _, running in found] == [
+        ("live", True),
+        ("nameless", True),  # broken, on the default ledger of its mode
+        ("sup", False),
+        ("typo", True),  # broken, on the ledger it names
+    ]
+
+
+def test_a_config_that_does_not_load_still_names_its_ledger() -> None:
+    assert named_ledger({"mode": "testnet", "initial_cahs": 5}) == Path("data/testnet.sqlite")
+    assert named_ledger({"mode": "live"}) == Path("data/live.sqlite")
+    assert named_ledger({"strategies": []}) == Path("data/paper.sqlite")
+    assert named_ledger({"mode": "live", "ledger": "x.sqlite"}) == Path("x.sqlite")
+    assert named_ledger({"ledger": 5}) is None
+    assert named_ledger({"mode": "futures"}) is None
 
 
 def test_a_start_after_a_resume_sells_nothing(tmp_path: Path) -> None:
@@ -219,6 +255,74 @@ def test_a_start_after_a_resume_sells_nothing(tmp_path: Path) -> None:
     assert asyncio.run(trader.sell_if_halted()) == []
     assert trader.session.portfolio.positions
     ledger.close()
+
+
+def test_a_halt_whose_sale_failed_sells_again_within_minutes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.live.runner.HALT_RETRY_SECONDS", 0.01)
+    prices = Prices()
+    trader, ledger, notifier = paper_trader(tmp_path, prices)
+    bar(trader, 0)
+    prices.down = True
+    assert asyncio.run(trader.halt_now(HALT_BY_HAND)) == []  # not at the next bar, hours away
+    assert "1 NOT SOLD" in notifier.messages[-1]
+    prices.down = False
+
+    async def wait() -> None:
+        task = asyncio.create_task(halt_retry_loop(trader))
+        async with asyncio.timeout(5):
+            while trader.session.portfolio.positions:
+                await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(wait())
+    assert "Positions flattened (1 fills)" in notifier.messages[-1]
+    ledger.close()
+
+
+def test_dust_is_neither_sold_nor_called_a_holding(tmp_path: Path) -> None:
+    trader, ledger, notifier = paper_trader(tmp_path, minimum=50.0)
+    portfolio, marks = trader.session.portfolio, trader.session.marks
+    portfolio.positions["BTC"] = 0.1  # 10.00 at 100: no order can sell it
+    marks["BTC"] = 100.0
+    assert trader.sellable() == {}
+    assert asyncio.run(trader.halt_now(HALT_BY_HAND)) == []
+    assert ledger.conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
+    assert "1 left below the exchange minimum" in notifier.messages[-1]
+    assert held_text(portfolio, marks, 50.0) == "nothing held"
+    portfolio.positions["BTC"] = 1.0
+    assert held_text(portfolio, marks, 50.0) == "still held: BTC 1.000000 (100.00)"
+    ledger.close()
+
+
+def test_a_resume_withdraws_a_request_of_a_book_that_is_not_halted(tmp_path: Path) -> None:
+    trader, ledger, _ = paper_trader(tmp_path)
+    request = halt_path(config_of(trader).ledger)
+    request.write_text("telegram\n", encoding="utf-8")  # its session stopped before taking it
+    assert resume(config_of(trader)).startswith("not halted; withdrew")
+    assert not request.exists()  # never sells at a later start
+    assert resume(config_of(trader)) == "not halted"
+    ledger.close()
+
+
+def test_resume_without_a_name_finds_a_waiting_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "paper.yaml").write_text(
+        f"ledger: paper.sqlite\nstrategies:\n{STRATEGY}", "utf-8"
+    )
+    Ledger(tmp_path / "paper.sqlite").close()
+    request = halt_path(tmp_path / "paper.sqlite")
+    request.write_text("halt\n", encoding="utf-8")
+    assert main(["status", "paper"]) == 0
+    assert "a `tbot halt` request waits" in capsys.readouterr().out
+    assert main(["resume"]) == 0
+    assert "withdrew a `tbot halt` request" in capsys.readouterr().out
+    assert not request.exists()
 
 
 def test_a_resume_withdraws_a_halt_request_no_session_took(tmp_path: Path) -> None:
@@ -337,14 +441,12 @@ def test_halt_marks_a_stopped_session_and_names_what_its_start_sells(
     assert "was halted already (halted by hand" in capsys.readouterr().out
 
 
-def test_halt_reaches_a_running_session(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    config = session_file(tmp_path, "")
-    ledger_path = tmp_path / "s.sqlite"
-    Ledger(ledger_path).close()
+def halt_running(ledger_path: Path, args: list[str]) -> int:
+    """`tbot halt` against a session that halts when asked, and sells nothing."""
     request = halt_path(ledger_path)
     held, done = threading.Event(), threading.Event()
 
-    def session() -> None:  # holds the ledger, takes the request, halts, and removes it
+    def session() -> None:
         with instance_lock(ledger_path):
             held.set()
             while not request.exists():
@@ -360,11 +462,52 @@ def test_halt_reaches_a_running_session(tmp_path: Path, capsys: pytest.CaptureFi
     thread.start()
     try:
         held.wait(5)
-        assert main(["halt", str(config), "--timeout", "10"]) == 0
+        return main(["halt", *args, "--timeout", "10"])
     finally:
         done.set()
         thread.join(5)
-    assert "halted: nothing held; `tbot resume" in capsys.readouterr().out
+
+
+def test_halt_says_what_a_failed_sale_left(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = session_file(tmp_path, "")
+    with Ledger(tmp_path / "s.sqlite") as ledger:
+        ledger.add_fill(Fill(T0, "BTCUSDT", 0.01, 50000.0, 0.5), 50000.0)
+        ledger.add_fill(Fill(T0, "ETHUSDT", 0.001, 3000.0, 0.0), 3000.0)  # 3.00: dust
+    assert halt_running(tmp_path / "s.sqlite", [str(config)]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "halted, but not sold yet: BTCUSDT 0.010000 (see the alerts)" in err
+    assert "ETH" not in err
+
+
+def test_halt_without_a_name_takes_the_running_session_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "paper.yaml").write_text(
+        f"ledger: paper.sqlite\nstrategies:\n{STRATEGY}", "utf-8"
+    )
+    (tmp_path / "config" / "testnet.yaml").write_text(  # edited into errors while it runs
+        f"mode: testnet\ninitial_cahs: 5\nstrategies:\n{STRATEGY}", "utf-8"
+    )
+    (tmp_path / "data").mkdir()
+    Ledger(tmp_path / "paper.sqlite").close()
+    Ledger(tmp_path / "data" / "testnet.sqlite").close()
+    assert halt_running(tmp_path / "data" / "testnet.sqlite", []) == 0
+    out = capsys.readouterr().out
+    assert "testnet.yaml" in out
+    assert "halted; `tbot status testnet` shows what it holds" in out
+    with Ledger(tmp_path / "paper.sqlite") as ledger:
+        assert ledger.get_meta(GUARD_META) is None  # the stopped book is left alone
+
+
+def test_halt_reaches_a_running_session(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = session_file(tmp_path, "")
+    Ledger(tmp_path / "s.sqlite").close()
+    assert halt_running(tmp_path / "s.sqlite", [str(config)]) == 0
+    assert "halted: the bot holds nothing; `tbot resume" in capsys.readouterr().out
 
 
 def test_halt_never_picks_a_real_money_session(

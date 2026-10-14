@@ -25,7 +25,7 @@ from tbot.exchange.binance import (
     BinanceSpot,
 )
 from tbot.live.backup import daily_backups
-from tbot.live.config import LiveConfig, SessionConfig, Settings, env_readers
+from tbot.live.config import ONE_QUOTE, LiveConfig, SessionConfig, Settings, env_readers
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.release import newest_release, update_note
 from tbot.live.runner import (
@@ -40,6 +40,7 @@ from tbot.live.runner import (
     make_spot,
     mode_problem,
     needless_rights,
+    other_books_cash,
     restore_portfolio,
     stop_path,
     symbols_of,
@@ -101,9 +102,10 @@ async def run_checks(
                 "your account (README, Security)",
             )
         )
-    if offline:
+    if offline:  # a real-money start refuses a missing Telegram, offline or not
+        anyway = STARTS_ANYWAY - {"telegram"} if real_money else STARTS_ANYWAY
         checks = [
-            Check("warn", c.name, c.detail) if c.status == "fail" and c.name in STARTS_ANYWAY else c
+            Check("warn", c.name, c.detail) if c.status == "fail" and c.name in anyway else c
             for c in checks
         ]
     if checks[0].status == "fail":
@@ -155,10 +157,11 @@ def synced_folder(folder: Path) -> str:
     roots = [
         os.environ.get(name, "") for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
     ]
-    resolved = str(folder.resolve()).lower()
-    if any(root and resolved.startswith(str(Path(root).resolve()).lower()) for root in roots):
-        return "OneDrive"
     parts = [part.lower() for part in folder.resolve().parts]
+    for root in filter(None, roots):
+        top = [part.lower() for part in Path(root).resolve().parts]
+        if parts[: len(top)] == top:  # inside it, not a sibling such as OneDriveArchive
+            return "OneDrive"
     for name in SYNCED:
         lower = name.lower()  # also "OneDrive - Company", "Dropbox (Personal)"
         if any(part == lower or part.startswith((f"{lower} - ", f"{lower} (")) for part in parts):
@@ -194,8 +197,8 @@ async def key_checks(
     return await account_checks(config, settings, client, offset)
 
 
-async def works_on_testnet(key: str, secret: str, client: httpx.AsyncClient) -> bool:
-    """Whether Binance's testnet takes this key pair."""
+async def works_on_testnet(key: str, secret: str, client: httpx.AsyncClient) -> bool | None:
+    """Whether Binance's testnet takes this key pair; None when it cannot be reached."""
     public = BinanceSpot(client, "", "", base_url=TESTNET_URL)
     try:
         offset = await server_offset(public)
@@ -204,8 +207,10 @@ async def works_on_testnet(key: str, secret: str, client: httpx.AsyncClient) -> 
             return datetime.now(UTC) + timedelta(seconds=offset)
 
         await BinanceSpot(client, key, secret, base_url=TESTNET_URL, clock=clock).account()
-    except (httpx.HTTPError, BinanceError):
-        return False
+    except httpx.HTTPError:
+        return None
+    except BinanceError as exc:  # a refusal says no; an outage or a rate limit cannot tell
+        return False if 400 <= exc.status < 500 and exc.status not in (418, 429) else None
     return True
 
 
@@ -430,6 +435,9 @@ async def symbol_checks(config: SessionConfig, spot: BinanceSpot) -> list[Check]
         return [Check("fail", "symbols", exc.message)]
     except httpx.HTTPError as exc:
         return [Check("fail", "symbols", f"unreachable: {describe_error(exc)}")]
+    quotes = sorted({rule.quote for rule in rules.values()})
+    if len(quotes) > 1:
+        return [Check("fail", "symbols", f"quoted in {', '.join(quotes)}: {ONE_QUOTE}")]
     paused = [f"{s} {spot.status[s]}" for s in sorted(rules) if not spot.trading(s)]
     if paused:
         return [
@@ -474,7 +482,8 @@ async def account_checks(
     except BinanceError as exc:
         if exc.status >= 500 or exc.status == 429:
             return [*checks, Check("fail", "api key", f"unreachable: {exc}")]
-        hint = f"; {key_hint(exc)}" if key_hint(exc) else ""
+        hint = key_hint(exc, settings.key_names(config.mode))
+        hint = f"; {hint}" if hint else ""
         return [*checks, Check("fail", "api key", f"rejected: {exc}{hint}")]
     checks.append(
         Check("ok", "api key", f"valid on {spot.base_url}")
@@ -540,13 +549,16 @@ def budget_check(
     if config.ledger.is_file():
         with Ledger(config.ledger) as ledger:  # plus a budget change the next start books
             needed = restore_portfolio(config, ledger).cash + unbooked_budget(config, ledger)
-    if free + 1e-9 < needed:
+    taken, books = other_books_cash(config)  # the same free cash, counted once
+    theirs = f" ({taken:,.2f} of it the cash of {', '.join(books)})" if books else ""
+    if free - taken + 1e-9 < needed:
         return Check(
             "fail",
             "budget",
-            f"{quote} {free:,.2f} free, the bot needs {needed:,.2f}; deposit or lower initial_cash",
+            f"{quote} {free:,.2f} free{theirs}, the bot needs {needed:,.2f}; deposit or lower "
+            "initial_cash",
         )
-    return Check("ok", "budget", f"{quote} {free:,.2f} free covers the bot's {needed:,.2f}")
+    return Check("ok", "budget", f"{quote} {free:,.2f} free{theirs} covers the bot's {needed:,.2f}")
 
 
 def checks_text(checks: list[Check]) -> str:

@@ -14,6 +14,7 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.research.report import format_report
 from tbot.research.sweep import (
+    OBJECTIVES,
     SweepRun,
     best_run,
     grid_points,
@@ -24,7 +25,12 @@ from tbot.research.sweep import (
     sweep_table,
 )
 from tbot.research.trials import TrialLog
-from tbot.research.validate import WalkForwardConfig, load_validation_config, run_validation
+from tbot.research.validate import (
+    ValidationConfig,
+    WalkForwardConfig,
+    load_validation_config,
+    run_validation,
+)
 from tbot.research.walkforward import Window, add_months, run_walk_forward, stitch, windows
 
 H4 = Timeframe.H4
@@ -92,6 +98,23 @@ def test_sweep_ranks_and_neighborhood(data_dir: Path) -> None:
 
     everything = neighborhood_mean(runs, GRID, best.params, "sharpe", 1)
     assert everything == pytest.approx(sum(r.metrics.sharpe for r in runs) / len(runs))
+
+
+def test_the_sweep_table_shows_every_objective(data_dir: Path) -> None:
+    runs = run_sweep(BASE, {"entry": [5, 10]}, data_dir)
+    for objective in OBJECTIVES:  # calmar is no column of its own
+        assert objective in sweep_table(runs, objective).columns
+
+
+def test_grid_numbers_are_put_in_order() -> None:
+    config = ValidationConfig.model_validate(
+        {
+            "backtest": "b.yaml",
+            "holdout_start": "2024-01-01",
+            "grid": {"entry": [20, 30, 40, 55, 25], "kind": ["b", "a"]},
+        }
+    )
+    assert config.grid == {"entry": [20, 25, 30, 40, 55], "kind": ["b", "a"]}  # 25 beside 20
 
 
 def test_sweep_in_processes(data_dir: Path) -> None:

@@ -105,3 +105,13 @@ def test_a_temporary_file_a_dead_writer_left_is_removed(tmp_path: Path) -> None:
     stale.write_bytes(b"partial")
     store.write("BTCUSDT", H4, make_bars(NEW_YEAR_EVE, 3, H4))
     assert not stale.exists()
+
+
+def test_a_writer_that_cannot_wait_longer_finds_the_store_busy(tmp_path: Path) -> None:
+    from tbot.data.store import StoreBusy, locked
+
+    store = BarStore(tmp_path)
+    store.write("BTCUSDT", H4, make_bars(NEW_YEAR_EVE, 2, H4))
+    with locked(store.directory("BTCUSDT", H4) / ".lock"), pytest.raises(StoreBusy):
+        store.write("BTCUSDT", H4, make_bars(NEW_YEAR_EVE, 4, H4), wait=0.1)
+    assert not issubclass(StoreBusy, TimeoutError)  # never taken for a silent socket

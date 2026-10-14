@@ -74,7 +74,7 @@ if ($Remove) {
 $code = 0
 try {
     $path = Resolve-Config $repo $Config
-    $text = Get-Content -Raw $path
+    $text = Get-Content -Raw -LiteralPath $path
     $isLive = $text -match '(?m)^mode:\s*["'']?live["'']?\s*(#.*)?$'
     if ($isLive -and -not $Live) { throw "$Config trades real money: add -Live to confirm" }
     if ($Live -and -not $isLive) { throw "-Live is only for a config with mode: live" }
@@ -155,7 +155,7 @@ try {
                 Write-Output "registered and started '$Name': it runs at every boot. Watch it: tbot status, tbot log $stem -f"
             } else {
                 $journal = Join-Path $repo "logs\$stem.supervisor.log"
-                $last = if (Test-Path $journal) { Get-Content $journal -Tail 1 } else { "no journal yet" }
+                $last = if (Test-Path -LiteralPath $journal) { Get-Content -LiteralPath $journal -Tail 1 } else { "no journal yet" }
                 Write-Output "registered '$Name', but it is not running ($state): $last"
                 $code = 1
             }

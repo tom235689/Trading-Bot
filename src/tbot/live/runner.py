@@ -47,7 +47,14 @@ from tbot.live.commands import (
     command_loop,
     command_of,
 )
-from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings
+from tbot.live.config import (
+    ONE_QUOTE,
+    LiveConfig,
+    PaperConfig,
+    SessionConfig,
+    Settings,
+    named_ledger,
+)
 from tbot.live.executor import BinanceBookTicker, Executor, LiveExecutor, PaperExecutor
 from tbot.live.feed import Batch, LiveFeed, bars_since, close_time, utc_now
 from tbot.live.history import MAX_BARS, BarHistory
@@ -77,6 +84,9 @@ STOP_POLL_SECONDS = 2.0  # how often a session looks for a `tbot stop` request
 STOP_REQUEST_SECONDS = 1200  # a request this fresh also stops a start: beyond the supervisor's
 # longest wait between restarts (15 minutes), so a restart after `tbot stop` ends at once
 RECONCILE_ALERT_AFTER = 3  # consecutive failed reconciliations before trading pauses
+HALT_RETRY_SECONDS = 60.0  # a halted book that still holds coins sells again this soon
+HALT_RETRY_MAX_SECONDS = 900.0  # doubling after each failed try, up to this
+DAY_REFERENCE = timedelta(hours=36)  # an older snapshot is no reference for a 24h change
 GUARD_META = "guard"
 BUDGET_META = "initial_cash"  # the budget the guard levels refer to
 BASE_META = "base_cash"  # what the book started with
@@ -101,9 +111,10 @@ KEYS_MISSING = (
 RELEASE_FIRST = 600.0  # seconds after a start before asking whether a newer release is out
 RELEASE_EVERY = 86400.0
 KEY_REJECTED = (
-    "check TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET in .env; tbot signs with HMAC, so "
-    "the key must be a system-generated (HMAC) one, not Ed25519 or RSA"
+    "check {} in .env; tbot signs with HMAC, so the key must be a system-generated (HMAC) "
+    "one, not Ed25519 or RSA"
 )
+MAIN_KEYS = "TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET"
 KEY_REFUSED = -2015  # wrong key, wrong network, missing permission, or IP not allowed
 KEY_REFUSED_HINT = (
     "the key is mistyped, made for the other network (testnet keys work only on testnet), "
@@ -111,11 +122,12 @@ KEY_REFUSED_HINT = (
 )
 
 
-def key_hint(exc: Exception) -> str:
-    """What to check when Binance refuses the key, or ""."""
+def key_hint(exc: Exception, names: str = MAIN_KEYS) -> str:
+    """What to check when Binance refuses the key, or "". `names` are the .env lines of
+    the pair the session uses."""
     code = getattr(exc, "code", None)
     if code in KEY_ERRORS:
-        return KEY_REJECTED
+        return KEY_REJECTED.format(names)
     return KEY_REFUSED_HINT if code == KEY_REFUSED else ""
 
 
@@ -251,7 +263,7 @@ class SessionTrader:
         dust below the exchange minimum can stay behind for a long time.
         """
         session = self.session
-        orders = self.guard.flatten_orders(session.portfolio.positions)
+        orders = self.guard.flatten_orders(self.sellable())
         fills: list[Fill] = []
         if orders:
             fills = await self.executor.execute(orders, now, session.portfolio, session.marks)
@@ -290,17 +302,21 @@ class SessionTrader:
             now = self.clock()
             return await self._halt(self.guard.state.halt_reason, now, announce=announce)
 
-    async def sell_if_halted(self) -> list[Fill]:
-        """At the start: a halted book that still holds coins (`tbot halt` while stopped, a
-        sale that failed) sells them now rather than at the next bar."""
+    def sellable(self) -> dict[str, float]:
+        """Positions an order can sell: below the exchange minimum is dust, which stays."""
         session = self.session
         minimum = session.config.rebalance.min_notional
-        held = [
-            symbol
+        return {
+            symbol: quantity
             for symbol, quantity in session.portfolio.positions.items()
-            if quantity and abs(quantity) * session.marks.get(symbol, 0.0) >= minimum
-        ]
-        if not held:
+            if quantity
+            and (symbol not in session.marks or abs(quantity) * session.marks[symbol] >= minimum)
+        }
+
+    async def sell_if_halted(self) -> list[Fill]:
+        """A halted book that still holds coins (`tbot halt` while stopped, a sale that
+        failed) sells them now rather than at the next bar."""
+        if not self.sellable():
             return []
         async with self.lock:
             self.reload_guard()  # a `tbot resume` while this session started
@@ -367,12 +383,19 @@ def adopt_resume(guard: RiskGuard, ledger: Ledger) -> None:
             guard.state = stored
 
 
-def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard, now: datetime) -> str:
+def check_budget(
+    config: SessionConfig,
+    ledger: Ledger,
+    guard: RiskGuard,
+    now: datetime,
+    store: BarStore | None = None,
+) -> str:
     """A changed initial_cash moves money into or out of the book: not a profit or loss.
 
     It is booked as a cash adjustment, like a deposit, so the guard, the dashboard, and
-    compare all see a transfer. Run it before the book is restored. Returns what changed,
-    or "".
+    compare all see a transfer. Run it before the book is restored, after the store is
+    synced: the book is valued at its latest closes, not at the last bar before a stop.
+    Returns what changed, or "".
     """
     stored = ledger.get_meta(BUDGET_META)
     note = ""
@@ -381,7 +404,9 @@ def check_budget(config: SessionConfig, ledger: Ledger, guard: RiskGuard, now: d
             ledger.set_meta(BASE_META, stored if stored is not None else repr(config.initial_cash))
         if stored is not None and float(stored) != config.initial_cash:
             change = config.initial_cash - float(stored)
-            equity = book_equity(config, ledger) + pending_shift(ledger)
+            equity = book_value(config, ledger, store, now) if store is not None else None
+            if equity is None:
+                equity = book_equity(config, ledger) + pending_shift(ledger)
             if equity + change < 0:
                 raise StartRefused(
                     f"initial_cash {config.initial_cash:,.2f} takes {-change:,.2f} out of a "
@@ -418,6 +443,21 @@ def book_equity(config: SessionConfig, ledger: Ledger) -> float:
     last = {fill.symbol: fill.price for fill in ledger.fills()}  # no bar event valued it yet
     book = restore_portfolio(config, ledger)
     return book.cash + sum(qty * last.get(s, 0.0) for s, qty in book.positions.items())
+
+
+def book_value(
+    config: SessionConfig, ledger: Ledger, store: BarStore, now: datetime
+) -> float | None:
+    """The book's value now: its cash, and its coins at the latest stored closes. None
+    when a coin has no stored price. Budget changes booked earlier are in the cash."""
+    book = restore_portfolio(config, ledger)
+    value = book.cash
+    for symbol, quantity in book.positions.items():
+        price = price_at(config, store, symbol, now)
+        if quantity and not price > 0:
+            return None
+        value += quantity * price
+    return value
 
 
 def pending_shift(ledger: Ledger) -> float:
@@ -576,7 +616,9 @@ def build_session(
     until = replay_until(config, checkpoint, now)
     frames: dict[StreamKey, pl.DataFrame] = {}
     for key, count in lookback.items():
-        frames[key] = bars_since(store, key, count, until)
+        # The first event brings its own bar: with it the strategies see `count` bars, as
+        # a backtest starting at that event does (its first bar included).
+        frames[key] = bars_since(store, key, count - 1, until)
         if frames[key].height < count // WARMUP_MARGIN:
             hint = store.download_hint([key])
             raise ValueError(f"not enough stored bars for {key[0]} {key[1]}; run {hint}")
@@ -584,8 +626,29 @@ def build_session(
         key: BarHistory(key[1], max_bars=max(MAX_BARS, count)) for key, count in lookback.items()
     }
     session = TradingSession(config, slots, histories, portfolio)
+    mark_leftovers(session, store, now)
     replay_history(session, frames, checkpoint)
     return session
+
+
+def mark_leftovers(session: TradingSession, store: BarStore, now: datetime) -> None:
+    """Coins of pairs the config no longer trades: dust a sale left behind is valued and
+    left alone (no order can sell it); more than that refuses the start. Without stored
+    bars of the pair (dropped long ago), its last fill prices it."""
+    config = session.config
+    last = {fill.symbol: fill.price for fill in session.portfolio.fills}
+    for symbol, quantity in session.portfolio.positions.items():
+        if not quantity or symbol in session.exec_keys:
+            continue
+        price = price_at(config, store, symbol, now) or last.get(symbol, 0.0)
+        if price > 0 and abs(quantity) * price < config.rebalance.min_notional:
+            session.marks[symbol] = price
+            continue
+        raise StartRefused(
+            f"the book holds {quantity:.8f} {symbol}, which this config does not trade: add "
+            "the symbol back to the config (and run `tbot download`) so the bot can value, "
+            "manage, and sell it"
+        )
 
 
 def summary_text(
@@ -603,6 +666,9 @@ def summary_text(
     equity = session.portfolio.equity(session.marks)
     earlier = ledger.equity_before(now - timedelta(days=1))
     change = "no 24h reference"
+    span = "over 24h"
+    if earlier and earlier.time < now - DAY_REFERENCE:  # the bot was down: say since when
+        span = f"since {earlier.time:%Y-%m-%d %H:%M}"
 
     def price(symbol: str, moment: datetime) -> float:
         if store is None:
@@ -615,7 +681,7 @@ def summary_text(
             for a in ledger.adjustments()
             if earlier.time < a.time <= now
         )
-        change = f"{(equity - moved) / earlier.equity - 1:+.2%} over 24h"
+        change = f"{(equity - moved) / earlier.equity - 1:+.2%} {span}"
     raw = ledger.get_meta(GUARD_META)
     guard = GuardState.model_validate_json(raw) if raw else GuardState()
     if guard.peak_equity > 0:
@@ -656,13 +722,26 @@ def fills_text(ledger: Ledger, label: str, count: int = 10) -> str:
     )
 
 
-def held_text(portfolio: Portfolio, marks: Mapping[str, float]) -> str:
+def held_text(portfolio: Portfolio, marks: Mapping[str, float], minimum: float = 0.0) -> str:
+    """What the book holds; dust below `minimum` (the exchange minimum) is no holding."""
     held = [
         f"{symbol} {quantity:.6f} ({quantity * marks.get(symbol, 0.0):,.2f})"
         for symbol, quantity in sorted(portfolio.positions.items())
-        if quantity
+        if quantity and (symbol not in marks or abs(quantity) * marks[symbol] >= minimum)
     ]
     return f"still held: {', '.join(held)}" if held else "nothing held"
+
+
+def held_positions(config: SessionConfig, ledger: Ledger) -> dict[str, float]:
+    """What the book holds, without dust: a position worth less than the exchange minimum
+    at its last fill price can never be sold, so no message counts it."""
+    last = {fill.symbol: fill.price for fill in ledger.fills()}
+    minimum = config.rebalance.min_notional
+    return {
+        symbol: quantity
+        for symbol, quantity in restore_portfolio(config, ledger).positions.items()
+        if quantity and (symbol not in last or abs(quantity) * last[symbol] >= minimum)
+    }
 
 
 def command_answer(
@@ -674,10 +753,10 @@ def command_answer(
     store: BarStore | None = None,
     halt: Callable[[str], Awaitable[list[Fill]]] | None = None,
     name: str = "",
-    others: Callable[[], list[tuple[str, Path]]] = list,
+    others: Callable[[], list[tuple[str, Path, bool]]] = list,
 ) -> Answer:
-    """`others` names the other sessions that run: one /halt halts them too, since only one
-    session reads the bot's messages."""
+    """`others` names the other sessions to halt with this one, by name, ledger, and
+    whether they run: only one session reads the bot's messages."""
     code: list[tuple[str, float]] = []  # the /halt code in force, and when it expires
     resume = resume_command(name)
     halt_command = f"tbot halt {name}" if name else "tbot halt"
@@ -706,23 +785,25 @@ def command_answer(
             )
         if given[0] != expected or time.monotonic() > deadline:
             return f"[{label}] wrong or expired code, nothing done: send /halt for a new one"
-        asked = []
-        for other, path in others():  # first: they sell while this one does
+        asked: list[str] = []
+        later: list[str] = []  # stopped, but a supervisor may start them
+        for other, path, running in others():  # first: they sell while this one does
             try:
                 halt_path(path).write_text(f"{TELEGRAM_REQUEST}\n", encoding="utf-8")
-                asked.append(other)
+                (asked if running else later).append(other)
             except OSError as exc:
                 log.error("halt_request_failed", session=other, error=repr(exc))
         also = f" Also halting: {', '.join(asked)}; their alerts follow." if asked else ""
+        if later:
+            also += f" Halting at their next start: {', '.join(later)}."
         try:
             fills = await halt(HALT_BY_TELEGRAM)
         except Exception as exc:  # the owner must know the bot did not get out
             log.exception("halt_failed")
             return f"[{label}] halt FAILED: {exc!r}; run `{halt_command}` on the computer.{also}"
-        return (
-            f"[{label}] halted: {len(fills)} fills, "
-            f"{held_text(session.portfolio, session.marks)}. No trading until `{resume}`.{also}"
-        )
+        minimum = session.config.rebalance.min_notional
+        held = held_text(session.portfolio, session.marks, minimum)
+        return f"[{label}] halted: {len(fills)} fills, {held}. No trading until `{resume}`.{also}"
 
     return answer
 
@@ -773,6 +854,23 @@ async def clock_loop(clock: ServerClock, interval: float) -> None:
             await asyncio.to_thread(clock.sync)
         except (httpx.HTTPError, LookupError, ValueError) as exc:
             log.warning("clock_sync_failed", error=repr(exc))
+
+
+async def halt_retry_loop(trader: SessionTrader) -> None:
+    """A halted book whose sale failed (a rate limit, an outage) tries again within
+    minutes instead of at the next close, which can be a day away."""
+    wait = HALT_RETRY_SECONDS
+    while True:
+        await asyncio.sleep(wait)
+        if not (trader.guard.state.halted and trader.sellable()):
+            wait = HALT_RETRY_SECONDS
+            continue
+        log.warning("halt_retry", positions=trader.sellable())
+        try:
+            await trader.sell_if_halted()
+        except Exception as exc:  # the next try, or the next bar, sells
+            log.error("halt_retry_failed", error=repr(exc))
+        wait = min(wait * 2, HALT_RETRY_MAX_SECONDS)
 
 
 async def consume(feed: LiveFeed, trader: SessionTrader) -> None:
@@ -902,8 +1000,9 @@ def halt_path(ledger: Path) -> Path:
 
 
 async def watch_halt_request(path: Path, halt: Callable[[str], Awaitable[object]]) -> None:
-    """Halt when `tbot halt` asks. The request goes only once the sales are done, so a
-    crash in between halts again at the next start."""
+    """Halt when `tbot halt` asks. The request goes once the halt is saved and the sales
+    were tried, so a crash in between halts again at the next start; what a failed sale
+    left, the session sells again within minutes (halt_retry_loop)."""
     while True:
         if path.exists():
             try:
@@ -920,26 +1019,28 @@ async def watch_halt_request(path: Path, halt: Callable[[str], Awaitable[object]
         await asyncio.sleep(STOP_POLL_SECONDS)
 
 
-def running_sessions(own: Path) -> list[tuple[str, Path]]:
-    """The other sessions of this clone's config/ that run now, by name and ledger."""
-    found: dict[Path, str] = {}
+def halt_targets(own: Path) -> list[tuple[str, Path, bool]]:
+    """The other sessions of this clone's config/ a /halt reaches, by name, ledger, and
+    whether they run: those that run now, and those a supervisor may start again (between
+    its restarts, or at the next boot). A config edited into errors still names its ledger."""
+    found: dict[Path, tuple[str, bool]] = {}
     for path in sorted(Path("config").glob("*.y*ml")):
         try:
             raw = load_yaml(path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict) or {"start", "backtest", "grid"} & raw.keys():
                 continue  # no session
-            named = raw.get("ledger")
-            if isinstance(named, str):
-                ledger = Path(named)
-            elif "mode" in raw:
-                ledger = LiveConfig.model_validate(raw).ledger
-            else:
-                ledger = PaperConfig.model_validate(raw).ledger
-        except Exception:  # a file that does not load names no ledger: `tbot halt` it
+            ledger = named_ledger(raw)
+            if ledger is None or ledger.resolve() == own.resolve() or not ledger.is_file():
+                continue
+            running = is_running(ledger)
+            if not running:
+                with Ledger(ledger) as book:
+                    if book.get_meta(SUPERVISED_META) != "1":
+                        continue  # started by hand: it does not come back on its own
+        except Exception:  # a file or ledger that cannot be read: `tbot halt` it
             continue
-        if ledger.resolve() != own.resolve() and ledger.is_file() and is_running(ledger):
-            found.setdefault(ledger.resolve(), path.stem)
-    return [(name, ledger) for ledger, name in found.items()]
+        found.setdefault(ledger.resolve(), (path.stem, running))
+    return [(name, ledger, running) for ledger, (name, running) in found.items()]
 
 
 def halt_book(config: SessionConfig) -> tuple[bool, str, dict[str, float]]:
@@ -954,8 +1055,7 @@ def halt_book(config: SessionConfig) -> tuple[bool, str, dict[str, float]]:
             with ledger.atomic():
                 ledger.set_meta(GUARD_META, guard.state.model_dump_json())
                 ledger.add_event(utc_now(), "warning", f"kill switch: {HALT_BY_HAND}, not running")
-        positions = restore_portfolio(config, ledger).positions
-        return already, guard.state.halt_reason, positions
+        return already, guard.state.halt_reason, held_positions(config, ledger)
     finally:
         ledger.close()
 
@@ -1155,7 +1255,7 @@ async def _trade(
             if precheck is not None:
                 await precheck(ledger, aclient, clock)
             guard = load_guard(config, ledger)
-            moved = check_budget(config, ledger, guard, now)  # before the book: it may adjust it
+            moved = check_budget(config, ledger, guard, now, store)  # it may adjust the book
             portfolio = restore_portfolio(config, ledger)
             checkpoint = load_checkpoint(config, ledger)
             session = build_session(config, store, portfolio, now, checkpoint)
@@ -1178,7 +1278,9 @@ async def _trade(
         except Exception as exc:  # tell the operator; a supervisor would restart silently
             log.error("start_failed", error=repr(exc))
             ledger.add_event(utc_now(), "error", f"failed to start: {exc!r}")
-            hint = f"; {key_hint(exc)}" if key_hint(exc) else ""
+            names = settings.key_names(config.mode) if isinstance(config, LiveConfig) else ""
+            hint = key_hint(exc, names) if names else ""
+            hint = f"; {hint}" if hint else ""
             if permanent(exc):  # the same at every try: say so, and let the supervisor stop
                 await notifier.send(
                     f"[{label}] cannot start: {exc}{hint}; fix the config, then start"
@@ -1270,6 +1372,7 @@ async def _trade(
             asyncio.create_task(
                 watch_halt_request(halt_path(config.ledger), trader.halt_now), name="halt-request"
             ),
+            asyncio.create_task(halt_retry_loop(trader), name="halt-retry"),
         ]
         if config.backup_days:
             backups = backup_loop(
@@ -1286,11 +1389,11 @@ async def _trade(
                 store,
                 trader.halt_now,
                 name,
-                lambda: running_sessions(config.ledger),
+                lambda: halt_targets(config.ledger),
             )
             real_money = isinstance(config, LiveConfig) and config.mode == "live"
             turn = PollTurn(settings.telegram_token or "", RANK_REAL_MONEY if real_money else 0)
-            commands = command_loop(direct, answer, utc_now(), turn)
+            commands = command_loop(direct, answer, utc_now(), turn, label)
             tasks.append(asyncio.create_task(commands, name="commands"))
         elif config.telegram_commands and (settings.telegram_token or settings.telegram_chat_id):
             log.warning("telegram_commands_off", hint="set both TBOT_TELEGRAM_TOKEN and _CHAT_ID")
@@ -1330,9 +1433,9 @@ async def _trade(
             lock.release()
         ledger.add_event(utc_now(), "info", "stopped")
         equity = session.portfolio.equity(session.marks)
-        holding = held_text(session.portfolio, session.marks)
+        holding = held_text(session.portfolio, session.marks, config.rebalance.min_notional)
         guarded = isinstance(executor, LiveExecutor) and executor.protective_stop_pct > 0
-        if guarded and session.portfolio.positions:
+        if guarded and trader.sellable():
             holding += " (their exchange stops stay; after `tbot halt` a start sells them)"
         await notifier.send(f"[{label}] stopped, equity {equity:,.2f}, {holding}")
     return code
@@ -1543,7 +1646,9 @@ async def run_live(
 
         spot = make_spot(config, settings, ctx.aclient, ctx.clock.now, resync)
         symbols = symbols_of(config)
-        await spot.load_rules(symbols)
+        quotes = sorted({rules.quote for rules in (await spot.load_rules(symbols)).values()})
+        if len(quotes) > 1:  # the book keeps one cash
+            raise StartRefused(f"the symbols are quoted in {', '.join(quotes)}: {ONE_QUOTE}")
         if config.mode == "live":
             for note in await check_key_rights(spot):
                 await ctx.notifier.send(f"[{label}] {note}")
@@ -1682,7 +1787,10 @@ async def check_funds(
     needed = restore_portfolio(config, ledger).cash + (raised if stored is not None else 0.0)
     spot = make_spot(config, settings, client, clock.now)
     rules = await spot.load_rules(symbols_of(config))
-    quote = next(iter(rules.values())).quote
+    quotes = sorted({r.quote for r in rules.values()})
+    if len(quotes) > 1:
+        raise StartRefused(f"the symbols are quoted in {', '.join(quotes)}: {ONE_QUOTE}")
+    quote = quotes[0]
     balances = await spot.balances()
     free = balances[quote].free if quote in balances else 0.0
     taken, books = other_books_cash(config)
@@ -1724,7 +1832,12 @@ def resume(config: SessionConfig) -> str:
     try:
         guard = load_guard(config, ledger)
         if not guard.state.halted:
-            return "not halted"
+            request = halt_path(config.ledger)
+            if not request.exists():
+                return "not halted"
+            request.unlink(missing_ok=True)  # it would sell at the next start
+            ledger.add_event(utc_now(), "info", "a `tbot halt` request no session took withdrawn")
+            return "not halted; withdrew a `tbot halt` request no session had taken"
         reason = guard.state.halt_reason
         guard.resume()
         ledger.set_meta(GUARD_META, guard.state.model_dump_json())
@@ -1832,6 +1945,11 @@ def status_text(config: SessionConfig, store: BarStore) -> str:
             lines.append(f"orders in doubt {len(unresolved)} (settled when the bot runs)")
         if guard.state.halted:
             lines.append(f"HALTED: {guard.state.halt_reason} (run `tbot resume`)")
+        if halt_path(config.ledger).exists():
+            lines.append(
+                "a `tbot halt` request waits: the session sells and halts when it takes it "
+                "(`tbot resume` withdraws it)"
+            )
         for symbol, qty in sorted(portfolio.positions.items()):
             lines.append(f"position {symbol} {qty:.6f}")
         for symbol, timeframe in stream_keys(config):

@@ -3,18 +3,18 @@
 function Resolve-Config([string] $repo, [string] $config) {
     # A config file, or a name from config\ such as paper; returns the full path.
     $path = if ([IO.Path]::IsPathRooted($config)) { $config } else { Join-Path $repo $config }
-    if (-not (Test-Path $path -PathType Leaf) -and -not [IO.Path]::GetExtension($config) -and
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -and -not [IO.Path]::GetExtension($config) -and
         $config -notmatch '[\\/]') {
         $path = Join-Path $repo "config\$config.yaml"
-        if (-not (Test-Path $path -PathType Leaf)) { $path = Join-Path $repo "config\$config.yml" }
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { $path = Join-Path $repo "config\$config.yml" }
     }
-    if (-not (Test-Path $path -PathType Leaf)) {
-        $names = @(Get-ChildItem (Join-Path $repo "config") -File |
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        $names = @(Get-ChildItem -LiteralPath (Join-Path $repo "config") -File |
             Where-Object { $_.Extension -in ".yaml", ".yml" } |
             ForEach-Object { $_.BaseName } | Sort-Object) -join ", "
         throw "no config '$config' (names in config\: $names)"
     }
-    return (Resolve-Path $path).Path
+    return (Resolve-Path -LiteralPath $path).Path
 }
 
 function Get-TaskRunner($task) {

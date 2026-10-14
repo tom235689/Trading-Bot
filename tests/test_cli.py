@@ -97,6 +97,18 @@ def test_check_ok(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert "BTCUSDT 4h: OK, 6 bars" in capsys.readouterr().out
 
 
+def test_check_finds_a_1m_bar_still_open(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    BarStore(tmp_path).write(
+        "BTCUSDT", Timeframe.M1, make_bars(now - timedelta(minutes=9), 10, Timeframe.M1)
+    )
+    argv = ["check", "--symbols", "BTCUSDT", "--timeframes", "1m", "--data-dir", str(tmp_path)]
+    assert main(argv) == 1
+    assert "error: 1 incomplete" in capsys.readouterr().out
+
+
 def test_check_without_data_fails(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     argv = ["check", "--symbols", "ETHUSDT", "--timeframes", "1h", "--data-dir", str(tmp_path)]
     assert main(argv) == 1
@@ -953,6 +965,8 @@ def test_a_config_of_another_kind_names_the_command_for_it(
     (tmp_path / "config" / "real.yaml").write_text(real, "utf-8")
     assert main(["backtest", "real"]) == EXIT_CONFIG
     assert "is a live config: run it with `tbot live real --live`" in capsys.readouterr().err
+    assert main(["paper", "real"]) == EXIT_CONFIG
+    assert "this is a live config; use `tbot live real --live`" in capsys.readouterr().err
 
 
 def test_a_broken_config_is_named_by_what_the_command_needs(

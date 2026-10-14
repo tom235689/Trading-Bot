@@ -14,6 +14,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from tbot.core.config import TradingConfig, load_yaml
 from tbot.risk.guard import GuardConfig
 
+ONE_QUOTE = "a book keeps one cash, so every symbol of a session needs the same quote asset"
+
 
 class SessionConfig(TradingConfig):
     ledger: Path
@@ -58,6 +60,18 @@ class LiveConfig(SessionConfig):
         return self
 
 
+def named_ledger(raw: dict[str, Any]) -> Path | None:
+    """The ledger a session config names, defaults included, without checking the rest:
+    a session still runs on it after an edit breaks the file. None if it names none."""
+    named = raw.get("ledger")
+    if isinstance(named, str):
+        return Path(named)
+    mode = raw.get("mode")
+    if named is not None or mode not in (None, "testnet", "live"):
+        return None
+    return Path(f"data/{mode or 'paper'}.sqlite")
+
+
 def load_paper_config(path: Path) -> PaperConfig:
     return PaperConfig.model_validate(load_yaml(path.read_text(encoding="utf-8")))
 
@@ -88,6 +102,12 @@ class Settings(BaseSettings):
         if self.binance_api_key and self.binance_api_secret:
             return self.binance_api_key, self.binance_api_secret
         return None
+
+    def key_names(self, mode: str) -> str:
+        """The .env lines of the pair api_keys picks, for messages about a refused key."""
+        if mode == "testnet" and self.binance_testnet_api_key and self.binance_testnet_api_secret:
+            return "TBOT_BINANCE_TESTNET_API_KEY and TBOT_BINANCE_TESTNET_API_SECRET"
+        return "TBOT_BINANCE_API_KEY and TBOT_BINANCE_API_SECRET"
 
     @field_validator("*", mode="before")
     @classmethod

@@ -240,7 +240,7 @@ def test_utf16_files_are_scanned_as_text(repo: Path) -> None:
     found = [(f.where, f.kind) for f in gg.check_staged(repo)]
     assert ("staged out.txt:2", "Hangul at column 1") in found
     assert ("staged out.txt:2", "possible secret (telegram bot token)") in found
-    assert ("staged plain.bin", "possible secret (telegram bot token)") in found
+    assert ("staged plain.bin:1", "possible secret (telegram bot token)") in found
     run(repo, "commit", "-q", "-m", "Add files")
     assert ("out.txt:2", "Hangul at column 1") in [(f.where, f.kind) for f in gg.audit(repo)]
 
@@ -251,6 +251,15 @@ def test_an_icon_is_not_read_as_utf16_text() -> None:
     assert list(gg.scan_blob("app.ico", icon)) == []
     text = "x = 1\n".encode("utf-16-le")  # UTF-16 without a byte order mark is still read
     assert gg.blob_text(text) == "x = 1\n"
+
+
+def test_hangul_hidden_in_files_git_calls_binary_is_found() -> None:
+    with_nul = f"name = {SYLLABLE}\n".encode() + b"\x00"  # one NUL makes it binary to git
+    assert kinds(gg.scan_blob("notes.txt", with_nul)) == ["Hangul at column 8"]
+    utf16 = (SYLLABLE * 10 + "\n").encode("utf-16-le")  # mostly Hangul, no byte order mark
+    assert "Hangul at column 1" in kinds(gg.scan_blob("out.txt", utf16))
+    database = b"SQLite format 3\x00\xff\xfe\x80" + (SYLLABLE * 3).encode() + b"\x0d\xff\x90"
+    assert kinds(gg.scan_blob("bot.sqlite", database)) == ["Hangul in a binary file"]
 
 
 def test_a_zip_is_opened_and_utf32_is_read() -> None:

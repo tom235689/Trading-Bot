@@ -17,6 +17,10 @@ REPLACE_ATTEMPTS = 6  # Windows refuses to replace a file another process is rea
 LOCK_SECONDS = 60.0  # another process merging into the same stream gets this long
 
 
+class StoreBusy(OSError):
+    """Another process kept a stream locked for longer than the writer could wait."""
+
+
 class BarStore:
     def __init__(self, root: Path, exchange: str = "binance", market: str = "spot") -> None:
         self.base = root
@@ -69,7 +73,13 @@ class BarStore:
         return value if isinstance(value, datetime) else None
 
     def write(
-        self, symbol: str, timeframe: Timeframe, bars: pl.DataFrame, *, newest_first: bool = False
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        bars: pl.DataFrame,
+        *,
+        newest_first: bool = False,
+        wait: float = LOCK_SECONDS,
     ) -> None:
         """Merge bars into storage. On duplicate open_time the new row wins.
 
@@ -83,7 +93,7 @@ class BarStore:
         directory = self.directory(symbol, timeframe)
         directory.mkdir(parents=True, exist_ok=True)
         years = bars["open_time"].dt.year().unique().sort(descending=newest_first)
-        with locked(directory / ".lock"):  # a merge by another process would be lost
+        with locked(directory / ".lock", wait):  # a merge by another process would be lost
             for stale in directory.glob("*.tmp"):  # left by a writer that died; none runs now
                 stale.unlink(missing_ok=True)
             for year in years:
@@ -101,17 +111,17 @@ class BarStore:
 
 
 @contextmanager
-def locked(path: Path) -> Iterator[None]:
+def locked(path: Path, wait: float = LOCK_SECONDS) -> Iterator[None]:
     """An exclusive lock between processes, released by the system if one dies."""
     with path.open("a+") as handle:
-        deadline = time.monotonic() + LOCK_SECONDS
+        deadline = time.monotonic() + wait
         while True:
             try:
                 lock_file(handle, lock=True)
                 break
             except OSError:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"{path} stays locked by another process") from None
+                    raise StoreBusy(f"{path} stays locked by another process") from None
                 time.sleep(0.05)
         try:
             yield

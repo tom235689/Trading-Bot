@@ -20,16 +20,19 @@ DEFAULT_RULES: dict[str, dict[str, str]] = {
 
 
 def symbol_info(symbol: str, rules: dict[str, str], status: str = "TRADING") -> dict[str, Any]:
+    filters: list[dict[str, str]] = [
+        {"filterType": "PRICE_FILTER", "tickSize": rules["tick"]},
+        {"filterType": "LOT_SIZE", "stepSize": rules["step"], "minQty": rules["minQty"]},
+        {"filterType": "NOTIONAL", "minNotional": rules["minNotional"]},
+    ]
+    if "marketMaxQty" in rules:
+        filters.append({"filterType": "MARKET_LOT_SIZE", "maxQty": rules["marketMaxQty"]})
     return {
         "symbol": symbol,
         "status": status,
         "baseAsset": symbol[:-4],
         "quoteAsset": symbol[-4:],
-        "filters": [
-            {"filterType": "PRICE_FILTER", "tickSize": rules["tick"]},
-            {"filterType": "LOT_SIZE", "stepSize": rules["step"], "minQty": rules["minQty"]},
-            {"filterType": "NOTIONAL", "minNotional": rules["minNotional"]},
-        ],
+        "filters": filters,
     }
 
 
@@ -246,6 +249,10 @@ class FakeSpot:
         limit = float(params.get("price", 0))
         if limit and side == "SELL" and limit < self.prices[symbol] * ASK_MULTIPLIER_DOWN:
             return _error(400, -1013, "Filter failure: PERCENT_PRICE_BY_SIDE")
+        if kind in STOPS and side == "SELL" and float(params["stopPrice"]) >= price:
+            return _error(400, -2010, "Stop price would trigger immediately.")
+        if kind == "MARKET" and qty > float(rules.get("marketMaxQty", "inf")):
+            return _error(400, -1013, "Filter failure: MARKET_LOT_SIZE")
         order: dict[str, Any] = {
             "symbol": symbol,
             "orderId": self.next_id,

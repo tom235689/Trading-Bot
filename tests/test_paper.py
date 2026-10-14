@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from factories import Scripted, price_bars
 from tbot.cli import EXIT_CONFIG, EXIT_ERROR, load_session_config, main
 from tbot.core.config import StrategyConfig
+from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.execution.rebalance import RebalanceRules
@@ -18,11 +19,12 @@ from tbot.live.commands import HELP
 from tbot.live.config import LiveConfig, PaperConfig, Settings, load_paper_config
 from tbot.live.executor import PaperExecutor
 from tbot.live.history import BarHistory
-from tbot.live.ledger import Adjustment, Ledger
+from tbot.live.ledger import Adjustment, EquityPoint, Ledger
 from tbot.live.runner import (
     GUARD_META,
     AlreadyRunning,
     SessionTrader,
+    StartRefused,
     adopt_resume,
     build_session,
     check_budget,
@@ -231,7 +233,7 @@ def test_build_session_needs_stored_history(tmp_path: Path) -> None:
     closes = [100.0 + i for i in range(30)]
     store.write("BTCUSDT", H4, price_bars(T0, H4, [closes[0], *closes[:-1]], closes))
     session = build_session(config, store, Portfolio(1000.0), now)
-    assert len(session.histories[("BTCUSDT", H4)]) == 12
+    assert len(session.histories[("BTCUSDT", H4)]) == 11  # the first event brings the 12th
     assert session.marks == {"BTCUSDT": 129.0}
     assert session.slots[0].targets == {"BTCUSDT": 1.0}  # rising series: long after warmup
 
@@ -551,6 +553,64 @@ def test_the_checkpoint_waits_for_the_event_to_finish(tmp_path: Path) -> None:
         asyncio.run(trader.handle({BTC: BARS.slice(1, 1)}))
     after = load_checkpoint(trader.session.config, ledger)  # type: ignore[arg-type]
     assert after == before  # a restart hands the 02:00 bar over again
+    ledger.close()
+
+
+def test_a_budget_change_values_the_book_at_its_latest_close(tmp_path: Path) -> None:
+    config = paper_config(tmp_path)  # initial_cash 1000
+    store = BarStore(tmp_path / "data")
+    with Ledger(config.ledger) as ledger:
+        guard = load_guard(config, ledger)
+        check_budget(config, ledger, guard, at(0), store)
+        ledger.add_fill(Fill(at(1), "BTC", 10.0, 100.0, 0.0), 100.0)  # all in at 100
+        ledger.add_equity(EquityPoint(at(1), 1000.0, 0.0, 1.0))
+        guard.check(at(1), 1000.0, at(1))
+        store.write("BTC", H1, price_bars(at(30), H1, [60.0], [60.0]))  # down 40% while stopped
+        cut = config.model_copy(update={"initial_cash": 300.0})
+        with pytest.raises(
+            StartRefused, match=r"book worth 600\.00; the lowest it can be now is 400"
+        ):
+            check_budget(cut, ledger, guard, at(32), store)  # 700 of 600 would leave a debt
+        smaller = config.model_copy(update={"initial_cash": 500.0})
+        check_budget(smaller, ledger, guard, at(32), store)
+        assert guard.state.peak_equity == pytest.approx(1000.0 * 100.0 / 600.0)  # still 40% off
+
+
+def test_dust_of_a_pair_no_longer_traded_does_not_block_a_start(tmp_path: Path) -> None:
+    config = PaperConfig(
+        strategies=[
+            StrategyConfig(
+                name="donchian_trend",
+                symbols=["BTCUSDT"],
+                timeframe=H4,
+                allocation=1.0,
+                params={"entry": 5, "exit": 3},
+            )
+        ]
+    )
+    store = BarStore(tmp_path / "data")
+    now = T0 + timedelta(hours=4 * 30, minutes=10)
+    closes = [100.0 + i for i in range(30)]
+    store.write("BTCUSDT", H4, price_bars(T0, H4, [closes[0], *closes[:-1]], closes))
+    store.write("ETHUSDT", H4, price_bars(T0, H4, [2000.0] * 30, [2000.0] * 30))
+    portfolio = Portfolio(1000.0)
+    portfolio.positions["ETHUSDT"] = 0.000004  # 0.008 left by a sale: no order can sell it
+    assert build_session(config, store, portfolio, now).marks["ETHUSDT"] == 2000.0
+    sold = Portfolio(1000.0)  # dropped long ago: no bars stored, its last fill prices it
+    sold.apply(Fill(T0, "XRPUSDT", 10.0, 0.5, 0.0))
+    sold.apply(Fill(T0, "XRPUSDT", -9.99, 0.5, 0.0))
+    assert build_session(config, store, sold, now).marks["XRPUSDT"] == 0.5
+    portfolio.positions["ETHUSDT"] = 0.5  # 1,000: the config must trade it
+    with pytest.raises(StartRefused, match=r"holds 0\.50000000 ETHUSDT, which this config"):
+        build_session(config, store, portfolio, now)
+
+
+def test_a_change_against_an_older_snapshot_says_since_when(tmp_path: Path) -> None:
+    trader, ledger, _ = make_trader(tmp_path, {at(1): {"BTC": 0.0}}, FakePrices({"BTC": 100.0}))
+    asyncio.run(trader.handle({BTC: BARS.slice(0, 1)}))
+    summary = summary_text(trader.session, ledger, at(1) + timedelta(days=8), "paper")
+    assert "(+0.00% since 2024-01-01 01:00" in summary  # the bot was down for a week
+    assert "over 24h" not in summary
     ledger.close()
 
 

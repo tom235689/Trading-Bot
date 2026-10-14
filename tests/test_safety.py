@@ -1,6 +1,7 @@
 """Checks around real money: the budget, the alert channel, the key, whose turn Telegram is."""
 
 import asyncio
+import io
 import os
 import time
 from datetime import UTC, datetime
@@ -9,15 +10,17 @@ from pathlib import Path
 import httpx
 import pytest
 
-from binance_spot_fake import FakeSpot
+from binance_spot_fake import DEFAULT_RULES, FakeSpot
 from tbot.cli import (
     EXIT_ERROR,
+    _alert,
     after_stop,
     amount_matches,
     announce,
     confirm_budget,
     main,
     quote_of,
+    save_env,
 )
 from tbot.core.config import StrategyConfig
 from tbot.core.models import Fill
@@ -473,3 +476,113 @@ def test_keys_need_a_terminal(
     monkeypatch.setattr("tbot.cli.interactive", lambda: False)
     assert main(["keys", "testnet"]) == EXIT_ERROR
     assert "run `tbot keys` in a terminal" in capsys.readouterr().out
+
+
+def test_an_old_key_the_testnet_cannot_check_stays_for_testnet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "live.yaml").write_text(
+        f"mode: live\ninitial_cash: 1000\nledger: live.sqlite\nstrategies:\n{STRATEGY_YAML}",
+        "utf-8",
+    )
+    old_key = "a" * 64
+    (tmp_path / ".env").write_bytes(
+        f"TBOT_BINANCE_API_KEY={old_key}\nTBOT_BINANCE_API_SECRET={'b' * 64}\n".encode()
+    )
+    monkeypatch.setattr("tbot.cli.interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "c" * 64)
+    monkeypatch.setattr("tbot.cli.getpass.getpass", lambda prompt="": "d" * 64)
+    monkeypatch.setattr("tbot.cli.env_readers", lambda path: ["Users"])
+
+    async def key_checks(config: LiveConfig, trial: Settings, client: object) -> list[Check]:
+        return [Check("ok", "api key", "valid")]
+
+    async def unknown(key: str, secret: str, client: object) -> bool | None:
+        return None  # the testnet could not be reached
+
+    monkeypatch.setattr("tbot.cli.key_checks", key_checks)
+    monkeypatch.setattr("tbot.cli.works_on_testnet", unknown)
+    assert main(["keys", "live"]) == 0
+    out = capsys.readouterr().out
+    assert "could not be tried on the testnet; it stays as TBOT_BINANCE_TESTNET_API_KEY" in out
+    assert "warning: .env can be read by Users: limit it to your account" in out
+    assert "readable by your account only" not in out
+    saved = Settings(_env_file=tmp_path / ".env")  # type: ignore[call-arg]
+    assert saved.api_keys("testnet") == (old_key, "b" * 64)
+
+
+def test_a_setting_the_environment_also_sets_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("TBOT_TELEGRAM_CHAT_ID", "5")
+    save_env(tmp_path / ".env", {"TBOT_TELEGRAM_CHAT_ID": "7", "TBOT_TELEGRAM_TOKEN": "t"})
+    out = capsys.readouterr().out
+    assert "the environment also sets TBOT_TELEGRAM_CHAT_ID, which wins over" in out
+    assert "TBOT_TELEGRAM_TOKEN" not in out
+
+
+def test_symbols_of_two_quote_assets_refuse_a_start(tmp_path: Path) -> None:
+    mixed = StrategyConfig(
+        name="donchian_trend",
+        symbols=["BTCUSDT", "ETHBUSD"],
+        timeframe=Timeframe.H4,
+        allocation=1.0,
+    )
+    config = live(tmp_path, "testnet", strategies=[mixed])
+    rules = {**DEFAULT_RULES, "ETHBUSD": DEFAULT_RULES["ETHUSDT"]}
+    spot = FakeSpot(balances={"USDT": 5000.0}, prices={}, rules=rules)
+    with Ledger(config.ledger) as ledger, pytest.raises(StartRefused, match="quoted in BUSD, USDT"):
+        funds(config, spot, ledger)
+
+
+def test_a_question_no_one_can_answer_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def closed(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("tbot.cli.interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", closed)
+    assert main(["keys", "testnet"]) == EXIT_ERROR
+    assert "no answer (the input ended): nothing changed" in capsys.readouterr().err
+
+
+def test_a_name_the_console_cannot_show_ends_no_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    name = "b" + chr(0x416) + "t"  # a letter outside the code page of the console
+    (tmp_path / "config" / f"{name}.yaml").write_text(
+        f"ledger: x.sqlite\nstrategies:\n{STRATEGY_YAML}", "utf-8"
+    )
+    piped = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")  # strict, as on Windows
+    monkeypatch.setattr("sys.stdout", piped)
+    assert main(["status"]) == 0
+    piped.flush()
+    assert b"b?t" in piped.buffer.getvalue()
+
+
+def test_a_supervised_start_that_gives_up_keeps_trying_its_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[str] = []
+    answers: list[float | None] = [0.0, 0.0, None]  # no network twice, then sent
+
+    async def deliver(self: Telegram, text: str) -> float | None:
+        sent.append(text)
+        return answers.pop(0)
+
+    monkeypatch.setattr("tbot.cli.Telegram.deliver", deliver)
+    monkeypatch.setattr("tbot.cli.ALERT_RETRY_WAITS", (0.0, 0.0, 0.0, 0.0))
+    monkeypatch.setattr("tbot.cli.Settings", lambda: keys(telegram_token="t", telegram_chat_id="1"))
+    monkeypatch.setattr("tbot.cli.supervised", lambda: True)
+    _alert("tbot cannot start: a config error")
+    assert len(sent) == 3  # its supervisor gives up: no later chance to say why
+    monkeypatch.setattr("tbot.cli.supervised", lambda: False)
+    answers[:] = [0.0, None]
+    sent.clear()
+    _alert("tbot cannot start: a config error")
+    assert len(sent) == 1  # by hand, the terminal shows it
