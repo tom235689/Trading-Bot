@@ -98,11 +98,19 @@ def test_check_ok(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_check_finds_a_1m_bar_still_open(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    minute = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> "Clock":  # 30 s into the bar opening at 12:00
+            moment = minute + timedelta(seconds=30)
+            return cls.fromtimestamp(moment.timestamp(), tz)
+
+    monkeypatch.setattr("tbot.cli.datetime", Clock)
     BarStore(tmp_path).write(
-        "BTCUSDT", Timeframe.M1, make_bars(now - timedelta(minutes=9), 10, Timeframe.M1)
+        "BTCUSDT", Timeframe.M1, make_bars(minute - timedelta(minutes=9), 10, Timeframe.M1)
     )
     argv = ["check", "--symbols", "BTCUSDT", "--timeframes", "1m", "--data-dir", str(tmp_path)]
     assert main(argv) == 1

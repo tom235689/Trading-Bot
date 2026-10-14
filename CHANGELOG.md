@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.2 (2026-10-14)
+
+The release of 0.9.1, whose Linux check failed on a test, not on the bot: the test that `tbot check` finds a 1m bar still open read the real clock and failed in the last ten seconds of a minute; it now sets the time. Nothing else changed.
+
 ## 0.9.1 (2026-10-14)
 
 Fixes from a review of the whole code base in seven parts: the session core, orders and the exchange, the command line, market data, research, operations, and the documents against the code. Upgrade notes:
