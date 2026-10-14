@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,8 +23,9 @@ class SessionConfig(TradingConfig):
     batch_wait_seconds: float = Field(default=5.0, ge=0)  # wait for streams closing together
     summary_hour_utc: int = Field(default=0, ge=0, le=23)
     backup_days: int = Field(default=14, ge=0)  # daily ledger copies kept; 0 turns them off
-    # Answer /status and /fills from the Telegram chat. One session per bot token may poll.
-    telegram_commands: bool = False
+    # Answer /status, /fills, and /halt from the Telegram chat. The sessions of a clone
+    # take turns reading the bot's messages; a real-money one goes first.
+    telegram_commands: bool = True
 
 
 class PaperConfig(SessionConfig):
@@ -48,6 +49,13 @@ class LiveConfig(SessionConfig):
         if isinstance(data, dict) and "ledger" not in data and data.get("mode") == "testnet":
             return {**data, "ledger": Path("data/testnet.sqlite")}
         return data
+
+    @model_validator(mode="after")
+    def budget_for_real_money(self) -> Self:
+        """Real money never trades a default amount."""
+        if self.mode == "live" and "initial_cash" not in self.model_fields_set:
+            raise ValueError("set initial_cash: the real-money budget, the most the bot can lose")
+        return self
 
 
 def load_paper_config(path: Path) -> PaperConfig:

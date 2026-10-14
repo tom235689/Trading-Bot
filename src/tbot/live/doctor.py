@@ -1,7 +1,9 @@
 """Preflight checks: what would stop a session, endanger the account, or hide a failure."""
 
 import asyncio
+import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -31,11 +33,13 @@ from tbot.live.runner import (
     KEYS_MISSING,
     AlreadyRunning,
     StartRefused,
+    halt_path,
     instance_lock,
     key_hint,
     load_guard,
     make_spot,
     mode_problem,
+    needless_rights,
     restore_portfolio,
     stop_path,
     symbols_of,
@@ -76,6 +80,16 @@ async def run_checks(
     checks = strategy_checks(config) + ledger_checks(config) + alert_checks(settings, real_money)
     if isinstance(config, LiveConfig) and settings.api_keys(config.mode) is None:
         checks.append(Check("fail", "api key", KEYS_MISSING))
+    synced = synced_folder(Path.cwd())
+    if synced:
+        checks.append(
+            Check(
+                "warn",
+                "folder",
+                f"the repository is in a folder {synced} syncs: it uploads .env with the keys, "
+                "and syncing a running ledger can damage it; move the repository out",
+            )
+        )
     env = Path(".env")
     readers = env_readers(env) if env.is_file() else []
     if readers:
@@ -103,18 +117,9 @@ async def run_checks(
     live = config if isinstance(config, LiveConfig) else None
     public = BinanceSpot(client, "", "", base_url=PRODUCTION_URL)
     try:
-        before = time.time()
-        server = await public.server_time()
-        offset = server.timestamp() - (before + time.time()) / 2
+        offset = await server_offset(public)
     except (httpx.HTTPError, BinanceError) as exc:
-        checks.append(
-            Check(
-                "fail",
-                "binance",
-                f"unreachable: {exc!r}; check the network (HTTP 403 or 451: Binance may not "
-                "serve this region)",
-            )
-        )
+        checks.append(unreachable(exc))
         return checks
     side = "behind" if offset > 0 else "ahead of"  # offset: Binance minus this clock
     checks.append(
@@ -140,6 +145,68 @@ async def run_checks(
     if note:
         checks.append(Check("warn", "version", note))
     return checks
+
+
+SYNCED = ("OneDrive", "Dropbox", "Google Drive", "iCloudDrive", "iCloud Drive")
+
+
+def synced_folder(folder: Path) -> str:
+    """The cloud service that syncs this folder, or ""."""
+    roots = [
+        os.environ.get(name, "") for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
+    ]
+    resolved = str(folder.resolve()).lower()
+    if any(root and resolved.startswith(str(Path(root).resolve()).lower()) for root in roots):
+        return "OneDrive"
+    parts = [part.lower() for part in folder.resolve().parts]
+    for name in SYNCED:
+        lower = name.lower()  # also "OneDrive - Company", "Dropbox (Personal)"
+        if any(part == lower or part.startswith((f"{lower} - ", f"{lower} (")) for part in parts):
+            return name
+    return ""
+
+
+async def server_offset(public: BinanceSpot) -> float:
+    """Binance's clock minus this computer's, in seconds. Raises httpx and Binance errors."""
+    before = time.time()
+    server = await public.server_time()
+    return server.timestamp() - (before + time.time()) / 2
+
+
+def unreachable(exc: Exception) -> Check:
+    return Check(
+        "fail",
+        "binance",
+        f"unreachable: {exc!r}; check the network (HTTP 403 or 451: Binance may not serve "
+        "this region)",
+    )
+
+
+async def key_checks(
+    config: LiveConfig, settings: Settings, client: httpx.AsyncClient
+) -> list[Check]:
+    """What `tbot keys` asks Binance before it saves a key: that it signs, trades, and for
+    real money cannot withdraw."""
+    try:
+        offset = await server_offset(BinanceSpot(client, "", "", base_url=PRODUCTION_URL))
+    except (httpx.HTTPError, BinanceError) as exc:
+        return [unreachable(exc)]
+    return await account_checks(config, settings, client, offset)
+
+
+async def works_on_testnet(key: str, secret: str, client: httpx.AsyncClient) -> bool:
+    """Whether Binance's testnet takes this key pair."""
+    public = BinanceSpot(client, "", "", base_url=TESTNET_URL)
+    try:
+        offset = await server_offset(public)
+
+        def clock() -> datetime:
+            return datetime.now(UTC) + timedelta(seconds=offset)
+
+        await BinanceSpot(client, key, secret, base_url=TESTNET_URL, clock=clock).account()
+    except (httpx.HTTPError, BinanceError):
+        return False
+    return True
 
 
 async def telegram_check(token: str, chat: str, client: httpx.AsyncClient) -> Check:
@@ -306,6 +373,15 @@ def ledger_checks(config: SessionConfig) -> list[Check]:
                     "stops at once (`tbot stop --cancel` withdraws it)",
                 )
             )
+        if halt_path(config.ledger).exists():
+            checks.append(
+                Check(
+                    "warn",
+                    "halt",
+                    "a `tbot halt` request waits: the next start sells what the bot holds and "
+                    "halts (`tbot resume` withdraws it)",
+                )
+            )
     return [*checks, backup]
 
 
@@ -409,7 +485,8 @@ async def account_checks(
         checks.extend(await permission_checks(spot))
     if spot.rules:
         quote = next(iter(spot.rules.values())).quote
-        checks.append(budget_check(config, account, quote))
+        bases = sorted({rules.base for rules in spot.rules.values()})
+        checks.append(budget_check(config, account, quote, bases))
     if config.protective_stop_pct == 0:
         checks.append(Check("warn", "stops", "protective stops are off: a dead bot has no exit"))
     if config.mode == "live":
@@ -427,6 +504,11 @@ async def permission_checks(spot: BinanceSpot) -> list[Check]:
         checks.append(Check("fail", "permissions", "the key can withdraw; turn that off"))
     if not rights.get("enableSpotAndMarginTrading", False):
         checks.append(Check("fail", "permissions", "the key cannot trade spot; turn that on"))
+    extra = needless_rights(rights)
+    if extra:
+        checks.append(
+            Check("warn", "permissions", f"the key also allows {extra}: tbot never uses it")
+        )
     if not rights.get("ipRestrict", False):
         checks.append(
             Check(
@@ -436,14 +518,23 @@ async def permission_checks(spot: BinanceSpot) -> list[Check]:
     return checks or [Check("ok", "permissions", "trading on, withdrawals off, IP restricted")]
 
 
-def budget_check(config: LiveConfig, account: dict[str, Any], quote: str) -> Check:
+def budget_check(
+    config: LiveConfig, account: dict[str, Any], quote: str, bases: Sequence[str] = ()
+) -> Check:
     rows = account.get("balances", [])
     free = sum(float(row["free"]) for row in rows if row.get("asset") == quote)
     if config.ownership == "account":
+        held = {
+            str(row.get("asset")): float(row["free"]) + float(row.get("locked", 0))
+            for row in rows
+            if row.get("asset") in (quote, *bases)
+        }
+        named = ", ".join(f"{asset} {amount:,.8g}" for asset, amount in held.items() if amount)
         return Check(
             "warn",
             "budget",
-            f"ownership account: the bot manages every asset ({quote} {free:,.2f} free)",
+            f"ownership account: the bot takes over and trades all of {named or 'nothing yet'}, "
+            "not only initial_cash; use it only on an account kept for the bot",
         )
     needed = config.initial_cash
     if config.ledger.is_file():

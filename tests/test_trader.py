@@ -144,7 +144,37 @@ def test_stale_bar_is_blocked(tmp_path: Path) -> None:
     h = Harness(tmp_path, guard, {at(1): {"BTC": 1.0}})
     assert h.bar(0, 100.0) == []  # bar closed at 1h, clock says 9h
     assert h.ledger.recent_events(1)[0].message.startswith("blocked: bar is")
-    assert any("no trading this bar" in m for m in h.notifier.messages)
+    assert any("no buying this bar" in m for m in h.notifier.messages)
+    h.ledger.close()
+
+
+def test_a_stale_bar_holds_back_buys_but_not_an_exit(tmp_path: Path) -> None:
+    guard = GuardConfig(daily_loss_limit=0, max_drawdown=0, stale_seconds=60)
+    h = Harness(tmp_path, guard, {at(9): {"BTC": 1.0}, at(10): {"BTC": 0.0}})
+    assert len(h.bar(8, 100.0)) == 1  # closes at 9h, the clock says 9h: fresh, it buys
+    h.trader.clock = lambda: at(12)  # the 10h bar arrives two hours late
+    assert h.bar(9, 100.0) == [pytest.approx(-1000 / 100.1)]  # the exit still goes out
+    assert h.ledger.recent_events(1)[0].message.startswith("blocked: bar is")
+    h.ledger.close()
+
+
+def test_resume_while_running_is_announced(tmp_path: Path) -> None:
+    guard = GuardConfig(daily_loss_limit=0, max_drawdown=0.1, stale_seconds=0)
+    h = Harness(tmp_path, guard, {at(1): {"BTC": 1.0}})
+    h.bar(0, 100.0)
+    h.bar(1, 85.0)  # the kill switch
+    h.bar(2, 100.0)
+    assert not any("resumed" in m for m in h.notifier.messages)
+    resume(h.config)
+    h.bar(3, 100.0)
+    assert (
+        sum(
+            m.startswith("[paper] resumed: the kill switch is cleared") for m in h.notifier.messages
+        )
+        == 1
+    )
+    h.bar(4, 100.0)
+    assert sum("resumed" in m for m in h.notifier.messages) == 1
     h.ledger.close()
 
 
@@ -167,7 +197,7 @@ def test_blocked_bars_are_announced_once(tmp_path: Path) -> None:
     h = Harness(tmp_path, guard, {})
     assert h.bar(0, 100.0) == []  # closed at 1h, the clock says 9h: stale
     assert h.bar(1, 100.0) == []
-    assert sum("no trading this bar" in m for m in h.notifier.messages) == 1
+    assert sum("no buying this bar" in m for m in h.notifier.messages) == 1
     assert h.bar(8, 100.0) == []  # closes at 9h: fresh again
     assert h.notifier.messages[-1].endswith("trading again")
     h.ledger.close()

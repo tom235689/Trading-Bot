@@ -15,7 +15,7 @@ There are four kinds of configs:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `initial_cash` | 10000 | Quote currency (USDT) the bot trades with. In live mode with `ownership: budget` it is the most the bot can lose. Changing it later moves money into or out of the book at the next start, like a transfer; a cut larger than the book is worth is refused. With less than about 300 USDT, Binance's 10 USDT order minimum makes small rebalances impossible and results drift from the backtest. |
+| `initial_cash` | 10000; required in live mode | Quote currency (USDT) the bot trades with. In live mode with `ownership: budget` it is the most the bot can lose, and a real-money config must set it. Changing it later moves money into or out of the book at the next start, like a transfer (Telegram says so); a cut larger than the book is worth is refused, and so is a new budget, or a raise, that the account's free USDT does not cover. A first real-money start, or one after a raise, started by hand asks you to type the amount. With less than about 300 USDT, Binance's 10 USDT order minimum makes small rebalances impossible and results drift from the backtest. |
 | `costs.fee_rate` | 0.001 | Fee per fill, as a fraction: 0.1% is Binance spot taker at VIP 0 without the BNB discount. Backtests and paper trading charge it; live trading books what Binance charged. |
 | `costs.slippage_bps` | 5 | Price paid beyond the quoted price in backtests and paper trading, in basis points (5 = 0.05%). Below 10000. |
 | `risk.max_symbol_weight` | 1.0 | Largest share of equity in one symbol (above 0, up to 1). |
@@ -67,14 +67,14 @@ Each strategy:
 |---|---|---|
 | `ledger` | `data/paper.sqlite`, `data/testnet.sqlite`, `data/live.sqlite` | The session's book: fills, events, and state. Give every config its own (a copy without this line shares the default); `tbot status` and `tbot doctor` point out two configs that share one. A ledger keeps the mode it was started in. |
 | `guard.daily_loss_limit` | 0.03 | While equity is this far below the day's open (UTC), no new entries; exits still trade. The bar that closes at midnight counts for the day it ends. 0 turns it off. |
-| `guard.max_drawdown` | 0.45 | The kill switch: this far below the peak, sell everything and halt until `tbot resume`. 0 turns it off; below 1. Set it beyond the strategy's normal drawdowns (see the validation's Monte Carlo). Money moved in or out rescales the peak, so a transfer never moves the drawdown. |
-| `guard.stale_seconds` | 900 | A bar event later than this after its close is not traded. 0 turns the check off. |
+| `guard.max_drawdown` | 0.45 | The kill switch: this far below the peak, sell everything and halt until `tbot resume`. 0 turns it off; below 1. Set it beyond the strategy's normal drawdowns (see the validation's Monte Carlo). Money moved in or out rescales the peak, so a transfer never moves the drawdown. `tbot halt` and Telegram's `/halt` trip it by hand. |
+| `guard.stale_seconds` | 900 | A bar event later than this after its close buys nothing; its sales still go out. 0 turns the check off. |
 | `stale_after_seconds` | 600 | A stream whose next bar is this late is reported stale (an alert; the heartbeat pauses). At least 60. |
 | `batch_wait_seconds` | 5 | How long an event waits for the other streams closing at the same time. |
 | `heartbeat_seconds` | 300 | How often `TBOT_HEARTBEAT_URL` is pinged (at least 30). |
 | `summary_hour_utc` | 0 | Hour of the daily Telegram summary, UTC (0 to 23). |
 | `backup_days` | 14 | Daily ledger copies kept in `data/backups/`; 0 turns them off. |
-| `telegram_commands` | false | Answer `/status` and `/fills` in the Telegram chat. Only one session per bot token can. |
+| `telegram_commands` | true | Answer `/status`, `/fills`, and `/halt` in the Telegram chat. Telegram lets one process read a bot's messages, so the sessions of a clone take turns: a real-money session first, else the one that started first. |
 
 Testnet and live only:
 
@@ -91,8 +91,9 @@ Testnet and live only:
 
 | Variable | Meaning |
 |---|---|
-| `TBOT_BINANCE_API_KEY`, `TBOT_BINANCE_API_SECRET` | A system-generated (HMAC) key with spot trading on and withdrawals off. Testnet keys come from testnet.binance.vision. |
-| `TBOT_TELEGRAM_TOKEN`, `TBOT_TELEGRAM_CHAT_ID` | Alerts; `tbot notify` fills them in. `tbot doctor` fails a live config without them (offline, only warns). |
+| `TBOT_BINANCE_API_KEY`, `TBOT_BINANCE_API_SECRET` | A system-generated (HMAC) key with spot trading on and withdrawals off. `tbot keys live` asks for them, checks them with Binance, and saves them. |
+| `TBOT_BINANCE_TESTNET_API_KEY`, `TBOT_BINANCE_TESTNET_API_SECRET` | Testnet keys (testnet.binance.vision), so testnet keeps running once the pair above is a live key; without them testnet uses the pair above. `tbot keys testnet` saves them here. |
+| `TBOT_TELEGRAM_TOKEN`, `TBOT_TELEGRAM_CHAT_ID` | Alerts; `tbot notify` fills them in (`--chat` picks the chat again). `tbot doctor` fails a live config without them (offline, only warns), and a real-money session does not start while Telegram refuses them. |
 | `TBOT_HEARTBEAT_URL` | A monitor's ping URL (healthchecks.io, Uptime Kuma, ...). Keep it secret: anyone with it can report the bot alive. |
 | `TBOT_DEBUG` | Set to 1 in the terminal (not in `.env`) to see a full traceback instead of a one-line error. |
 

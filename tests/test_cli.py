@@ -47,6 +47,7 @@ from tbot.cli import (
 from tbot.core.config import StrategyConfig, load_yaml
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
+from tbot.live.commands import PollTurn
 from tbot.live.config import Settings, save_settings
 from tbot.live.ledger import EquityPoint, Ledger
 from tbot.live.runner import (
@@ -314,6 +315,9 @@ def test_session_commands_find_the_config_they_mean(
     assert main(["resume"]) == 0
     assert capsys.readouterr().out.splitlines() == [
         f"using {paper}",
+        "halted: drawdown 50%",
+        "after resume the kill switch counts from the equity then: another 45% fall from here "
+        "halts it again; the strategy may buy back in at the next bar",
         "resumed (was halted: drawdown 50%); a running bot trades again from its next bar",
     ]
 
@@ -486,6 +490,32 @@ def test_notify_guides_a_first_setup_and_saves_it(
     assert len(telegram.sent) == 2
 
 
+def test_notify_picks_the_chat_again_and_waits_for_a_session_to_let_go(
+    no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    telegram = FakeTelegram(monkeypatch, [[message(77, "Group", f"/{CODE}@tbot_test_bot")]])
+    monkeypatch.setenv("TBOT_TELEGRAM_TOKEN", "123:abc")
+    monkeypatch.setenv("TBOT_TELEGRAM_CHAT_ID", "42")
+    monkeypatch.setattr("tbot.cli.interactive", lambda: True)
+    assert main(["notify"]) == 0  # set up: only a test message to 42
+    assert telegram.sent[-1][0] == "42"
+
+    session = PollTurn("123:abc", 0)  # a running session reads the bot's messages
+    assert session.take()
+    monkeypatch.setattr("tbot.cli.TURN_WAIT_SECONDS", 0.5)
+    assert main(["notify", "--chat"]) == EXIT_ERROR
+    assert "it did not let go: stop the session" in capsys.readouterr().out
+    threading.Timer(0.3, session.release).start()  # its next poll sees the request
+    monkeypatch.setattr("tbot.cli.TURN_WAIT_SECONDS", 10)
+    assert main(["notify", "--chat"]) == 0
+    out = capsys.readouterr().out
+    assert "asking it to let go" in out
+    assert "saved chat 77 in .env" in out
+    assert telegram.sent[-1][0] == "77"
+    assert session.take()  # notify gave the turn back
+    session.release()
+
+
 def test_notify_without_a_terminal_or_with_a_wrong_token(
     no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -585,7 +615,7 @@ def test_resume_never_picks_a_real_money_session(
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "live.yaml").write_text(
-        f"mode: live\nledger: live.sqlite\nstrategies:\n{STRATEGY}", "utf-8"
+        f"mode: live\ninitial_cash: 1000\nledger: live.sqlite\nstrategies:\n{STRATEGY}", "utf-8"
     )
     with Ledger(tmp_path / "live.sqlite") as ledger:
         state = GuardState(peak_equity=100.0, halted=True, halt_reason="drawdown 50%")
@@ -669,7 +699,7 @@ def test_a_start_without_keys_ends_for_good(
     for name in ("TBOT_BINANCE_API_KEY", "TBOT_BINANCE_API_SECRET"):
         monkeypatch.delenv(name, raising=False)
     assert main(["live", "testnet"]) == EXIT_CONFIG  # the supervisor gives up: no retry helps
-    assert "set TBOT_BINANCE_API_KEY" in capsys.readouterr().err
+    assert "no Binance API keys: `tbot keys testnet`" in capsys.readouterr().err
     assert not (tmp_path / "testnet.sqlite").exists()  # no ledger left for nothing
 
 
@@ -914,12 +944,12 @@ def test_a_config_of_another_kind_names_the_command_for_it(
     write_configs(tmp_path)
     assert main(["live", "paper"]) == EXIT_CONFIG
     err = capsys.readouterr().err.replace("\\", "/")
-    assert "config/paper.yaml is a paper config: run it with `tbot paper paper`" in err
+    assert "config/paper.yaml is a paper config: run it with `tbot paper`" in err
     assert main(["backtest", "testnet"]) == EXIT_CONFIG
     assert "is a testnet config: run it with `tbot live testnet`" in capsys.readouterr().err
     assert main(["status", "trend"]) == EXIT_CONFIG
     assert "is a backtest config: run it with `tbot backtest trend`" in capsys.readouterr().err
-    real = f"mode: live\nledger: live.sqlite\nstrategies:\n{STRATEGY}"
+    real = f"mode: live\ninitial_cash: 1000\nledger: live.sqlite\nstrategies:\n{STRATEGY}"
     (tmp_path / "config" / "real.yaml").write_text(real, "utf-8")
     assert main(["backtest", "real"]) == EXIT_CONFIG
     assert "is a live config: run it with `tbot live real --live`" in capsys.readouterr().err
@@ -1263,7 +1293,7 @@ def test_a_never_started_live_config_does_not_point_at_starting_it(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     write_configs(tmp_path)
-    real = f"mode: live\nledger: live.sqlite\nstrategies:\n{STRATEGY}"
+    real = f"mode: live\ninitial_cash: 1000\nledger: live.sqlite\nstrategies:\n{STRATEGY}"
     (tmp_path / "config" / "real.yaml").write_text(real, "utf-8")
     assert main(["status", "real"]) == EXIT_ERROR
     err = capsys.readouterr().err

@@ -1,7 +1,6 @@
 """Parquet bar storage: one file per symbol, timeframe, and year."""
 
 import os
-import sys
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -10,6 +9,7 @@ from pathlib import Path
 
 import polars as pl
 
+from tbot.core.filelock import lock_file
 from tbot.core.timeframe import Timeframe
 from tbot.data.schema import BAR_SCHEMA, empty_bars
 
@@ -107,7 +107,7 @@ def locked(path: Path) -> Iterator[None]:
         deadline = time.monotonic() + LOCK_SECONDS
         while True:
             try:
-                _lock(handle.fileno(), lock=True)
+                lock_file(handle, lock=True)
                 break
             except OSError:
                 if time.monotonic() >= deadline:
@@ -116,19 +116,7 @@ def locked(path: Path) -> Iterator[None]:
         try:
             yield
         finally:
-            _lock(handle.fileno(), lock=False)
-
-
-def _lock(fd: int, *, lock: bool) -> None:
-    if sys.platform == "win32":
-        import msvcrt
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_NBLCK if lock else msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if lock else fcntl.LOCK_UN)
+            lock_file(handle, lock=False)
 
 
 def _replace(source: Path, target: Path) -> None:

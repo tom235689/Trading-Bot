@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.9.0 (2026-10-14)
+
+Safer and easier trading, from three reviews: what real money could suffer, a new user's way from paper to live, and the changes of this release themselves. Upgrade notes:
+- A real-money config must set `initial_cash`; the default of 10,000 no longer applies in `mode: live`.
+- A real-money session does not start while Telegram refuses its token or chat. In budget mode a new book, or a raised `initial_cash`, starts only when the account's free USDT, less the cash of the other books in `config/` on that account, covers it (exit 4, alerted). A first real-money start, or one after a raise, started by hand at a terminal asks you to type the budget.
+- `telegram_commands` is on by default and in every shipped config: the sessions of a clone take turns reading the bot's messages, a real-money session first, so the option no longer has to be turned off elsewhere.
+- A stale bar or failing reconciliation now holds back buys only: sales still go out.
+- Alerts of a config whose name is not its mode carry both, such as `[live btc_only]`.
+
+**The panic button**
+- `tbot halt <config>` sells what the bot holds at once and halts it until `tbot resume`: a running session books stops that executed, cancels its exchange stops, and sells within seconds; a stopped one is marked, and its next start sells before it trades on. A real-money session must be named; a running session is reached even when its config no longer loads.
+- Telegram `/halt` does the same from the phone for every running session of the clone, after a second message with the four-digit code it answers (two minutes, one try), so a tap on the command never sells.
+- `tbot resume` withdraws a halt request no session took, and doctor names one that waits.
+- `tbot stop` and the stop alert name the positions left, and for a scheduled session that its task starts it again at the next boot; the protective stop alert says the strategy may buy back at the next close.
+
+**Real money**
+- The budget is checked against the account before it is booked, typed by the owner on a first start or a raise (`ownership: account` asks for the word `account`), and named in every real-money start alert and in the start banner, with the way out.
+- `tbot resume` first says where the book stands and what trips the kill switch again, asks you to type `resume` for real money, and a running session announces the resume.
+- Telegram refusing alerts (a revoked token, a blocked bot) is recorded in the ledger and pauses the heartbeat, so the monitor reports the silence.
+- The start and `tbot doctor` warn about key rights tbot never uses (margin, futures, options, transfers), and the start alerts when it cannot read them; doctor names what `ownership: account` takes over, and warns about a repository in a synced folder (OneDrive, Dropbox, Google Drive, iCloud).
+- No message suggests selling by hand on Binance: the book would sell its amount again, from the owner's own coins.
+
+**Convenience**
+- `tbot keys testnet|live` asks for the API keys (the secret hidden), checks them with Binance, and saves them in `.env` only when they work; a testnet key the main pair held moves to the testnet pair.
+- `tbot notify --chat` picks the chat again, and pairs while a session runs: the session lets go of the bot's messages for it. Both say which running sessions need a restart.
+- The daily summary and `/status` show the profit since the start and say which bar's prices value the book.
+- `tbot paper` is suggested without the default name, and reconciliation alerts carry the session's label.
+
+**Documents**
+- README: getting out, a protective stop that follows the last close, why a sale by hand is bought back, a sub-account for the bot, keys through `tbot keys`, and new troubleshooting rows; CONFIG and DESIGN follow.
+
+**Tests**
+- 42 new tests (605 in all); undoing any of 52 changes makes a test fail.
+
 ## 0.8.0 (2026-10-13)
 
 Product readiness, from six reviews of 0.7.0: its own changes, months of unattended running, security, a new user following the README on a fresh clone, a randomized simulation of live trading with injected faults (12,800 bars, 28,877 reconciliations, 915 crashes), and what a shippable product lacks. Upgrade notes:

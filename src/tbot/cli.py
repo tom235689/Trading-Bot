@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import difflib
+import getpass
 import hashlib
 import io
 import logging
@@ -39,22 +40,28 @@ from tbot.data.quality import LONG_GAP, QualityReport, check_bars
 from tbot.data.store import BarStore
 from tbot.live.backup import backup_dir
 from tbot.live.clock import CLOSE_GRACE, ServerClock
-from tbot.live.commands import command_of
+from tbot.live.commands import RANK_PAIRING, PollTurn, command_of
 from tbot.live.compare import compare_session, comparison_text
 from tbot.live.config import LiveConfig, PaperConfig, SessionConfig, Settings, save_settings
-from tbot.live.doctor import Check, checks_text, run_checks
+from tbot.live.doctor import Check, checks_text, key_checks, run_checks, works_on_testnet
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.overview import broken_row, overview_text, session_row
 from tbot.live.runner import (
+    BUDGET_META,
     KEYS_MISSING,
     STOP_REQUEST_SECONDS,
+    SUPERVISED_META,
     AlreadyRunning,
     LedgerModeError,
     StartRefused,
     account_text,
+    halt_book,
+    halt_path,
+    instance_lock,
     is_running,
     load_guard,
     next_close,
+    restore_portfolio,
     resume,
     run_live,
     run_paper,
@@ -135,6 +142,7 @@ MAX_LISTED = 10
 CONFIG_DIR = Path("config")
 CONFIG_SUFFIXES = (".yaml", ".yml")
 CHAT_WAIT_SECONDS = 120  # `tbot notify` waits this long for the code to reach the bot
+TURN_WAIT_SECONDS = 90  # and this long for a running session to stop reading messages
 ROOT = Path(__file__).resolve().parents[2]  # the repository, when tbot runs from a clone
 DATA_HELP = "bar store and trial log (default: data)"
 SESSION_DATA_HELP = "bar store (default: data); the ledger is set in the config"
@@ -258,7 +266,9 @@ def live_command(name: str, config: SessionConfig | dict[str, Any]) -> str:
     mode = config.get("mode") if isinstance(config, dict) else getattr(config, "mode", None)
     if mode == "live":
         return f"tbot live {name} --live"
-    return f"tbot live {name}" if mode else f"tbot paper {name}"
+    if mode:
+        return f"tbot live {name}"
+    return "tbot paper" if name == "paper" else f"tbot paper {name}"  # paper is the default
 
 
 def kind_of(raw: dict[str, Any]) -> str:
@@ -303,8 +313,9 @@ def load[T](path: Path, loader: Callable[[Path], T], kinds: tuple[str, ...]) -> 
         if kind not in kinds:
             name = short_name(path)
             use = KIND_USE[kind].format(name=name)
-            if kind == "live":
-                use = f"a {raw.get('mode')} config: run it with `{live_command(name, raw)}`"
+            if kind in ("live", "paper"):
+                what = raw.get("mode") or "paper"
+                use = f"a {what} config: run it with `{live_command(name, raw)}`"
             failure = load_failure(path, kind)
             if failure is None:
                 raise ConfigError(f"{path} is {use}") from None
@@ -462,10 +473,12 @@ EPILOG = """\
 start here:
   tbot doctor         check the setup before a session
   tbot notify         set up Telegram alerts, guided
+  tbot keys testnet   enter Binance API keys, checked before they are saved
   tbot paper          paper trade with config/paper.yaml until stopped
   tbot status         every session at a glance
   tbot log -f         follow what a session does
   tbot stop           stop the running session after the event in progress
+  tbot halt live      the panic button: sell what the bot holds and stop its trading
   tbot support        a report to share when asking for help
 
 A config is a file or a name from config/: `tbot status testnet` reads config/testnet.yaml.
@@ -541,7 +554,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the network checks (Binance, keys, heartbeat ping); the bot retries those",
     )
 
-    command("notify", "set up Telegram alerts (guided) and send a test message")
+    notify = command("notify", "set up Telegram alerts (guided) and send a test message")
+    notify.add_argument(
+        "--chat", action="store_true", help="pick the chat again, such as a group or another phone"
+    )
+
+    keys = command("keys", "enter Binance API keys, guided: checked before they go into .env")
+    keys.add_argument("config", type=config_arg, help="testnet, live, or a config file")
 
     dashboard = session("dashboard", "write an HTML dashboard of a session and open it")
     dashboard.add_argument(
@@ -560,6 +579,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", default=None, help="a file or folder (default: backups/ by the ledger)"
     )
 
+    halt = session(
+        "halt",
+        "the panic button: sell what the bot holds and stop its trading until `tbot resume`",
+        "the running one (a real-money session must be named)",
+    )
+    halt.add_argument(
+        "--timeout", type=float, default=120.0, help="seconds to wait (default: %(default)s)"
+    )
     session("resume", "clear the kill switch of a halted session", "the halted one")
     support = command("support", "write a report to share when asking for help (no keys in it)")
     support.add_argument("--out", default=None, help="a file or folder (default: reports/)")
@@ -933,7 +960,7 @@ def run_paper_command(args: argparse.Namespace) -> int:
     log_file = args.log_file or log_path(args.config)
     announce("paper", args.config, config, log_file)
     session_logging(log_file)
-    return asyncio.run(run_paper(config, settings, args.data_dir))
+    return asyncio.run(run_paper(config, settings, args.data_dir, name=short_name(args.config)))
 
 
 def run_live_command(args: argparse.Namespace) -> int:
@@ -947,10 +974,81 @@ def run_live_command(args: argparse.Namespace) -> int:
     if settings.api_keys(config.mode) is None:
         raise ConfigError(KEYS_MISSING)  # every start would fail the same way
     not_running(config)
+    asked = config.mode == "live" and interactive() and not supervised()
+    if asked and not confirm_budget(args.config, config):
+        print("that is not the budget in the config: nothing started", file=sys.stderr)
+        return EXIT_ERROR
     log_file = args.log_file or log_path(args.config)
     announce(config.mode, args.config, config, log_file)
     session_logging(log_file)
-    return asyncio.run(run_live(config, settings, args.data_dir, confirmed=args.live))
+    name = short_name(args.config)
+    return asyncio.run(run_live(config, settings, args.data_dir, confirmed=args.live, name=name))
+
+
+QUOTES = ("FDUSD", "USDT", "USDC", "TUSD", "EUR", "TRY", "BTC", "ETH", "BNB")
+
+
+def quote_of(config: SessionConfig) -> str:
+    """The currency initial_cash is in: the quote asset every symbol shares."""
+    found = {
+        next((q for q in QUOTES if symbol.endswith(q)), "")
+        for c in config.strategies
+        for symbol in c.symbols
+    }
+    return found.pop() if len(found) == 1 and "" not in found else "of the quote currency"
+
+
+def stored_budget(config: SessionConfig) -> float | None:
+    """The budget the ledger's book was last given, or None before the first start."""
+    if not config.ledger.is_file():
+        return None
+    with Ledger(config.ledger) as ledger:
+        raw = ledger.get_meta(BUDGET_META)
+    return float(raw) if raw is not None else None
+
+
+def confirm_budget(path: Path, config: LiveConfig) -> bool:
+    """A real-money book that takes a budget for the first time, or a raised one, starts
+    only once the owner types the amount: a mistyped initial_cash must not trade."""
+    before = stored_budget(config)
+    if before is not None and config.initial_cash <= before:
+        return True
+    name, quote = short_name(path), quote_of(config)
+    raised = f", raised from {before:,.2f}" if before is not None else ""
+    drawdown = config.guard.max_drawdown
+    lines = [
+        f"REAL MONEY: {path} lets the bot trade up to {config.initial_cash:,.2f} {quote} of "
+        f"this Binance account (initial_cash{raised})."
+        if config.ownership == "budget"
+        else f"REAL MONEY: {path} lets the bot take over this whole Binance spot account "
+        "(ownership: account): all of its cash and every coin of the pairs it trades.",
+    ]
+    if drawdown:
+        lines.append(
+            f"The kill switch sells everything after a {drawdown:.0%} fall from the best value "
+            f"(about {config.initial_cash * drawdown:,.2f} of this budget)."
+        )
+    if config.protective_stop_pct:
+        lines.append(
+            f"Each position also has an exchange stop {config.protective_stop_pct:.0%} under "
+            "the last close."
+        )
+    lines.append(f"`tbot halt {name}` sells everything and stops its trading at any time.")
+    print("\n".join(lines))
+    if config.ownership == "account":
+        return input("To start, type account: ").strip().lower() == "account"
+    typed = input(f"To start, type the budget ({config.initial_cash:,.2f}): ")
+    return amount_matches(typed, config.initial_cash)
+
+
+def amount_matches(typed: str, amount: float) -> bool:
+    """`1,000`, `1000 usdt`, and `1000.0` all match 1000."""
+    text = re.sub(r"[\s,_]", "", typed.lower())
+    text = re.sub(r"[a-z]+$", "", text)
+    try:
+        return abs(float(text) - amount) <= 1e-9 * max(1.0, amount)
+    except ValueError:
+        return False
 
 
 def session_logging(log_file: Path) -> None:
@@ -970,8 +1068,17 @@ def announce(kind: str, path: Path, config: SessionConfig, log_file: Path) -> No
     name = short_name(path)
     shared = sharing_note(path, config)
     timeframe, first = next_close(config, datetime.now(UTC))
+    money = ""
+    if isinstance(config, LiveConfig) and config.mode == "live":
+        stake = (
+            f"up to {config.initial_cash:,.2f} {quote_of(config)} (initial_cash)"
+            if config.ownership == "budget"
+            else "the whole spot account (ownership: account)"
+        )
+        money = f"REAL MONEY: {stake}; `tbot halt {name}` sells everything and halts\n"
     print(
         f"{kind} session {name} (tbot {__version__}): ledger {config.ledger}, log {log_file}\n"
+        f"{money}"
         f"its first decision comes with the next {timeframe} close, {clock_text(first)}; "
         f"`tbot status {name}` shows what it did\n"
         f"stop it with Ctrl+C here, or `tbot stop {name}` from another terminal"
@@ -1093,6 +1200,9 @@ def run_stop_command(args: argparse.Namespace) -> int:
     )
     if not is_running(ledger):
         print(f"no session is running on {ledger}; {later}")
+        note = after_stop(path, ledger)
+        if note:
+            print(note)
         return 0
     print(f"asked the session on {ledger} to stop; it finishes the event in progress")
     deadline = monotonic() + args.timeout
@@ -1103,9 +1213,40 @@ def run_stop_command(args: argparse.Namespace) -> int:
                 print(f"the session ended without taking the request; {later}")
             else:
                 print("stopped")
+            note = after_stop(path, ledger)
+            if note:
+                print(note)
             return 0
     print(f"still running: `tbot log {short_name(path)}` shows what it is doing", file=sys.stderr)
     return EXIT_ERROR
+
+
+def after_stop(path: Path, ledger: Path) -> str:
+    """What still happens to a stopped session: a supervisor brings it back at the next boot,
+    and its positions stay (with their exchange stops)."""
+    try:
+        config = load_session_config(path)
+    except ConfigError:  # it no longer loads: `tbot doctor` says why
+        return ""
+    name = short_name(path)
+    with Ledger(ledger) as book:
+        scheduled = book.get_meta(SUPERVISED_META) == "1"
+        positions = restore_portfolio(config, book).positions
+    notes = []
+    if scheduled:
+        keep = (
+            f"`tbot autostart {name} -Remove`"
+            if sys.platform == "win32"
+            else "disabling its systemd unit"
+        )
+        notes.append(f"its scheduled task starts it again at the next boot; {keep} prevents that")
+    if any(positions.values()):
+        guarded = isinstance(config, LiveConfig) and config.protective_stop_pct > 0
+        stops = ", with their exchange stops," if guarded else ""
+        notes.append(
+            f"its positions stay{stops} until it runs again; `tbot halt {name}` sells them"
+        )
+    return "\n".join(notes)
 
 
 def run_compare_command(args: argparse.Namespace) -> int:
@@ -1218,8 +1359,126 @@ def run_resume_command(args: argparse.Namespace) -> int:
                 f"tbot resume {short_name(halted[0])}"
             )
         path = picked(halted[0])
-    print(resume(existing_ledger(load_session_config(path), path)))
+    config = existing_ledger(load_session_config(path), path)
+    real_money = isinstance(config, LiveConfig) and config.mode == "live"
+    if is_halted(config):
+        print(resume_note(config))
+        if real_money and interactive() and input("Type resume to go on: ").strip() != "resume":
+            print("nothing changed: still halted")
+            return EXIT_ERROR
+    print(resume(config))
     return 0
+
+
+def resume_note(config: SessionConfig) -> str:
+    """What a resume means for the book: where it stands, and what trips it again."""
+    with Ledger(config.ledger) as ledger:
+        state = load_guard(config, ledger).state
+        point = ledger.latest_equity()
+    lines = [f"halted: {state.halt_reason}"]
+    if point is not None and state.peak_equity > 0:
+        lines.append(
+            f"equity {point.equity:,.2f} at the last bar event, "
+            f"{point.equity / state.peak_equity - 1:.1%} from its best of {state.peak_equity:,.2f}"
+        )
+    limit = config.guard.max_drawdown
+    again = f"another {limit:.0%} fall from here halts it again; " if limit else ""
+    lines.append(
+        f"after resume the kill switch counts from the equity then: {again}the strategy may "
+        "buy back in at the next bar"
+    )
+    return "\n".join(lines)
+
+
+def run_halt_command(args: argparse.Namespace) -> int:
+    """The panic button: the session sells what the bot holds and trades no more."""
+    path = args.config
+    if path is None:
+        path = pick_config("halt")
+        picked_config = load_session_config(path)
+        if isinstance(picked_config, LiveConfig) and picked_config.mode == "live":
+            raise ConfigError(
+                f"it trades real money: name it to sell and halt it: tbot halt {short_name(path)}"
+            )
+    name = short_name(path)
+    config: SessionConfig | None = None
+    try:
+        config = existing_ledger(load_session_config(path), path)
+        ledger_path = config.ledger
+    except ConfigError:  # edited while it runs: the request needs only the ledger
+        ledger_path = stop_ledger(path)
+        if not (ledger_path.is_file() and is_running(ledger_path)):
+            raise
+    if config is not None:
+        try:
+            with instance_lock(ledger_path, wait=3.0):  # none runs, and none starts meanwhile
+                print(halted_text(name, config, *halt_book(config)))
+                return 0
+        except AlreadyRunning:
+            pass
+    request = halt_path(ledger_path)
+    request.write_text("halt\n", encoding="utf-8")
+    print(f"asked the session on {ledger_path} to sell what the bot holds and halt", flush=True)
+    deadline = monotonic() + args.timeout
+    while monotonic() < deadline:
+        sleep(1.0)
+        if not request.exists():  # taken and done
+            if config is None:
+                print(f"halted; `tbot status {name}` shows what it holds")
+                return 0
+            with Ledger(ledger_path) as ledger:
+                halted = load_guard(config, ledger).state.halted
+                positions = restore_portfolio(config, ledger).positions
+            if not halted:
+                print(f"the session did not halt: `tbot log {name}` says why", file=sys.stderr)
+                return EXIT_ERROR
+            print(f"halted: {held_names(positions)}; `tbot resume {name}` trades again")
+            return 0
+        if config is not None and not is_running(ledger_path):  # it ended first
+            try:
+                with instance_lock(ledger_path, wait=3.0):
+                    request.unlink(missing_ok=True)
+                    print(halted_text(name, config, *halt_book(config)))
+                return 0
+            except AlreadyRunning:  # a restart took it, and takes the request
+                continue
+    print(
+        f"not done yet: the request stays until the session has sold; `tbot log {name} -f` "
+        "shows what it does",
+        file=sys.stderr,
+    )
+    return EXIT_ERROR
+
+
+def held_list(positions: dict[str, float]) -> list[str]:
+    return [f"{symbol} {qty:.6f}" for symbol, qty in sorted(positions.items()) if qty]
+
+
+def held_names(positions: dict[str, float]) -> str:
+    held = held_list(positions)
+    return f"still held: {', '.join(held)} (see the alerts)" if held else "nothing held"
+
+
+def halted_text(
+    name: str, config: SessionConfig, already: bool, reason: str, positions: dict[str, float]
+) -> str:
+    """What `tbot halt` did to a session that was not running."""
+    held = held_list(positions)
+    head = (
+        f"{name} was halted already ({reason})"
+        if already
+        else f"halted {name} (no session was running)"
+    )
+    if not held:
+        return f"{head}: the bot holds nothing, and it trades no more until `tbot resume {name}`"
+    text = (
+        f"{head}: its next start sells {', '.join(held)} at once and trades no more until "
+        f"`tbot resume {name}`"
+    )
+    if isinstance(config, LiveConfig):  # a sale by hand would not leave the book
+        stops = "the exchange stops stay in place; " if config.protective_stop_pct else ""
+        text += f". Until then {stops}to sell now, start it (`{live_command(name, config)}`)"
+    return text
 
 
 def is_halted(config: SessionConfig) -> bool:
@@ -1275,7 +1534,22 @@ def run_notify_command(args: argparse.Namespace) -> int:
         if not token:
             print("no token: nothing changed")
             return EXIT_ERROR
-    return asyncio.run(set_up_telegram(token, chat_id, new_token, Path(".env")))
+    if args.chat:
+        chat_id = None
+    code = asyncio.run(set_up_telegram(token, chat_id, new_token, Path(".env")))
+    if code == 0 and (new_token or not settings.telegram_chat_id or args.chat):
+        print_restart_note()
+    return code
+
+
+def print_restart_note() -> None:
+    """Sessions read .env when they start."""
+    running = [short_name(path) for path in running_configs()]
+    if running:
+        print(
+            f"running sessions use the new settings once restarted: {', '.join(running)} "
+            "(`tbot stop <config>`, then start it again)"
+        )
 
 
 async def set_up_telegram(token: str, chat_id: str | None, new_token: bool, env: Path) -> int:
@@ -1302,7 +1576,7 @@ async def set_up_telegram(token: str, chat_id: str | None, new_token: bool, env:
             save_settings(env, {"TBOT_TELEGRAM_TOKEN": token})
             print(f"saved the token of @{name} in {env}")
         if not chat_id:
-            chat_id = await find_chat(bot, name)
+            chat_id = await find_chat(bot, name, token)
             if chat_id is None:
                 return EXIT_ERROR
             save_settings(env, {"TBOT_TELEGRAM_CHAT_ID": chat_id})
@@ -1321,12 +1595,35 @@ def one_time_code() -> str:
     return f"tb{secrets.token_hex(4)}"
 
 
-async def find_chat(bot: Telegram, name: str) -> str | None:
+async def find_chat(bot: Telegram, name: str, token: str = "") -> str | None:
     """The chat that sends the bot a one-time code. Bot names are public: a stranger who
     wrote to the bot first must not end up with the alerts."""
     if not interactive():
         print("run `tbot notify` in a terminal to pick the chat, or set TBOT_TELEGRAM_CHAT_ID")
         return None
+    turn = PollTurn(token, RANK_PAIRING)  # a running session lets go of the messages
+    try:
+        if not await take_turn(turn):
+            return None
+        return await pair_chat(bot, name)
+    finally:
+        turn.release()
+
+
+async def take_turn(turn: PollTurn) -> bool:
+    if turn.take():
+        return True
+    print("a running session reads the bot's messages: asking it to let go (up to 90 seconds)")
+    deadline = monotonic() + TURN_WAIT_SECONDS
+    while monotonic() < deadline:
+        await asyncio.sleep(1.0)
+        if turn.take():
+            return True
+    print("it did not let go: stop the session (`tbot stop`), then run `tbot notify` again")
+    return False
+
+
+async def pair_chat(bot: Telegram, name: str) -> str | None:
     code = one_time_code()
     print(f"Now send this code to @{name} in Telegram: {code} (waiting up to 2 minutes)")
     print(f"For alerts in a group, add the bot to it and send /{code}@{name} there.")
@@ -1347,6 +1644,8 @@ async def find_chat(bot: Telegram, name: str) -> str | None:
                 if "id" in chat and fresh and text == code:
                     title = chat.get("title") or chat.get("first_name") or chat.get("username")
                     print(f"found chat {chat['id']} {title or ''}".rstrip())
+                    with suppress(httpx.HTTPError):  # done with: no session answers it again
+                        await bot.updates(offset, 0)
                     return str(chat["id"])
     except httpx.HTTPError as exc:
         busy = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 409
@@ -1364,6 +1663,88 @@ async def find_chat(bot: Telegram, name: str) -> str | None:
     return None
 
 
+KEY_SOURCES = {
+    "testnet": (
+        "sign in at https://testnet.binance.vision with GitHub, choose Generate "
+        "HMAC_SHA256 Key, and copy the API key and the secret key"
+    ),
+    "live": (
+        "on binance.com open API Management and create a system-generated (HMAC) key; turn "
+        "on spot trading, leave withdrawals off (tbot refuses a key that can withdraw), and "
+        "restrict it to your IP if yours never changes"
+    ),
+}
+HMAC_SHAPE = re.compile(r"[A-Za-z0-9]{64}")
+KEY_CHECKS = {"binance", "api key", "permissions"}  # what a key that fails must not pass
+
+
+def run_keys_command(args: argparse.Namespace) -> int:
+    """Ask for a key pair, check it with Binance, and save it in .env only once it works."""
+    config = load_live_config(args.config)
+    name = short_name(args.config)
+    if not interactive():
+        print("run `tbot keys` in a terminal: it asks for the key and the secret, checks them")
+        print("with Binance, and saves them in .env")
+        return EXIT_ERROR
+    print(f"Binance API keys for {name} ({config.mode}): {KEY_SOURCES[config.mode]}.")
+    key = input("API key: ").strip()
+    secret = getpass.getpass("Secret key (hidden while you type or paste): ").strip()
+    if not key or not secret:
+        print("nothing changed")
+        return EXIT_ERROR
+    if not (HMAC_SHAPE.fullmatch(key) and HMAC_SHAPE.fullmatch(secret)):
+        print(
+            "note: system-generated (HMAC) keys are 64 letters and digits; tbot cannot sign "
+            "with an Ed25519 or RSA key"
+        )
+    current = Settings()
+    trial = current.model_copy(
+        update={
+            "binance_api_key": key,
+            "binance_api_secret": secret,
+            "binance_testnet_api_key": key,
+            "binance_testnet_api_secret": secret,
+        }
+    )
+    checks, old_is_testnet = asyncio.run(check_new_keys(config, trial, current))
+    print(checks_text(checks))
+    if any(c.status == "fail" and c.name in KEY_CHECKS for c in checks):
+        print(f"not saved: fix what failed above, then run `tbot keys {name}` again")
+        return EXIT_ERROR
+    if config.mode == "testnet":
+        names = ("TBOT_BINANCE_TESTNET_API_KEY", "TBOT_BINANCE_TESTNET_API_SECRET")
+    else:
+        names = ("TBOT_BINANCE_API_KEY", "TBOT_BINANCE_API_SECRET")
+    values = dict(zip(names, (key, secret), strict=True))
+    if old_is_testnet and current.binance_api_key and current.binance_api_secret:
+        values["TBOT_BINANCE_TESTNET_API_KEY"] = current.binance_api_key
+        values["TBOT_BINANCE_TESTNET_API_SECRET"] = current.binance_api_secret
+    env = Path(".env")
+    save_settings(env, values)
+    print(f"saved in {env} as {names[0]} and {names[1]}, readable by your account only")
+    if old_is_testnet:
+        print("the testnet keys there before now are TBOT_BINANCE_TESTNET_API_KEY and _SECRET")
+    print_restart_note()
+    return 0
+
+
+async def check_new_keys(
+    config: LiveConfig, trial: Settings, current: Settings
+) -> tuple[list[Check], bool]:
+    """Doctor's checks of the new key, and whether the live key it replaces in the main
+    pair is a testnet key, which then moves to the testnet pair so testnet keeps working."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        checks = await key_checks(config, trial, client)
+        old = (current.binance_api_key, current.binance_api_secret)
+        moves = (
+            config.mode == "live"
+            and current.api_keys("testnet") == old
+            and all(old)
+            and old[0] != trial.binance_api_key
+        )
+        return checks, moves and await works_on_testnet(old[0] or "", old[1] or "", client)
+
+
 COMMANDS = {
     "download": run_download,
     "check": run_check,
@@ -1378,10 +1759,12 @@ COMMANDS = {
     "stop": run_stop_command,
     "backup": run_backup_command,
     "support": run_support_command,
+    "halt": run_halt_command,
     "resume": run_resume_command,
     "account": run_account_command,
     "dashboard": run_dashboard_command,
     "notify": run_notify_command,
+    "keys": run_keys_command,
 }
 
 

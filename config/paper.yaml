@@ -33,4 +33,4 @@ stale_after_seconds: 600
 batch_wait_seconds: 5
 summary_hour_utc: 0
 backup_days: 14           # daily copies of the ledger in data/backups
-telegram_commands: true   # /status and /fills from the chat; one session per bot token
+telegram_commands: true   # /status, /fills, /halt; sessions take turns, real money first

@@ -18,6 +18,13 @@ def _no_release_lookups(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _own_turns(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whose turn it is to read a bot's messages: never shared with a session that runs."""
+    monkeypatch.setattr("tbot.live.commands.TURN_DIR", tmp_path_factory.mktemp("turns"))
+
+
+@pytest.fixture(autouse=True)
 def _private_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Doctor's check of who can read the developer's own .env is no part of a test."""
     monkeypatch.setattr("tbot.live.doctor.env_readers", lambda path: [])
+    monkeypatch.setattr("tbot.live.doctor.synced_folder", lambda folder: "")

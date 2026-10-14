@@ -14,6 +14,7 @@ import pytest
 
 from factories import price_bars
 from tbot.core.config import StrategyConfig
+from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.data.schema import empty_bars
 from tbot.data.store import BarStore
@@ -26,17 +27,21 @@ from tbot.live.executor import Executor, PaperExecutor
 from tbot.live.feed import LiveFeed
 from tbot.live.ledger import Ledger
 from tbot.live.runner import (
+    GUARD_META,
+    HALT_BY_HAND,
     MODE_META,
+    SUPERVISED_META,
     Context,
     Health,
     LedgerModeError,
     StartRefused,
+    halt_path,
     reconcile_loop,
     run_paper,
     run_session,
     stop_path,
 )
-from tbot.risk.guard import GuardConfig
+from tbot.risk.guard import GuardConfig, GuardState
 
 H4 = Timeframe.H4
 KEY = ("BTCUSDT", H4)
@@ -146,6 +151,36 @@ def test_a_paper_session_trades_a_bar_and_stops_cleanly(
         assert ledger.latest_equity() is not None
 
 
+def test_a_halted_book_sells_at_the_start_and_a_halt_request_reaches_it(
+    tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notifier, _ = offline
+    config, _, _ = setup_store(tmp_path)
+    monkeypatch.setenv("TBOT_SUPERVISED", "1")
+    monkeypatch.setattr(runner, "STOP_POLL_SECONDS", 0.05)
+    with Ledger(config.ledger) as ledger:  # `tbot halt` while it was stopped, holding coins
+        ledger.add_fill(Fill(datetime(2024, 1, 1, tzinfo=UTC), "BTCUSDT", 2.0, 100.0, 0.2), 100)
+        state = GuardState(peak_equity=1000.0, halted=True, halt_reason=HALT_BY_HAND)
+        ledger.set_meta(GUARD_META, state.model_dump_json())
+
+    async def scenario() -> int:
+        stop = asyncio.Event()
+        session = asyncio.create_task(
+            run_paper(config, Settings(_env_file=None), tmp_path / "data", stop=stop)  # type: ignore[call-arg]
+        )
+        await until(lambda: any("SELL 2.000000 BTCUSDT" in m for m in notifier.messages))
+        halt_path(config.ledger).write_text("halt\n", encoding="utf-8")  # halted already
+        await until(lambda: not halt_path(config.ledger).exists())
+        stop.set()
+        return await session
+
+    assert asyncio.run(scenario()) == 0
+    assert notifier.messages[-1].endswith(", nothing held")
+    assert sum("KILL SWITCH" in m for m in notifier.messages) == 1  # sold once, told once
+    with Ledger(config.ledger) as ledger:
+        assert ledger.get_meta(SUPERVISED_META) == "1"  # `tbot stop` says it comes back
+
+
 def test_a_start_by_hand_drops_a_stop_request_left_for_a_supervisor(
     tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -227,7 +262,8 @@ def test_failing_reconciliations_pause_new_orders_until_one_works(tmp_path: Path
     assert seen[:4] == ["", "", "", "reconciliation failing (down)"]  # paused after three
     assert health.blocked == ""  # the fourth worked
     assert notifier.messages == [
-        "[live] reconciliation failing (down); new orders wait until it works again",
+        "[live] reconciliation failing (down); new buys wait until it works again, "
+        "sales still go out",
         "[live] reconciliation works again",
     ]
 

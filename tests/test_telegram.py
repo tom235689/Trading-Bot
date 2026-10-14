@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from tbot.live.commands import command_loop
+from tbot.live.commands import command_loop, command_of
 from tbot.monitoring.heartbeat import heartbeat_loop
 from tbot.monitoring.telegram import LogNotifier, QueuedNotifier, Telegram
 
@@ -67,6 +67,10 @@ def test_queued_alerts_keep_their_order_and_never_wait() -> None:
     assert sent == ["a", "b", "c"]
 
 
+async def echo(text: str) -> str:
+    return f"answer {command_of(text)}"
+
+
 def test_commands_are_answered_only_for_the_owner() -> None:
     started = datetime(2024, 1, 1, tzinfo=UTC)
     stamp = int(started.timestamp())
@@ -91,7 +95,7 @@ def test_commands_are_answered_only_for_the_owner() -> None:
     async def run() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
             telegram = Telegram("token", "42", client)
-            task = asyncio.create_task(command_loop(telegram, lambda c: f"answer {c}", started))
+            task = asyncio.create_task(command_loop(telegram, echo, started))
             async with asyncio.timeout(5):  # a regression fails instead of hanging
                 while len(sent) < 2 or len(offsets) < 2:
                     await asyncio.sleep(0.01)
@@ -145,7 +149,7 @@ def test_an_odd_reply_from_telegram_never_ends_the_session(
     async def run() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
             telegram = Telegram("token", "42", client)
-            task = asyncio.create_task(command_loop(telegram, lambda c: f"answer {c}", started))
+            task = asyncio.create_task(command_loop(telegram, echo, started))
             async with asyncio.timeout(5):
                 while not sent:
                     await asyncio.sleep(0.01)

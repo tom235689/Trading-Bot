@@ -16,9 +16,23 @@ from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.live.backup import backup_ledger, daily_backups
 from tbot.live.config import LiveConfig, PaperConfig, Settings
-from tbot.live.doctor import Check, backup_check, checks_text, guard_check, run_checks
+from tbot.live.doctor import (
+    Check,
+    backup_check,
+    checks_text,
+    guard_check,
+    run_checks,
+    synced_folder,
+)
 from tbot.live.ledger import Ledger
-from tbot.live.runner import GUARD_META, KEYS_MISSING, MODE_META, mode_problem, stop_path
+from tbot.live.runner import (
+    GUARD_META,
+    KEYS_MISSING,
+    MODE_META,
+    halt_path,
+    mode_problem,
+    stop_path,
+)
 from tbot.risk.guard import GuardConfig, GuardState
 
 STRATEGIES = [
@@ -104,6 +118,50 @@ def test_dangerous_key_and_short_budget_fail(tmp_path: Path) -> None:
     assert found["permissions"][-1][0] == "warn"  # any IP
     assert found["budget"][0][0] == "fail"
     assert "USDT 400.00 free, the bot needs 1,000.00" in found["budget"][0][1]
+
+
+def test_rights_the_bot_never_uses_are_warned_about(tmp_path: Path) -> None:
+    spot = fake()
+    spot.restrictions = {**spot.restrictions, "enableFutures": True}
+    found = by_name(check(live(tmp_path), settings(**ALERTS, **KEYS), spot))
+    assert found["permissions"] == [
+        ("warn", "the key also allows futures trading: tbot never uses it")
+    ]
+
+
+def test_account_ownership_names_what_the_bot_takes_over(tmp_path: Path) -> None:
+    spot = fake(balances={"USDT": 5000.0, "BTC": 0.25, "DOGE": 900.0})
+    found = by_name(check(live(tmp_path, ownership="account"), settings(**ALERTS, **KEYS), spot))
+    [(status, detail)] = found["budget"]
+    assert status == "warn"
+    assert detail.startswith("ownership account: the bot takes over and trades all of ")
+    assert "USDT 5,000" in detail
+    assert "BTC 0.25" in detail
+    assert "DOGE" not in detail  # a pair it does not trade stays out of it
+
+
+def test_a_halt_request_no_session_took_is_named(tmp_path: Path) -> None:
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    Ledger(config.ledger).close()
+    halt_path(config.ledger).write_text("halt\n", encoding="utf-8")
+    found = by_name(check(config, settings(), fake()))
+    assert found["halt"] == [
+        (
+            "warn",
+            "a `tbot halt` request waits: the next start sells what the bot holds and halts "
+            "(`tbot resume` withdraws it)",
+        )
+    ]
+
+
+def test_a_synced_folder_is_named(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        monkeypatch.delenv(name, raising=False)
+    assert synced_folder(tmp_path / "Projects" / "Trading-Bot") == ""
+    assert synced_folder(tmp_path / "Dropbox (Personal)" / "Trading-Bot") == "Dropbox"
+    assert synced_folder(tmp_path / "OneDrive - Contoso" / "Trading-Bot") == "OneDrive"
+    monkeypatch.setenv("OneDrive", str(tmp_path / "Cloud"))  # a renamed OneDrive folder
+    assert synced_folder(tmp_path / "Cloud" / "bots" / "Trading-Bot") == "OneDrive"
 
 
 def test_testnet_skips_permissions_and_flags_a_wrong_key(tmp_path: Path) -> None:

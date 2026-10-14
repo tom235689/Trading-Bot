@@ -105,12 +105,14 @@ class PaperExecutor:
         ledger: Ledger,
         notifier: Notifier,
         clock: Callable[[], datetime],
+        label: str = "paper",
     ) -> None:
         self.broker = broker
         self.prices = prices
         self.ledger = ledger
         self.notifier = notifier
         self.clock = clock
+        self.label = label
 
     async def execute(
         self,
@@ -126,7 +128,9 @@ class PaperExecutor:
             except Exception as exc:  # a failed quote skips this order only
                 log.error("price_failed", symbol=symbol, error=repr(exc))
                 self.ledger.add_order(now, symbol, quantity, "failed", repr(exc))
-                await self.notifier.send(f"[paper] price lookup failed for {symbol}: {exc!r}")
+                await self.notifier.send(
+                    f"[{self.label}] price lookup failed for {symbol}: {exc!r}"
+                )
                 continue
             fill = self.broker.fill(
                 self.clock(),
@@ -144,7 +148,7 @@ class PaperExecutor:
             portfolio.apply(fill)
             self.ledger.add_fill(fill, reference)
             self.ledger.add_order(now, symbol, quantity, "filled")
-            await self.notifier.send(_fill_text("paper", fill, portfolio.equity(marks)))
+            await self.notifier.send(_fill_text(self.label, fill, portfolio.equity(marks)))
             fills.append(fill)
         return fills
 
@@ -559,7 +563,8 @@ class LiveExecutor:
         log.warning("stop_executed", symbol=symbol, quantity=quantity, price=fill.price)
         await self.notifier.send(
             f"[{self.label}] protective stop sold {quantity:.6f} {symbol} "
-            f"@ {price_text(fill.price)}"
+            f"@ {price_text(fill.price)}; the strategy decides again at the next close and may "
+            f"buy back (`tbot halt` keeps it out)"
         )
         return 1
 

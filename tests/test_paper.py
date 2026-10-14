@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from factories import Scripted, price_bars
 from tbot.cli import EXIT_CONFIG, EXIT_ERROR, load_session_config, main
@@ -253,7 +254,10 @@ def test_configs_and_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert LiveConfig(mode="testnet", strategies=live.strategies).ledger == Path(
         "data/testnet.sqlite"
     )
-    assert LiveConfig(mode="live", strategies=live.strategies).ledger == Path("data/live.sqlite")
+    real = LiveConfig(mode="live", initial_cash=500, strategies=live.strategies)
+    assert real.ledger == Path("data/live.sqlite")
+    with pytest.raises(ValidationError, match="set initial_cash"):  # never a default amount
+        LiveConfig(mode="live", strategies=live.strategies)
 
     monkeypatch.chdir(tmp_path)  # no .env here: only the environment counts
     for name in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "HEARTBEAT_URL", "BINANCE_API_KEY"):
@@ -315,7 +319,7 @@ def test_status_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
 def test_live_command_needs_the_flag_for_real_money(tmp_path: Path) -> None:
     config_path = tmp_path / "live.yaml"
     config_path.write_text(
-        "mode: live\nstrategies:\n"
+        "mode: live\ninitial_cash: 1000\nstrategies:\n"
         "  - {name: donchian_trend, symbols: [BTCUSDT], timeframe: 4h, allocation: 1.0}\n",
         encoding="utf-8",
     )
@@ -465,12 +469,13 @@ def test_telegram_status_and_fills_answers(tmp_path: Path) -> None:
     trader, ledger, _ = make_trader(tmp_path, {at(1): {"BTC": 0.5}}, FakePrices({"BTC": 100.0}))
     asyncio.run(trader.handle({BTC: BARS.slice(0, 1)}))
     answer = command_answer(trader.session, ledger, "paper", lambda: at(1), lambda: ["PAUSED: x"])
-    status = answer("/status")
+    status = asyncio.run(answer("/status"))
     assert status.startswith("[paper] status 2024-01-01 01:00 UTC")
-    assert "last bar event 2024-01-01 01:00 UTC" in status
+    assert "prices of the last bar event, 2024-01-01 01:00 UTC" in status
+    assert "profit -0.50 (-0.1%) on 1,000.00 put in" in status  # the fee
     assert status.endswith("PAUSED: x")
-    assert "BUY 5.000000 BTC @ 100.00" in answer("/fills")
-    assert answer("/nope") == HELP
+    assert "BUY 5.000000 BTC @ 100.00" in asyncio.run(answer("/fills"))
+    assert asyncio.run(answer("/nope")) == HELP
     ledger.close()
 
 

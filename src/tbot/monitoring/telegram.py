@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
@@ -42,6 +43,9 @@ class Telegram:
         self.url = f"{self.base}/sendMessage"
         self.chat_id = chat_id
         self.client = client
+        # Why Telegram refuses alerts for good (a revoked token, a blocked bot), else "".
+        self.refused = ""
+        self.on_refused: Callable[[str], None] | None = None
 
     async def me(self) -> str:
         """The bot's username. Raises httpx errors (401 for a wrong token); never log their URL."""
@@ -90,6 +94,7 @@ class Telegram:
             log.warning("telegram_failed", error=describe_error(exc))  # never the URL
             return False, 0.0
         if response.is_success:
+            self.refused = ""
             return True, None
         moved = migrated_to(response)
         if moved and moved != self.chat_id:  # a group became a supergroup, with a new id
@@ -99,7 +104,15 @@ class Telegram:
         log.warning("telegram_failed", error=f"HTTP {response.status_code}: {response.text[:200]}")
         if response.status_code == 429:
             return False, _retry_after(response)
-        return False, (0.0 if response.status_code >= 500 else None)  # 4xx: a wrong chat id
+        if response.status_code >= 500:
+            return False, 0.0
+        problem = f"HTTP {response.status_code}: {response.text[:120]}"  # a wrong chat id
+        if not self.refused:
+            log.error("telegram_refused", error=problem, hint="`tbot notify` tests it")
+            if self.on_refused is not None:
+                self.on_refused(problem)
+        self.refused = problem
+        return False, None
 
 
 class QueuedNotifier:
