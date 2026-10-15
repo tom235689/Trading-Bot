@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Self
 
 import yaml
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from tbot.core.config import StrategyConfig, TradingConfig, load_yaml
 from tbot.risk.guard import GuardConfig
@@ -17,6 +17,8 @@ class BacktestConfig(TradingConfig):
     start: date
     end: date | None = None  # exclusive; None runs to the latest stored bar
     guard: GuardConfig | None = None  # the session guard; None trades without one
+    # Live's exchange stop this far below the last close; 0 (the default) simulates none.
+    protective_stop_pct: float = Field(default=0.0, ge=0, lt=1)
 
     @model_validator(mode="after")
     def check_period(self) -> Self:

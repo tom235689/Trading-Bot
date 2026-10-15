@@ -1,7 +1,9 @@
 """Paper and live session configuration (YAML) and secrets (environment)."""
 
 import contextlib
+import difflib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,14 +17,19 @@ from tbot.core.config import TradingConfig, load_yaml
 from tbot.risk.guard import GuardConfig
 
 ONE_QUOTE = "a book keeps one cash, so every symbol of a session needs the same quote asset"
+FRACTION = "a fraction (0.002 means 0.2%)"
+MAX_TOLERANCE = 0.05  # a reconciliation mismatch beyond 5% is never noise
+OTHER_VARIABLES = {"TBOT_SUPERVISED", "TBOT_DEBUG"}  # read from the environment, not a setting
+ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 
 
 class SessionConfig(TradingConfig):
     ledger: Path
     guard: GuardConfig = GuardConfig()
-    heartbeat_seconds: int = Field(default=300, ge=30)
-    stale_after_seconds: int = Field(default=600, ge=60)  # bar overdue by this much: alert
-    batch_wait_seconds: float = Field(default=5.0, ge=0)  # wait for streams closing together
+    heartbeat_seconds: int = Field(default=300, ge=30, le=86400)
+    stale_after_seconds: int = Field(default=600, ge=60, le=7 * 86400)  # bar overdue: alert
+    # Wait for streams closing together.
+    batch_wait_seconds: float = Field(default=5.0, ge=0, le=300, allow_inf_nan=False)
     summary_hour_utc: int = Field(default=0, ge=0, le=23)
     backup_days: int = Field(default=14, ge=0)  # daily ledger copies kept; 0 turns them off
     # Answer /status, /fills, and /halt from the Telegram chat. The sessions of a clone
@@ -41,9 +48,17 @@ class LiveConfig(SessionConfig):
     # account: the bot owns the whole spot account (use only for a dedicated account).
     ownership: Literal["budget", "account"] = "budget"
     protective_stop_pct: float = Field(default=0.2, ge=0, lt=1)  # 0 disables exchange stops
-    reconcile_seconds: int = Field(default=300, ge=30)
-    reconcile_tolerance: float = Field(default=0.002, ge=0)  # relative mismatch that is noise
+    reconcile_seconds: int = Field(default=300, ge=30, le=86400)
+    # Relative mismatch that is noise; a percent typed as such (0.2 for 0.2%) is refused.
+    reconcile_tolerance: float = Field(default=0.002, ge=0, allow_inf_nan=False)
     recv_window: int = Field(default=5000, ge=1000, le=60000)
+
+    @field_validator("reconcile_tolerance")
+    @classmethod
+    def tolerance_fraction(cls, value: float) -> float:
+        if value > MAX_TOLERANCE:  # 0.2 meant as 0.2% would let a 20% mismatch pass
+            raise ValueError(f"must be at most {MAX_TOLERANCE:g}: {FRACTION}")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -58,6 +73,12 @@ class LiveConfig(SessionConfig):
         if self.mode == "live" and "initial_cash" not in self.model_fields_set:
             raise ValueError("set initial_cash: the real-money budget, the most the bot can lose")
         return self
+
+
+def looks_like_session(raw: dict[str, Any]) -> bool:
+    """A paper, testnet, or live config: `mode` says so (no backtest or validation config
+    takes it), else no backtest `start` and no validation `backtest` or `grid`."""
+    return "mode" in raw or not ({"start", "backtest", "grid"} & raw.keys())
 
 
 def named_ledger(raw: dict[str, Any]) -> Path | None:
@@ -80,10 +101,55 @@ def load_live_config(path: Path) -> LiveConfig:
     return LiveConfig.model_validate(load_yaml(path.read_text(encoding="utf-8")))
 
 
+class EnvUnreadable(ValueError):
+    """.env is there but cannot be used as written: every start would fail the same way."""
+
+
+def env_problem(path: Path) -> str:
+    """Why this .env cannot be read as written, or ""."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:  # owned by another account, such as an elevated prompt's
+        return f"cannot read {path} ({exc.strerror}): give your account access to it"
+    if b"\x00" in data:  # PowerShell 5.1 `>>` appends UTF-16 to a UTF-8 file
+        return (
+            f"{path} holds UTF-16 text, which is not read (PowerShell's `>`, `>>`, and "
+            "Out-File write it): open it in Notepad and save it as UTF-8"
+        )
+    return ""
+
+
+def env_notes(text: str, names: set[str]) -> list[str]:
+    """Lines of a .env that set nothing: an unknown TBOT_ name (a typo), or a line in
+    another shell's syntax (`set X=`, `$env:X=`)."""
+    notes = []
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = ENV_LINE.match(line)
+        if match is None:
+            notes.append(f"line {number} is not NAME=value, so it sets nothing")
+            continue
+        name = match.group(1).upper()
+        if name.startswith("TBOT_") and name not in names | OTHER_VARIABLES:
+            close = difflib.get_close_matches(name, sorted(names), n=1)
+            hint = f" (did you mean {close[0]}?)" if close else ""
+            notes.append(f"line {number}: {name} is no tbot setting{hint}")
+    return notes
+
+
 class Settings(BaseSettings):
     """Secrets and endpoints from the environment or a .env file."""
 
     model_config = SettingsConfigDict(env_prefix="TBOT_", env_file=".env", extra="ignore")
+
+    @classmethod
+    def names(cls) -> set[str]:
+        """The .env names of the settings."""
+        return {f"TBOT_{name.upper()}" for name in cls.model_fields}
 
     telegram_token: str | None = None
     telegram_chat_id: str | None = None
@@ -135,8 +201,13 @@ def save_settings(path: Path, values: dict[str, str]) -> None:
         if not found:
             lines.append(line)
     partial = path.with_name(path.name + ".partial")
-    partial.write_bytes((newline.join(lines) + newline).encode("utf-8"))
-    replace_keeping_access(partial, path)
+    try:
+        partial.write_bytes((newline.join(lines) + newline).encode("utf-8"))
+        replace_keeping_access(partial, path)
+    except OSError as exc:  # the secret must not stay behind in a file anyone may read
+        partial.unlink(missing_ok=True)
+        hint = "; if it is read-only, clear that in its Properties" if path.exists() else ""
+        raise EnvUnreadable(f"cannot save {path} ({exc.strerror}){hint}") from None
 
 
 def replace_keeping_access(source: Path, target: Path) -> None:

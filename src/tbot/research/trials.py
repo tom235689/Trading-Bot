@@ -49,6 +49,8 @@ def setup_hash(config: BacktestConfig) -> str:
     a different trial."""
     data = config.model_dump(mode="json", exclude={"start", "end"})
     data["strategies"][0]["params"] = {}
+    if not data["protective_stop_pct"]:  # off: the hash of the runs from before it existed
+        del data["protective_stop_pct"]
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -60,7 +62,7 @@ def make_record(config: BacktestConfig, metrics: Metrics, tag: str) -> TrialReco
         time=datetime.now(UTC),
         tag=tag if len(config.strategies) == 1 else f"{tag}-portfolio",
         strategy=strategy.name,
-        symbols=strategy.symbols,
+        symbols=sorted(strategy.symbols),  # the order they were listed in is no other sample
         timeframe=str(strategy.timeframe),
         params=dict(strategy.params),
         start=config.start,
@@ -125,13 +127,7 @@ class TrialLog:
         """
         trials: dict[tuple[str, str], float] = {}
         for r in self.read():
-            same = (r.strategy, r.symbols, r.timeframe, r.start, r.end) == (
-                like.strategy,
-                like.symbols,
-                like.timeframe,
-                like.start,
-                like.end,
-            )
+            same = _market(r) == _market(like) and (r.start, r.end) == (like.start, like.end)
             if same and r.tag in SELECTION_TAGS:
                 params = json.dumps(r.params, sort_keys=True, default=str)
                 result = f"{r.sharpe:.6f}" if math.isfinite(r.sharpe) else "nan"
@@ -144,9 +140,14 @@ class TrialLog:
         return sum(
             1
             for r in self.read()
-            if (r.strategy, r.symbols, r.timeframe) == (like.strategy, like.symbols, like.timeframe)
-            and (r.end is None or r.end > holdout_start)
+            if _market(r) == _market(like) and (r.end is None or r.end > holdout_start)
         )
 
     def count(self, strategy: str, tag: str) -> int:
         return sum(1 for r in self.read() if r.strategy == strategy and r.tag == tag)
+
+
+def _market(record: TrialRecord) -> tuple[str, list[str], str]:
+    """Strategy, symbols, and timeframe; symbols in any order (older logs kept the order
+    they were listed in)."""
+    return record.strategy, sorted(record.symbols), record.timeframe

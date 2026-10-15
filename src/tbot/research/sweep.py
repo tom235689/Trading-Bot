@@ -32,10 +32,13 @@ class SweepRun:
     metrics: Metrics
 
 
+def is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
 def in_order(values: Sequence[Any]) -> list[Any]:
     """Numbers sorted, so list neighbors are neighbors in value; other values as given."""
-    numeric = all(isinstance(v, int | float) and not isinstance(v, bool) for v in values)
-    return sorted(values) if numeric else list(values)
+    return sorted(values) if all(is_number(v) for v in values) else list(values)
 
 
 def grid_points(grid: Grid) -> list[dict[str, Any]]:

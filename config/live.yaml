@@ -22,7 +22,8 @@ guard:
   # strategy's 4h returns goes past 45% in 5% of in-sample paths and in 17% of 4-year
   # out-of-sample paths (55%: 0.5% and 5.5%). At 0.15 the backtest halts in Nov 2018 for good.
   # In plain terms: the bot sells everything and stops for good (until `tbot resume`) only after
-  # the book fell 45% below its best value (about 450 while that is near 1000), so expect large swings.
+  # the book fell 45% below its best value (with a best of 1000, a loss of 450, at 550), so
+  # expect large swings.
   max_drawdown: 0.45
   stale_seconds: 900
 strategies:

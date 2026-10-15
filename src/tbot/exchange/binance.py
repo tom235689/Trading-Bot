@@ -29,9 +29,14 @@ MAX_RETRY_WAIT = 30.0  # seconds; a longer Retry-After (an IP ban) fails at once
 RATE_LIMITED = frozenset({418, 429})
 RULES_MAX_AGE = 3600.0  # seconds; Binance changes filters and statuses of listed pairs
 ORDER_NOT_FOUND = -2013
+ORDER_ARCHIVED = -2026  # cancelled or expired, nothing executed, over 90 days ago
 NOTHING_TO_CANCEL = -2011
+ORDER_REJECTED = -2010
 TIMESTAMP_OUTSIDE_WINDOW = -1021
 SEND_STATUS_UNKNOWN = -1007
+UNEXPECTED_RESPONSE = -1006
+UNKNOWN_ERROR = -1000
+STATUS_UNKNOWN = frozenset({SEND_STATUS_UNKNOWN, UNEXPECTED_RESPONSE, UNKNOWN_ERROR})
 INVALID_SYMBOL = -1121
 FILTER_FAILURE = -1013
 BAD_PRECISION = -1111
@@ -40,6 +45,8 @@ BAD_KEY_FORMAT = -2014
 RULE_ERRORS = frozenset({FILTER_FAILURE, BAD_PRECISION})  # the cached rules may be out of date
 KEY_ERRORS = frozenset({BAD_SIGNATURE, BAD_KEY_FORMAT})  # the key or secret is wrong
 TRADING = "TRADING"
+ARCHIVED = "ARCHIVED"  # the status of an order Binance archived: done, nothing executed
+DONE = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", ARCHIVED})
 UNLISTED = "UNLISTED"  # the status of a configured pair Binance no longer lists
 NOISE = Decimal("1e-6")  # of a step: closer than this to it is float rounding, not a remainder
 Params = Mapping[str, str | int | float]
@@ -56,8 +63,9 @@ class BinanceError(Exception):
 
     @property
     def uncertain(self) -> bool:
-        """The request may have been executed: Binance says so for 5xx and -1007."""
-        return self.status >= 500 or self.code == SEND_STATUS_UNKNOWN
+        """The request may have been executed: Binance says so for 5xx, -1007, -1006, and
+        -1000."""
+        return self.status >= 500 or self.code in STATUS_UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -144,7 +152,7 @@ class Order:
 
     @property
     def done(self) -> bool:
-        return self.status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}
+        return self.status in DONE
 
 
 def parse_order(data: Mapping[str, Any]) -> Order:
@@ -293,8 +301,11 @@ class BinanceSpot:
                 self.paused_until = max(self.paused_until, time.monotonic() + delay)
             if response.status_code >= 400:
                 error = _error_from(response)
-                if error.code in RULE_ERRORS:
-                    self.rules_time = -math.inf  # reload them before the next order
+                closed = (
+                    error.code == ORDER_REJECTED and "market is closed" in error.message.lower()
+                )
+                if error.code in RULE_ERRORS or closed:
+                    self.rules_time = -math.inf  # reload them (or the status) before the next order
                 if (
                     error.code == TIMESTAMP_OUTSIDE_WINDOW
                     and signed
@@ -424,7 +435,8 @@ class BinanceSpot:
         self, symbol: str, client_order_id: str, *, attempts: int | None = None
     ) -> Order | None:
         """The order, or None when Binance does not know it; `attempts` 1 leaves retries to
-        a caller that has its own."""
+        a caller that has its own. One Binance archived (cancelled or expired long ago with
+        nothing executed) comes back done with status ARCHIVED."""
         params = {"symbol": symbol, "origClientOrderId": client_order_id}
         try:
             data = await self._request(
@@ -433,6 +445,8 @@ class BinanceSpot:
         except BinanceError as exc:
             if exc.code == ORDER_NOT_FOUND:
                 return None
+            if exc.code == ORDER_ARCHIVED:
+                return Order(symbol, 0, client_order_id, "", "", ARCHIVED, 0.0, 0.0)
             raise
         return parse_order(data)
 

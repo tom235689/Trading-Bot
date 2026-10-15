@@ -1,5 +1,6 @@
 """Parquet bar storage: one file per symbol, timeframe, and year."""
 
+import io
 import os
 import time
 from collections.abc import Iterable, Iterator
@@ -13,12 +14,26 @@ from tbot.core.filelock import lock_file
 from tbot.core.timeframe import Timeframe
 from tbot.data.schema import BAR_SCHEMA, empty_bars
 
-REPLACE_ATTEMPTS = 6  # Windows refuses to replace a file another process is reading
+REPLACE_ATTEMPTS = 8  # Windows refuses to replace a file another process is reading
+READ_ATTEMPTS = 5  # nor can a file be opened at the moment another process replaces it
 LOCK_SECONDS = 60.0  # another process merging into the same stream gets this long
+DAMAGED = ".damaged"  # suffix of a year file set aside because it cannot be read
+REFETCH = ".refetch"  # a year set aside and not fetched again yet
+# Polars panics instead of raising on some damaged files; a panic is a BaseException.
+PARSE_ERRORS = (pl.exceptions.PolarsError, pl.exceptions.PanicException)
 
 
 class StoreBusy(OSError):
     """Another process kept a stream locked for longer than the writer could wait."""
+
+
+class StoreUnreadable(OSError):
+    """A stored year file that cannot be read: damaged (it does not parse), or held."""
+
+    def __init__(self, message: str, path: Path, *, damaged: bool) -> None:
+        super().__init__(message)
+        self.path = path
+        self.damaged = damaged
 
 
 class BarStore:
@@ -40,6 +55,32 @@ class BarStore:
     def _files(self, symbol: str, timeframe: Timeframe) -> list[Path]:
         return sorted(self.directory(symbol, timeframe).glob("*.parquet"))
 
+    def _load(
+        self, path: Path, symbol: str, timeframe: Timeframe, columns: list[str] | None = None
+    ) -> pl.DataFrame:
+        """One year file, read in one open: a replace by another process between two reads
+        of the same file would tear it. A file just replaced is tried again first."""
+        attempt = 0
+        while True:
+            try:
+                return pl.read_parquet(io.BytesIO(path.read_bytes()), columns=columns)
+            except FileNotFoundError:  # set aside by another process since it was listed
+                return empty_bars().select(columns or BAR_SCHEMA.names())
+            except (OSError, *PARSE_ERRORS) as exc:
+                attempt += 1
+                if attempt < READ_ATTEMPTS:
+                    time.sleep(0.025 * 2**attempt)
+                    continue
+                if isinstance(exc, OSError):
+                    problem = f"cannot read {path} ({exc}); another program may hold it open"
+                    raise StoreUnreadable(problem, path, damaged=False) from exc
+                hint = self.download_hint([(symbol, timeframe)])
+                error = " ".join(str(exc).split())[:200]
+                problem = (
+                    f"{path} is damaged ({error}); {hint} sets it aside and fetches that year again"
+                )
+                raise StoreUnreadable(problem, path, damaged=True) from exc
+
     def read(
         self,
         symbol: str,
@@ -51,7 +92,7 @@ class BarStore:
         files = self._files(symbol, timeframe)
         if not files:
             return empty_bars()
-        bars = pl.read_parquet(files)
+        bars = pl.concat([self._load(file, symbol, timeframe) for file in files])
         if start is not None:
             bars = bars.filter(pl.col("open_time") >= start)
         if end is not None:
@@ -59,18 +100,18 @@ class BarStore:
         return bars.sort("open_time")
 
     def first_open_time(self, symbol: str, timeframe: Timeframe) -> datetime | None:
-        files = self._files(symbol, timeframe)
-        if not files:
-            return None
-        value = pl.read_parquet(files[0], columns=["open_time"])["open_time"].min()
-        return value if isinstance(value, datetime) else None
+        for file in self._files(symbol, timeframe):
+            value = self._load(file, symbol, timeframe, ["open_time"])["open_time"].min()
+            if isinstance(value, datetime):
+                return value
+        return None
 
     def last_open_time(self, symbol: str, timeframe: Timeframe) -> datetime | None:
-        files = self._files(symbol, timeframe)
-        if not files:
-            return None
-        value = pl.read_parquet(files[-1], columns=["open_time"])["open_time"].max()
-        return value if isinstance(value, datetime) else None
+        for file in reversed(self._files(symbol, timeframe)):
+            value = self._load(file, symbol, timeframe, ["open_time"])["open_time"].max()
+            if isinstance(value, datetime):
+                return value
+        return None
 
     def write(
         self,
@@ -100,14 +141,49 @@ class BarStore:
                 file = directory / f"{year}.parquet"
                 part = bars.filter(pl.col("open_time").dt.year() == year)
                 if file.exists():
-                    part = pl.concat([pl.read_parquet(file), part])
+                    part = pl.concat([self._load(file, symbol, timeframe), part])
                 merged = part.unique("open_time", keep="last", maintain_order=True)
                 # Write then rename so a crash never leaves a partial file.
                 tmp = file.with_suffix(f".{os.getpid()}.tmp")
                 merged.sort("open_time").write_parquet(tmp)
                 with tmp.open("rb+") as handle:  # on disk before it replaces the old file
                     os.fsync(handle.fileno())
-                _replace(tmp, file)
+                try:
+                    _replace(tmp, file)
+                except OSError:
+                    tmp.unlink(missing_ok=True)
+                    raise
+
+    def set_aside(self, path: Path) -> Path | None:
+        """Rename a damaged year file out of the way (it is kept, not deleted) and mark its
+        year to be fetched again. Return the new path, or None if another process has
+        replaced the file since."""
+        directory = path.parent
+        with locked(directory / ".lock"):
+            try:  # no writer runs now: one read says whether it is still damaged
+                pl.read_parquet(io.BytesIO(path.read_bytes()))
+                return None
+            except FileNotFoundError:
+                return None
+            except PARSE_ERRORS:
+                pass
+            target = path.with_name(path.name + DAMAGED)
+            copies = 1
+            while target.exists():  # damaged before: keep every copy
+                copies += 1
+                target = path.with_name(f"{path.name}{DAMAGED}{copies}")
+            # The mark goes first: a crash in between costs a fetch, never a hole.
+            (directory / f"{path.stem}{REFETCH}").touch()
+            _replace(path, target)
+        return target
+
+    def years_to_refetch(self, symbol: str, timeframe: Timeframe) -> list[int]:
+        """Years whose file was set aside and has not been fetched again."""
+        marks = self.directory(symbol, timeframe).glob(f"*{REFETCH}")
+        return sorted(int(mark.stem) for mark in marks if mark.stem.isdigit())
+
+    def refetched(self, symbol: str, timeframe: Timeframe, year: int) -> None:
+        (self.directory(symbol, timeframe) / f"{year}{REFETCH}").unlink(missing_ok=True)
 
 
 @contextmanager
@@ -136,6 +212,5 @@ def _replace(source: Path, target: Path) -> None:
             return
         except PermissionError:
             if attempt == REPLACE_ATTEMPTS - 1:
-                source.unlink(missing_ok=True)
                 raise
-            time.sleep(0.05 * 2**attempt)
+            time.sleep(min(0.05 * 2**attempt, 1.0))

@@ -1,10 +1,11 @@
 """A whole session, start to stop, with the network replaced: the code tests rarely reach."""
 
 import asyncio
+import json
 import signal
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,7 +27,7 @@ from tbot.live.clock import ServerClock
 from tbot.live.config import LiveConfig, PaperConfig, Settings
 from tbot.live.executor import Executor, PaperExecutor
 from tbot.live.feed import LiveFeed
-from tbot.live.ledger import Ledger
+from tbot.live.ledger import EquityPoint, Ledger
 from tbot.live.runner import (
     GUARD_META,
     HALT_BY_HAND,
@@ -38,10 +39,12 @@ from tbot.live.runner import (
     StartRefused,
     halt_path,
     reconcile_loop,
+    registered_sessions,
     run_paper,
     run_session,
     stop_path,
 )
+from tbot.monitoring.dashboard import growth
 from tbot.risk.guard import GuardConfig, GuardState
 
 H4 = Timeframe.H4
@@ -427,3 +430,117 @@ def test_a_live_session_of_two_quote_assets_ends_for_good(
     settings = Settings(_env_file=None, binance_api_key="key", binance_api_secret="secret")  # type: ignore[call-arg]
     assert asyncio.run(runner.run_live(config, settings, tmp_path / "data")) == 4
     assert "the symbols are quoted in BUSD, USDT" in notifier.messages[-1]
+
+
+def test_a_testnet_session_buys_places_its_stop_and_stops_cleanly(
+    tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real-money start path, with the exchange replaced: rules, keys, reconciliation,
+    an order at a breakout bar, and the stop that protects it."""
+    notifier, feeds = offline
+    paper, _, breakout = setup_store(tmp_path)
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={"BTCUSDT": 130.0})
+
+    def spot(*args: Any, **kwargs: Any) -> BinanceSpot:  # config, settings, client, clock
+        return BinanceSpot(fake.client(), "key", "secret", base_url=TESTNET_URL, clock=args[3])
+
+    monkeypatch.setattr(runner, "make_spot", spot)
+    monkeypatch.setattr(runner, "other_books_cash", lambda config: (0.0, []))  # not config/'s
+    config = LiveConfig(
+        mode="testnet",
+        initial_cash=1000.0,
+        strategies=paper.strategies,
+        ledger=tmp_path / "testnet.sqlite",
+        guard=paper.guard,
+        backup_days=0,
+    )
+    settings = Settings(_env_file=None, binance_api_key="key", binance_api_secret="secret")  # type: ignore[call-arg]
+    source = tmp_path / "testnet.yaml"
+
+    async def scenario() -> int:
+        stop = asyncio.Event()
+        run = runner.run_live(config, settings, tmp_path / "data", stop=stop, source=source)
+        session = asyncio.create_task(run)
+        await until(lambda: bool(feeds) and any("started" in m for m in notifier.messages))
+        feeds[0].queue.put_nowait((KEY, breakout))
+        await until(lambda: fake.order_count("STOP_LOSS") > 0)
+        stop.set()
+        return await session
+
+    assert asyncio.run(scenario()) == 0
+    assert notifier.messages[0].startswith("[testnet] started")
+    assert any("BUY" in m and "BTCUSDT" in m for m in notifier.messages)
+    assert notifier.messages[-1].startswith("[testnet] stopped")
+    assert "their exchange stops stay" in notifier.messages[-1]
+    assert fake.balances["USDT"] < 1000.0  # the order reached the exchange
+    with Ledger(config.ledger) as ledger:
+        assert ledger.counts()["fills"] == 1
+    [entry] = registered_sessions(tmp_path / "data")  # `tbot halt` finds it by its config
+    assert (entry.ledger, entry.config) == (config.ledger.resolve(), source.resolve())
+
+
+def test_a_budget_changed_at_a_restart_is_booked_before_the_bar_it_hands_over(
+    tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, store, _ = setup_store(tmp_path)
+    close = H4.floor(datetime.now(UTC))
+    monkeypatch.setattr(  # what it missed comes from Binance as it would
+        "tbot.live.feed.fetch_klines", lambda client, *stream: store.read(*stream)
+    )
+    with Ledger(config.ledger) as ledger:  # it stopped after the event of the close before
+        ledger.set_meta(runner.BUDGET_META, repr(1000.0))
+        ledger.add_equity(EquityPoint(close - H4.delta, 1000.0, 1000.0, 0.0))
+        checkpoint = {"time": (close - H4.delta).isoformat(), "targets": [{}]}
+        checkpoint["strategies"] = runner.strategies_hash(config)
+        ledger.set_meta(runner.TARGETS_META, json.dumps(checkpoint))
+    monkeypatch.setattr(ServerClock, "now", lambda self: close + timedelta(minutes=5))
+    cut = config.model_copy(update={"initial_cash": 400.0})
+
+    async def scenario() -> int:
+        stop = asyncio.Event()
+        session = asyncio.create_task(
+            run_paper(cut, Settings(_env_file=None), tmp_path / "data", stop=stop)  # type: ignore[call-arg]
+        )
+        # The bar that closed while it was down is traded, not replayed.
+        await until(lambda: equity_rows(config.ledger) >= 2)
+        stop.set()
+        return await session
+
+    assert asyncio.run(scenario()) == 0
+    with Ledger(config.ledger) as ledger:
+        [moved] = ledger.adjustments()
+        first, handed = ledger.equity_points()
+    assert first.time < moved.time < handed.time  # the transfer is between the two
+    assert handed.equity == pytest.approx(400.0)
+    times, equity = [first.time, handed.time], [first.equity, handed.equity]
+    assert growth(times, equity, [(moved.time, moved.cash)], 1000.0) == [1.0, 1.0]
+
+
+def equity_rows(path: Path) -> int:
+    with Ledger(path) as ledger:
+        return ledger.equity_rows()
+
+
+def test_a_problem_of_the_feed_reaches_the_owner_and_the_ledger(
+    tmp_path: Path, offline: tuple[Collect, list[LiveFeed]]
+) -> None:
+    notifier, feeds = offline
+    config, _, _ = setup_store(tmp_path)
+    problem = "no market data socket for 15 min (cannot connect to stream.binance.com:9443)"
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        session = asyncio.create_task(
+            run_paper(config, Settings(_env_file=None), tmp_path / "data", stop=stop)  # type: ignore[call-arg]
+        )
+        await until(lambda: bool(feeds) and any("started" in m for m in notifier.messages))
+        assert feeds[0].on_alert is not None
+        feeds[0].on_alert(problem)
+        await until(lambda: f"[paper] {problem}" in notifier.messages)
+        stop.set()
+        await session
+
+    asyncio.run(scenario())
+    with Ledger(config.ledger) as ledger:
+        events = ledger.events_starting(f"[paper] {problem}")
+    assert [event.level for event in events] == ["warning"]

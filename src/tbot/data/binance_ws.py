@@ -12,7 +12,9 @@ import websockets
 from tbot.core.timeframe import Timeframe
 from tbot.data.schema import from_rows
 
-STREAM_URL = "wss://stream.binance.com:9443/stream"
+# Binance serves the market streams on both ports; 443 passes firewalls that block 9443.
+STREAM_URLS = ("wss://stream.binance.com:9443/stream", "wss://stream.binance.com:443/stream")
+STREAM_URL = STREAM_URLS[0]
 StreamKey = tuple[str, Timeframe]
 
 

@@ -2,7 +2,7 @@
 
 import argparse
 import asyncio
-import difflib
+import csv
 import getpass
 import hashlib
 import io
@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 import yaml
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from tbot import __version__
 from tbot.backtest.attribution import format_attribution, run_attribution
@@ -32,22 +32,26 @@ from tbot.backtest.metrics import compute_metrics
 from tbot.backtest.report import format_metrics
 from tbot.backtest.runner import data_ends, history_bars, run_backtest
 from tbot.core.config import TradingConfig, load_yaml, normalize_symbol
+from tbot.core.hints import validation_text
 from tbot.core.text import clock_text
 from tbot.core.timeframe import Timeframe
 from tbot.data.downloader import sync
 from tbot.data.http import describe_error, retry_after
 from tbot.data.quality import LONG_GAP, QualityReport, check_bars
-from tbot.data.store import BarStore
+from tbot.data.store import BarStore, StoreUnreadable
 from tbot.live.backup import backup_dir
 from tbot.live.clock import CLOSE_GRACE, ServerClock
 from tbot.live.commands import RANK_PAIRING, PollTurn, command_of
 from tbot.live.compare import compare_session, comparison_text
 from tbot.live.config import (
+    EnvUnreadable,
     LiveConfig,
     PaperConfig,
     SessionConfig,
     Settings,
+    env_problem,
     env_readers,
+    looks_like_session,
     named_ledger,
     save_settings,
 )
@@ -65,6 +69,7 @@ from tbot.live.runner import (
     account_text,
     halt_book,
     halt_path,
+    halt_targets,
     held_positions,
     instance_lock,
     is_running,
@@ -73,6 +78,7 @@ from tbot.live.runner import (
     resume,
     run_live,
     run_paper,
+    running_ledger,
     status_text,
     stop_path,
     supervised,
@@ -87,6 +93,7 @@ from tbot.research.trials import TrialLog, make_record
 from tbot.research.validate import ValidationConfig, load_validation_config, run_validation
 
 DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+READS_ENV = {"paper", "live", "doctor", "notify", "keys", "account", "support"}  # .env first
 # Exit codes: scripts/run_bot.ps1 starts the bot again after 1 and gives up on 3 and 4.
 EXIT_ERROR = 1  # a crash, a failed start, or an error worth retrying
 EXIT_LEDGER = 3  # the ledger cannot be used: another process has it, it is damaged, no SQLite
@@ -102,22 +109,10 @@ class NothingYet(Exception):
     """Nothing has run with a config yet: no ledger to read. Not a wrong config."""
 
 
-def known_keys() -> list[str]:
-    """Every setting name of tbot's config models, for "did you mean" hints."""
-    names: set[str] = set()
-    models: list[type[BaseModel]] = [BaseModel]
-    while models:
-        model = models.pop()
-        models.extend(model.__subclasses__())
-        if model.__module__.startswith("tbot."):
-            names.update(model.model_fields)
-    return sorted(names)
-
-
 def brief(exc: BaseException, prefix: str = "") -> str:
     """One line for an error a user can act on."""
     if isinstance(exc, ValidationError):
-        return "; ".join(_problem(error, prefix) for error in exc.errors())
+        return validation_text(exc, prefix)
     if isinstance(exc, UnicodeDecodeError):
         return f"a file is not UTF-8 text; save .env and configs as UTF-8 ({exc})"
     if isinstance(exc, httpx.HTTPStatusError):
@@ -126,19 +121,6 @@ def brief(exc: BaseException, prefix: str = "") -> str:
     if isinstance(exc, httpx.HTTPError):
         return f"network error: {exc!r}"
     return str(exc) or repr(exc)
-
-
-def _problem(error: Any, prefix: str) -> str:
-    where = prefix + ".".join(str(part) for part in error["loc"]) or "config"
-    if error["type"] == "extra_forbidden":
-        key = str(error["loc"][-1])
-        close = [k for k in difflib.get_close_matches(key, known_keys(), n=2) if k != key]
-        return f"{where}: unknown key" + (f" (did you mean {close[0]}?)" if close else "")
-    message = str(error["msg"])
-    limit = (error.get("ctx") or {}).get("lt", (error.get("ctx") or {}).get("le"))
-    if limit == 1:
-        message += " (a fraction: 0.45 means 45%)"
-    return f"{where}: {message}"
 
 
 DEFAULT_TIMEFRAMES = [Timeframe.H1, Timeframe.H4]
@@ -281,12 +263,14 @@ def live_command(name: str, config: SessionConfig | dict[str, Any]) -> str:
 
 
 def kind_of(raw: dict[str, Any]) -> str:
-    """validation, backtest, live (testnet too), or paper: what a config file is for."""
+    """validation, backtest, live (testnet too), or paper: what a config file is for.
+    `mode` makes it a session config whatever else it has (no backtest or validation config
+    takes it): a stray `start:` in one is an unknown key, not another kind of file."""
+    if "mode" in raw:
+        return "live"
     if "backtest" in raw or "grid" in raw:
         return "validation"
-    if "start" in raw:
-        return "backtest"
-    return "live" if "mode" in raw else "paper"
+    return "backtest" if "start" in raw else "paper"
 
 
 def read_yaml(path: Path) -> dict[str, Any]:
@@ -428,15 +412,21 @@ def running_configs() -> list[Path]:
     return [path for path, ledger in ledgers if ledger.is_file() and is_running(ledger)]
 
 
-def stop_ledger(path: Path) -> Path:
-    """The ledger a stop request goes next to; a config that no longer loads still names it."""
+def stop_ledger(path: Path, data_dir: Path = Path("data")) -> Path:
+    """The ledger a stop or halt request goes next to: that of a session running from this
+    config, whatever the file says now; else the one it names, which a session config that
+    no longer loads still does. A backtest or validation config names none."""
+    running = running_ledger(data_dir, path)
+    if running is not None:
+        return running
     try:
         return load_session_config(path).ledger
     except ConfigError:
-        named = named_ledger(read_yaml(path))
-        if named is not None:
-            return named
-        raise
+        raw = read_yaml(path)
+        named = named_ledger(raw) if looks_like_session(raw) else None
+        if named is None:
+            raise
+        return named
 
 
 def pick_config(command: str, *, live: bool = False) -> Path:
@@ -470,6 +460,25 @@ def which(command: str, paths: list[Path], what: str) -> str:
     names = ", ".join(path.stem for path in paths)
     example = paths[0].stem if paths else "<config>"
     return f"name the config ({what}: {names or 'none'}), for example: tbot {command} {example}"
+
+
+def which_running(command: str, paths: list[Path]) -> str:
+    """Several sessions run: the command for each, real money first."""
+
+    def real(path: Path) -> bool:
+        try:
+            return read_yaml(path).get("mode") == "live"
+        except ConfigError:
+            return False
+
+    lines = [f"{len(paths)} sessions run; name one:"]
+    for path in sorted(paths, key=lambda p: (not real(p), p.stem)):
+        lines.append(
+            f"  tbot {command} {short_name(path)}" + (" (real money)" if real(path) else "")
+        )
+    if command == "halt":
+        lines.append("  tbot halt --all (every one)")
+    return "\n".join(lines)
 
 
 CONFIG_HELP = "a config file, or a name from config/ such as donchian_voltarget"
@@ -584,12 +593,18 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument(
         "--out", default=None, help="a file or folder (default: backups/ by the ledger)"
     )
+    export = session("export", "write every trade and transfer of a session to a CSV file")
+    export.add_argument(
+        "--out", default=None, help="a file or folder (default: reports/<config>-trades.csv)"
+    )
+    export.add_argument("--year", type=int, default=None, help="only this year (UTC), e.g. 2026")
 
     halt = session(
         "halt",
         "the panic button: sell what the bot holds and stop its trading until `tbot resume`",
-        "the running one (a real-money session must be named)",
+        f"{ANY_SESSION} (a real-money session must be named)",
     )
+    halt.add_argument("--all", action="store_true", help="every session, as Telegram's /halt does")
     halt.add_argument(
         "--timeout", type=float, default=120.0, help="seconds to wait (default: %(default)s)"
     )
@@ -620,7 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
             nargs="+",
             type=parse_symbol,
             default=DEFAULT_SYMBOLS,
-            help="e.g. BTCUSDT ETH/USDT (default: %(default)s)",
+            help=f"e.g. BTCUSDT ETH/USDT (default: {' '.join(DEFAULT_SYMBOLS)})",
         )
         parser_.add_argument(
             "--timeframes",
@@ -661,6 +676,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.cpu_count() or 1,
         help="backtests run at once (default: the number of CPUs, %(default)s)",
     )
+    validate.add_argument(
+        "--holdout",
+        action="store_true",
+        help="evaluate the holdout even when the checks before it failed (every look weakens it)",
+    )
     return parser
 
 
@@ -686,7 +706,7 @@ def run_download(args: argparse.Namespace) -> int:
                     continue  # the other streams still download
                 print(
                     f"{symbol} {timeframe}: {result.total_bars} bars stored, "
-                    f"{fmt(result.first)} -> {fmt(result.last)}"
+                    f"opening {fmt(result.first)} -> {fmt(result.last)} UTC"
                 )
                 if result.dropped:
                     print(f"  dropped {result.dropped} misaligned bars")
@@ -697,7 +717,7 @@ def print_report(symbol: str, timeframe: Timeframe, report: QualityReport, store
     status = "OK" if report.ok else "FAIL"
     print(
         f"{symbol} {timeframe}: {status}, {report.bars} bars, "
-        f"{fmt(report.first)} -> {fmt(report.last)}"
+        f"opening {fmt(report.first)} -> {fmt(report.last)} UTC"
     )
     errors = {
         "duplicates": report.duplicates,
@@ -743,7 +763,12 @@ def run_check(args: argparse.Namespace) -> int:
     named = args.symbols is not DEFAULT_SYMBOLS or args.timeframes is not DEFAULT_TIMEFRAMES
     for symbol in args.symbols:
         for timeframe in args.timeframes:
-            bars = store.read(symbol, timeframe)
+            try:
+                bars = store.read(symbol, timeframe)
+            except StoreUnreadable as exc:  # one damaged file: say which, check the others
+                print(f"{symbol} {timeframe}: FAIL, {exc}")
+                failed = True
+                continue
             if bars.is_empty():
                 hint = store.download_hint([(symbol, timeframe)])
                 if named:  # asked for by name: missing is a failure
@@ -809,17 +834,21 @@ def print_notes(config: BacktestConfig, store: BarStore) -> None:
 
 def check_period(config: BacktestConfig, store: BarStore) -> None:
     """A period outside the stored bars would run on nothing; say what is stored."""
-    for key in history_bars(build_slots(config.strategies), config.risk):
+    keys = list(history_bars(build_slots(config.strategies), config.risk))
+    missing = [key for key in keys if store.last_open_time(*key) is None]
+    if missing:  # every one in one hint, not one download after another
+        named = ", ".join(f"{symbol} {timeframe}" for symbol, timeframe in missing)
+        raise ValueError(f"no stored bars for {named}; run {store.download_hint(missing)}")
+    for key in keys:
         first, last = store.first_open_time(*key), store.last_open_time(*key)
         if first is None or last is None:
-            continue  # the backtest names the missing stream
+            continue
         stored = f"{key[0]} {key[1]} is stored from {first:%Y-%m-%d} to {last:%Y-%m-%d}"
         if last + key[1].delta <= utc_day(config.start):
             hint = store.download_hint([key])
             raise ValueError(f"{stored}, before the period starts: run {hint}")
         if config.end is not None and utc_day(config.end) <= first:
             raise ValueError(f"{stored}, after the period ends: no download goes back further")
-    keys = list(history_bars(build_slots(config.strategies), config.risk))
     firsts = [first for key in keys if (first := store.first_open_time(*key)) is not None]
     begin = utc_day(config.start)
     span = (utc_day(config.end) if config.end else datetime.now(UTC)) - begin
@@ -951,6 +980,7 @@ def run_validate_command(args: argparse.Namespace) -> int:
         trial_log(args.data_dir),
         workers=args.workers,
         progress=lambda stage: print(f"... {stage}", flush=True),
+        force_holdout=args.holdout,
     )
     print(format_report(report))
     return 0 if report.passed else 1
@@ -967,7 +997,8 @@ def run_paper_command(args: argparse.Namespace) -> int:
     log_file = args.log_file or log_path(args.config)
     announce("paper", args.config, config, log_file)
     session_logging(log_file)
-    return asyncio.run(run_paper(config, settings, args.data_dir, name=short_name(args.config)))
+    name = short_name(args.config)
+    return asyncio.run(run_paper(config, settings, args.data_dir, name=name, source=args.config))
 
 
 def run_live_command(args: argparse.Namespace) -> int:
@@ -989,7 +1020,11 @@ def run_live_command(args: argparse.Namespace) -> int:
     announce(config.mode, args.config, config, log_file)
     session_logging(log_file)
     name = short_name(args.config)
-    return asyncio.run(run_live(config, settings, args.data_dir, confirmed=args.live, name=name))
+    return asyncio.run(
+        run_live(
+            config, settings, args.data_dir, confirmed=args.live, name=name, source=args.config
+        )
+    )
 
 
 QUOTES = ("FDUSD", "USDT", "USDC", "TUSD", "EUR", "TRY", "BTC", "ETH", "BNB")
@@ -1119,7 +1154,7 @@ def run_status_command(args: argparse.Namespace) -> int:
         print(overview_text(rows))
         return 0
     config = existing_ledger(load_session_config(args.config), args.config)
-    print(status_text(config, store))
+    print(status_text(config, store, short_name(args.config)))
     return 0
 
 
@@ -1187,7 +1222,7 @@ def run_stop_command(args: argparse.Namespace) -> int:
     if path is None:
         running = running_configs()
         if len(running) > 1:
-            raise ConfigError(which("stop", running, "running"))
+            raise ConfigError(which_running("stop", running))
         if running:
             path = picked(running[0])
         else:
@@ -1206,7 +1241,9 @@ def run_stop_command(args: argparse.Namespace) -> int:
         f"once (`tbot stop --cancel` withdraws it)"
     )
     if not is_running(ledger):
-        print(f"no session is running on {ledger}; {later}")
+        with Ledger(ledger) as book:
+            scheduled = book.get_meta(SUPERVISED_META) == "1"
+        print(f"no session is running on {ledger}" + (f"; {later}" if scheduled else ""))
         note = after_stop(path, ledger)
         if note:
             print(note)
@@ -1273,12 +1310,80 @@ def run_backup_command(args: argparse.Namespace) -> int:
     path = args.config or pick_config("backup")
     config = existing_ledger(load_session_config(path), path)
     name = f"{config.ledger.stem}-{datetime.now(UTC):%Y%m%d-%H%M%S}.sqlite"
-    out = output_file(args.out, backup_dir(config.ledger), name)  # a folder: a synced one
+    value = args.out
+    if value and not typed_path(value).suffix and not exists(typed_path(value)):
+        value += "/"  # a folder not made yet, such as a backup drive's
+    out = output_file(value, backup_dir(config.ledger), name)  # a folder: a synced one
     if exists(out):  # another backup, or a ledger: never written over
         raise ConfigError(f"{out} exists: name a new file, or a folder")
     with Ledger(config.ledger) as ledger:
         ledger.backup(out)
     print(f"wrote {out}")
+    return 0
+
+
+def run_export_command(args: argparse.Namespace) -> int:
+    """Every fill and transfer of a book, oldest first, for a spreadsheet or a tax return."""
+    path = args.config or pick_config("export")
+    config = existing_ledger(load_session_config(path), path)
+    out = output_file(args.out, Path("reports"), f"{short_name(path)}-trades.csv")
+    if out.suffix.lower() != ".csv":
+        raise ConfigError(f"{out}: the export is CSV; name a .csv file or a folder")
+    with Ledger(config.ledger) as ledger:
+        fills, adjustments = ledger.fills(), ledger.adjustments()
+    rows: list[tuple[datetime, list[object]]] = []
+    for fill in fills:
+        side = "BUY" if fill.quantity > 0 else "SELL"
+        value = abs(fill.quantity) * fill.price
+        rows.append(
+            (
+                fill.time,
+                ["trade", side, fill.symbol, abs(fill.quantity), fill.price, value, fill.fee, ""],
+            )
+        )
+    for adjustment in adjustments:  # deposits, withdrawals, budget changes, reconciliations
+        kind = "transfer" if adjustment.symbol == "" else "coins moved"
+        rows.append(
+            (
+                adjustment.time,
+                [
+                    kind,
+                    "",
+                    adjustment.symbol,
+                    adjustment.quantity,
+                    "",
+                    adjustment.cash,
+                    "",
+                    adjustment.note,
+                ],
+            )
+        )
+    rows.sort(key=lambda row: row[0])
+    if args.year is not None:
+        rows = [row for row in rows if row[0].year == args.year]
+    quote = quote_of(config)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                "time_utc",
+                "kind",
+                "side",
+                "symbol",
+                "quantity",
+                "price",
+                f"value ({quote})",
+                f"fee ({quote})",
+                "note",
+            ]
+        )
+        for moment, row in rows:
+            writer.writerow([moment.strftime("%Y-%m-%d %H:%M:%S"), *row])
+    trades = sum(row[1][0] == "trade" for row in rows)
+    print(f"wrote {out}: {trades} trades and {len(rows) - trades} transfers")
+    if isinstance(config, PaperConfig):
+        print("these are simulated paper trades, not trades on an exchange")
     return 0
 
 
@@ -1399,23 +1504,27 @@ def resume_note(config: SessionConfig) -> str:
 
 def run_halt_command(args: argparse.Namespace) -> int:
     """The panic button: the session sells what the bot holds and trades no more."""
+    if args.all:
+        if args.config is not None:
+            raise ConfigError("name a config or give --all, not both")
+        return halt_all(args.timeout)
     path = args.config
     if path is None:
         running = running_configs()  # a config edited into errors included
         if len(running) > 1:
-            raise ConfigError(which("halt", running, "running"))
+            raise ConfigError(which_running("halt", running))
         path = picked(running[0]) if running else pick_config("halt")
         if read_yaml(path).get("mode") == "live":
             raise ConfigError(
                 f"it trades real money: name it to sell and halt it: tbot halt {short_name(path)}"
             )
     name = short_name(path)
+    ledger_path = stop_ledger(path)  # a running session's, whatever its config says now
     config: SessionConfig | None = None
     try:
-        config = existing_ledger(load_session_config(path), path)
-        ledger_path = config.ledger
-    except ConfigError:  # edited while it runs: the request needs only the ledger
-        ledger_path = stop_ledger(path)
+        loaded = load_session_config(path).model_copy(update={"ledger": ledger_path})
+        config = existing_ledger(loaded, path)
+    except (ConfigError, NothingYet):  # edited while it runs: the request needs only the ledger
         if not (ledger_path.is_file() and is_running(ledger_path)):
             raise
     if config is not None:
@@ -1465,6 +1574,42 @@ def run_halt_command(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return EXIT_ERROR
+
+
+def halt_all(timeout: float) -> int:
+    """`tbot halt --all`: what Telegram's /halt does from the computer. Every running session
+    sells and halts; a stopped one a supervisor may start, or whose book holds coins, halts
+    at its next start."""
+    targets = halt_targets(None)
+    if not targets:
+        print("no session to halt: none runs, and no stopped book holds coins")
+        return 0
+    waiting: list[tuple[str, Path]] = []
+    missed = 0
+    for name, ledger, running in targets:  # every request first: they all sell at once
+        try:
+            halt_path(ledger).write_text("halt\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"{name}: NOT REACHED ({exc.strerror}): `tbot halt {name}`", file=sys.stderr)
+            missed += 1
+            continue
+        later = "" if running else " at its next start"
+        print(f"asked {name} to sell what the bot holds and halt{later}")
+        if running:
+            waiting.append((name, ledger))
+    deadline = monotonic() + timeout
+    while waiting and monotonic() < deadline:
+        sleep(1.0)
+        for name, ledger in list(waiting):
+            if not halt_path(ledger).exists():  # taken and done
+                waiting.remove((name, ledger))
+                print(f"{name}: halted (`tbot status {name}` shows what is left)")
+            elif not is_running(ledger):  # it ended first: the request waits for its start
+                waiting.remove((name, ledger))
+                print(f"{name}: stopped before it took the request; it halts at its next start")
+    for name, _ in waiting:
+        print(f"{name}: not done yet; `tbot log {name} -f` shows what it does", file=sys.stderr)
+    return EXIT_ERROR if waiting or missed else 0
 
 
 def held_list(positions: dict[str, float]) -> list[str]:
@@ -1583,7 +1728,10 @@ async def set_up_telegram(token: str, chat_id: str | None, new_token: bool, env:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in (401, 404):
                 print("Telegram does not know this token: copy it again from @BotFather")
-                if new_token or not interactive():
+                if new_token:
+                    print("nothing was saved")
+                    return EXIT_ERROR
+                if not interactive():
                     print(f"(it is TBOT_TELEGRAM_TOKEN in {env})")
                     return EXIT_ERROR
                 token = input("Paste the new token here, or press Enter to stop: ").strip()
@@ -1651,10 +1799,10 @@ async def pair_chat(bot: Telegram, name: str) -> str | None:
     print(f"Now send this code to @{name} in Telegram: {code} (waiting up to 2 minutes)")
     print(f"For alerts in a group, add the bot to it and send /{code}@{name} there.")
     deadline = monotonic() + CHAT_WAIT_SECONDS
-    shown = datetime.now(UTC).timestamp() - 60  # a minute of slack for this clock
     try:
         # Only what is sent from now on counts: a stranger cannot have sent this code
-        # before, but could have sent every code of a shorter kind.
+        # before, but could have sent every code of a shorter kind. No date is compared:
+        # this PC's clock may be off by minutes.
         backlog = await bot.updates(-1, 0)
         offset = int(backlog[-1]["update_id"]) + 1 if backlog else None
         while monotonic() < deadline:
@@ -1663,8 +1811,7 @@ async def pair_chat(bot: Telegram, name: str) -> str | None:
                 message = update.get("message") or {}
                 chat = message.get("chat") or {}
                 text = command_of(str(message.get("text") or "")).lstrip("/")
-                fresh = float(message.get("date") or 0) >= shown
-                if "id" in chat and fresh and text == code:
+                if "id" in chat and text == code:
                     title = chat.get("title") or chat.get("first_name") or chat.get("username")
                     print(f"found chat {chat['id']} {title or ''}".rstrip())
                     with suppress(httpx.HTTPError):  # done with: no session answers it again
@@ -1793,6 +1940,7 @@ COMMANDS = {
     "doctor": run_doctor_command,
     "stop": run_stop_command,
     "backup": run_backup_command,
+    "export": run_export_command,
     "support": run_support_command,
     "halt": run_halt_command,
     "resume": run_resume_command,
@@ -1819,6 +1967,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
     session = args.command in ("paper", "live")
+    problem = env_problem(Path(".env")) if args.command in READS_ENV else ""
+    if problem:  # pydantic would read the rest, or nothing, without a word
+        return _fail(f"error: {problem}", EXIT_CONFIG, alert=False)
     if isinstance(sys.stdout, io.TextIOWrapper):  # a name the console's code page lacks
         sys.stdout.reconfigure(errors="replace")
     if not session:
@@ -1835,6 +1986,8 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(f"error: {exc}", EXIT_CONFIG, alert=session)
     except UnicodeDecodeError as exc:  # .env or a config saved as UTF-16: fix the file
         return _fail(f"error: {brief(exc)}", EXIT_CONFIG, alert=False)
+    except EnvUnreadable as exc:  # retrying cannot fix it, and no alert can be read from it
+        return _fail(f"error: {exc}", EXIT_CONFIG, alert=False)
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return EXIT_ERROR
@@ -1864,7 +2017,8 @@ def run() -> int:
 
 
 def _fail(message: str, code: int, *, alert: bool, what: str = "cannot start") -> int:
-    print(message, file=sys.stderr)
+    with suppress(OSError):  # a full disk fails the console file too: the alert still goes
+        print(message, file=sys.stderr)
     if alert:  # a supervised bot that cannot start says so before the supervisor gives up
         _alert(f"tbot {what}: {message}")
     return code

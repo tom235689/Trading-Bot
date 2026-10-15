@@ -12,10 +12,10 @@ from tbot.live.runner import (
     DAY_REFERENCE,
     GUARD_META,
     base_cash,
+    held_positions,
     is_running,
     next_close,
     price_at,
-    restore_portfolio,
 )
 from tbot.risk.guard import GuardState
 
@@ -85,7 +85,7 @@ def _row(
     if earlier and earlier.equity > 0 and earlier.time >= point.time - DAY_REFERENCE:
         moved = sum(value for at, value in flows if at > earlier.time)
         day_change = (point.equity - moved) / earlier.equity - 1
-    positions = restore_portfolio(config, ledger).positions
+    positions = held_positions(config, ledger)  # dust a sale left is not held
     return SessionRow(
         name,
         state,

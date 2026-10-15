@@ -1,6 +1,7 @@
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import polars as pl
 import pydantic
 import pytest
 
@@ -76,6 +77,24 @@ def test_runs_trend_on_stored_bars(tmp_path: Path) -> None:
     assert trade["pnl"] > 0
     assert result.equity["time"][0] >= datetime(2024, 1, 5, tzinfo=UTC)
     assert result.equity["equity"][-1] > 1000
+
+
+def test_a_backtest_can_simulate_the_protective_stop(tmp_path: Path) -> None:
+    closes = [100.0] * 30
+    for step in [1.02] * 20 + [0.98] * 20:
+        closes.append(closes[-1] * step)
+    bars = price_bars(T0, H4, [closes[0], *closes[:-1]], closes)
+    wick = [c * 0.5 if i == 40 else c for i, c in enumerate(bars["low"])]  # mid-trend
+    store = BarStore(tmp_path / "data")
+    store.write("BTCUSDT", H4, bars.with_columns(pl.Series("low", wick)))
+
+    config = load_config(write_config(tmp_path, CONFIG + "protective_stop_pct: 0.2\n"))
+    assert BacktestConfig.model_validate_json(config.model_dump_json()) == config  # workers
+    stopped = run_backtest(config.with_period(config.start, None), store)  # as validation does
+    held = run_backtest(load_config(write_config(tmp_path)), store)
+    assert len(held.trades) == 1
+    assert len(stopped.trades) == 2  # sold at the stop, bought back at the next open
+    assert stopped.trades["exit_time"][0] == T0 + H4.delta * 41  # the wick bar's close
 
 
 def test_missing_data_raises(tmp_path: Path) -> None:

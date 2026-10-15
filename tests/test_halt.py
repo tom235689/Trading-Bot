@@ -33,13 +33,15 @@ from tbot.live.runner import (
     held_text,
     instance_lock,
     load_guard,
+    register_session,
     resume,
+    running_ledger,
     watch_halt_request,
 )
 from tbot.live.session import TradingSession
 from tbot.portfolio.allocation import StrategySlot
 from tbot.portfolio.portfolio import Portfolio
-from tbot.risk.guard import GuardConfig, GuardState, RiskGuard
+from tbot.risk.guard import Decision, GuardConfig, GuardState, Mode, RiskGuard
 
 H1 = Timeframe.H1
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -595,3 +597,148 @@ def test_a_live_halt_cancels_the_stop_before_it_sells(tmp_path: Path) -> None:
     assert stops == 0  # cancelled, so it locks nothing and never sells again
     assert fake.balances["BTC"] == pytest.approx(0.0)
     assert any("KILL SWITCH: halted by hand" in m for m in messages)
+
+
+def test_a_halt_reaches_sessions_whose_config_was_broken_or_moved_while_they_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    broken = tmp_path / "config" / "broken.yaml"
+    moved = tmp_path / "config" / "moved.yaml"
+    broken.write_text("ledger: broken.sqlite\nstrategies:\n\t- tab\n", "utf-8")  # not YAML now
+    moved.write_text(f"ledger: new.sqlite\nstrategies:\n{STRATEGY}", "utf-8")  # ran on old
+    data = tmp_path / "data"
+    for ledger, source in (("broken", broken), ("old", moved)):
+        Ledger(tmp_path / f"{ledger}.sqlite").close()
+        register_session(data, tmp_path / f"{ledger}.sqlite", source, source.stem)
+    with instance_lock(tmp_path / "broken.sqlite"), instance_lock(tmp_path / "old.sqlite"):
+        found = halt_targets(tmp_path / "own.sqlite", data)
+        assert running_ledger(data, moved) == (tmp_path / "old.sqlite").resolve()
+    assert sorted((name, running) for name, _, running in found) == [
+        ("broken", True),
+        ("moved", True),
+    ]
+
+
+def test_a_halt_reaches_a_stopped_book_that_holds_coins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    for name in ("holds", "empty", "dust"):
+        body = f"ledger: {name}.sqlite\nstrategies:\n{STRATEGY}"
+        (tmp_path / "config" / f"{name}.yaml").write_text(body, "utf-8")
+    with Ledger(tmp_path / "holds.sqlite") as book:  # started by hand, stopped holding BTC
+        book.add_fill(Fill(T0, "BTCUSDT", 0.5, 100.0, 0.0), 100.0)
+    with Ledger(tmp_path / "dust.sqlite") as book:
+        book.add_fill(Fill(T0, "BTCUSDT", 0.01, 100.0, 0.0), 100.0)  # 1.00: below any order
+    Ledger(tmp_path / "empty.sqlite").close()
+    found = halt_targets(tmp_path / "own.sqlite", tmp_path / "data")
+    assert [(name, running) for name, _, running in found] == [("holds", False)]
+
+
+def test_telegram_halt_names_a_session_it_could_not_reach(tmp_path: Path) -> None:
+    trader, ledger, _ = paper_trader(tmp_path)
+
+    async def halt(reason: str) -> list[Fill]:
+        return []
+
+    gone = tmp_path / "missing" / "eth.sqlite"  # its folder is gone: no request can go there
+    answer = command_answer(
+        trader.session,
+        ledger,
+        "paper",
+        lambda: at(1),
+        list,
+        None,
+        halt,
+        "paper",
+        lambda: [("eth", gone, True)],
+    )
+    code = asyncio.run(answer("/halt")).split("send /halt ")[1].split()[0]
+    reply = asyncio.run(answer(f"/halt {code}"))
+    assert reply.endswith("NOT REACHED: eth; on the computer: `tbot halt eth`")
+    assert "Also halting" not in reply
+    ledger.close()
+
+
+def test_a_sale_that_keeps_failing_is_told_once_an_hour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.live.runner.HALT_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr("tbot.live.runner.HALT_RETRY_MAX_SECONDS", 0.01)
+    prices = Prices()
+    trader, ledger, notifier = paper_trader(tmp_path, prices)
+    bar(trader, 0)
+    prices.down = True
+    asyncio.run(trader.halt_now(HALT_BY_HAND))
+
+    async def retries() -> None:
+        task = asyncio.create_task(halt_retry_loop(trader))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(retries())
+    failed = ledger.conn.execute("SELECT COUNT(*) FROM orders WHERE status = 'failed'")
+    assert failed.fetchone()[0] > 2  # tried again and again
+    told = [m for m in notifier.messages if "price lookup failed" in m]
+    assert len(told) == 1
+    assert told[0].endswith("(more failures of BTC this hour go to the log)")
+    ledger.close()
+
+
+def test_entries_a_daily_loss_limit_blocks_are_told_once_a_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trader, ledger, notifier = paper_trader(tmp_path)
+    blocked = Decision(Mode.REDUCE_ONLY, "day loss -5.0%")
+    monkeypatch.setattr(trader.guard, "check", lambda *args: blocked)
+    for index in (0, 1, 2, 3, 24):  # the strategy wants to buy at each of these closes
+        bar(trader, index)
+    told = [m for m in notifier.messages if "entries blocked" in m]
+    assert (
+        told
+        == [
+            "[paper] entries blocked: day loss -5.0%; more today are logged, not sent",
+        ]
+        * 2
+    )  # the first day, then the next
+    ledger.close()
+
+
+def test_tbot_halt_reaches_a_session_whose_config_now_names_another_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    config = tmp_path / "config" / "moved.yaml"
+    config.write_text(f"ledger: new.sqlite\nstrategies:\n{STRATEGY}", "utf-8")  # edited
+    old = tmp_path / "old.sqlite"
+    Ledger(old).close()
+    register_session(tmp_path / "data", old, config, "moved")  # it started on old.sqlite
+    held, done = threading.Event(), threading.Event()
+
+    def session() -> None:
+        with instance_lock(old):
+            held.set()
+            while not halt_path(old).exists():
+                if done.wait(0.05):
+                    return
+            with Ledger(old) as book:  # sold nothing, held nothing: halted
+                state = GuardState(halted=True, halt_reason=HALT_BY_HAND)
+                book.set_meta(GUARD_META, state.model_dump_json())
+            halt_path(old).unlink()
+            done.wait(5)
+
+    thread = threading.Thread(target=session)
+    thread.start()
+    try:
+        held.wait(5)
+        assert main(["halt", "moved", "--timeout", "10"]) == 0
+    finally:
+        done.set()
+        thread.join(5)
+    assert f"asked the session on {old.resolve()}" in capsys.readouterr().out
+    assert not (tmp_path / "new.sqlite").exists()

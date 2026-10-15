@@ -4,9 +4,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from binance_fake import FakeBinance, make_rows
+from binance_fake import FakeBinance, Row, make_rows
 from tbot.core.timeframe import Timeframe
-from tbot.data import binance_rest, downloader
+from tbot.data import binance_rest, binance_vision, downloader
 from tbot.data.downloader import iter_months, sync
 from tbot.data.store import BarStore
 
@@ -75,7 +75,8 @@ def test_misaligned_bars_are_dropped(tmp_path: Path) -> None:
         result = sync(store, client, "BTCUSDT", H1, JAN_1, datetime(2024, 2, 2, tzinfo=UTC))
 
     assert (result.archive_bars, result.dropped, result.total_bars) == (47, 1, 47)
-    assert datetime(2024, 1, 1, 10, tzinfo=UTC) not in store.read("BTCUSDT", H1)["open_time"]
+    stored = store.read("BTCUSDT", H1)["open_time"].to_list()  # `in` misses values of a ms Series
+    assert datetime(2024, 1, 1, 10, tzinfo=UTC) not in stored
 
 
 def test_start_filters_earlier_bars(tmp_path: Path) -> None:
@@ -287,3 +288,86 @@ def test_months_before_the_listing_cost_no_requests(tmp_path: Path) -> None:
         return len([url for url in fake.requests if not url.endswith(".zip")])
 
     assert rest_calls(datetime(2023, 6, 1, tzinfo=UTC), "early") == rest_calls(JAN_1, "listed")
+
+
+def test_a_damaged_year_file_is_set_aside_and_that_year_fetched_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.data.store.time.sleep", lambda seconds: None)
+    fake = FakeBinance("BTCUSDT", H4, LONG)
+    store = BarStore(tmp_path)
+    start = datetime(2023, 1, 1, tzinfo=UTC)
+    with fake.client() as client:
+        first = sync(store, client, "BTCUSDT", H4, start, LATER)
+        directory = store.directory("BTCUSDT", H4)
+        whole = (directory / "2024.parquet").read_bytes()
+        (directory / "2024.parquet").write_bytes(whole[: len(whole) // 2])  # in the middle
+        said: list[str] = []
+        result = sync(store, client, "BTCUSDT", H4, start, LATER, progress=said.append)
+    assert (result.total_bars, result.first) == (first.total_bars, start)
+    assert _gaps(store, H4) == 0
+    assert (directory / "2024.parquet.damaged").read_bytes() == whole[: len(whole) // 2]
+    assert store.years_to_refetch("BTCUSDT", H4) == []
+    assert any("renamed it 2024.parquet.damaged" in line for line in said)
+
+
+def test_a_year_set_aside_is_fetched_by_the_next_sync_if_this_one_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.data.store.time.sleep", lambda seconds: None)
+    fake = FakeBinance("BTCUSDT", H4, LONG)
+    store = BarStore(tmp_path)
+    start = datetime(2023, 1, 1, tzinfo=UTC)
+    with fake.client() as client:
+        first = sync(store, client, "BTCUSDT", H4, start, LATER)
+        (store.directory("BTCUSDT", H4) / "2024.parquet").write_bytes(b"PAR1garbagePAR1")
+        real = binance_vision.fetch_month
+
+        def down(*args: object) -> object:
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(downloader, "fetch_month", down)
+        with pytest.raises(httpx.ConnectError):
+            sync(store, client, "BTCUSDT", H4, start, LATER)
+        monkeypatch.setattr(downloader, "fetch_month", real)
+        # The stored range still runs from 2023 to 2025: only the mark says 2024 is missing.
+        result = sync(store, client, "BTCUSDT", H4, start, LATER)
+    assert result.total_bars == first.total_bars
+    assert _gaps(store, H4) == 0
+
+
+class OffGrid(FakeBinance):
+    """The archive moved the 10:00 bar to 10:28; REST serves it on the grid."""
+
+    def __init__(self, rows: list[Row]) -> None:
+        archived = [list(row) for row in rows]
+        archived[10][0] += 28 * 60 * 1000
+        super().__init__("BTCUSDT", H1, archived)
+        self.rest_rows = rows
+
+    def _klines(self, params: httpx.QueryParams) -> httpx.Response:
+        start, end = int(params["startTime"]), int(params["endTime"])
+        rows = [row for row in self.rest_rows if start <= row[0] <= end]
+        return httpx.Response(200, json=rows[: int(params["limit"])])
+
+
+def test_off_grid_archive_bars_are_filled_from_rest_on_the_grid(tmp_path: Path) -> None:
+    fake = OffGrid(make_rows(JAN_1, 31 * 24, H1))
+    store = BarStore(tmp_path)
+    said: list[str] = []
+    end = datetime(2024, 2, 1, tzinfo=UTC)
+    with fake.client() as client:
+        result = sync(store, client, "BTCUSDT", H1, JAN_1, end, progress=said.append)
+    assert (result.archive_bars, result.rest_bars, result.dropped) == (743, 1, 1)
+    assert result.total_bars == 31 * 24
+    assert datetime(2024, 1, 1, 10, tzinfo=UTC) in store.read("BTCUSDT", H1)["open_time"].to_list()
+    assert "743 bars from archives, 1 from REST where the archive has them off the grid" in said[0]
+
+
+def test_a_delisted_symbol_keeps_its_off_grid_month_without_rest(tmp_path: Path) -> None:
+    rows = make_rows(JAN_1, 31 * 24, H1)
+    rows[10][0] += 28 * 60 * 1000
+    fake = Delisted("BTCUSDT", H1, rows)
+    with fake.client() as client:
+        result = sync(BarStore(tmp_path), client, "BTCUSDT", H1, JAN_1, LATER)
+    assert (result.archive_bars, result.dropped) == (743, 1)

@@ -3,7 +3,8 @@
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, time
+from itertools import product
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -27,7 +28,9 @@ from tbot.backtest.metrics import (
     compute_metrics,
     daily_returns,
 )
+from tbot.backtest.runner import data_ends
 from tbot.core.config import load_yaml
+from tbot.data.store import BarStore
 from tbot.portfolio.allocation import build_slots
 from tbot.research.montecarlo import MonteCarloSummary, simulate
 from tbot.research.statistics import daily_sharpe, deflated_sharpe, expected_max_sharpe, moments
@@ -37,8 +40,8 @@ from tbot.research.sweep import (
     SweepRun,
     best_run,
     evaluate,
-    grid_points,
     in_order,
+    is_number,
     neighborhood_mean,
     rank_of,
     run_sweep,
@@ -79,6 +82,7 @@ class GateConfig(BaseModel):
     min_oos_sharpe: float = 0.8
     max_drawdown: float = Field(default=0.25, gt=0, lt=1)
     min_trades: int = Field(default=100, ge=1)
+    min_holdout_days: int = Field(default=180, ge=1)  # a few days' return confirms nothing
 
 
 class ValidationConfig(BaseModel):
@@ -140,9 +144,29 @@ def load_validation_config(path: Path) -> tuple[ValidationConfig, BacktestConfig
     empty = [name for name, values in config.grid.items() if not values]
     if empty:
         raise ValueError(f"grid: no values for {', '.join(empty)}")
-    for point in grid_points(config.grid):  # a typo in a grid key fails now, not mid-run
-        build_slots(base.with_params(point).strategies)
-    return config, base
+    grid = _typed_grid(base, config.grid)
+    for name, values in grid.items():
+        repeated = [value for i, value in enumerate(values) if value in values[:i]]
+        if repeated:
+            raise ValueError(f"grid: {name} lists {repeated[0]!r} twice")
+    return config.model_copy(update={"grid": grid}), base
+
+
+def _typed_grid(base: BacktestConfig, grid: Grid) -> dict[str, list[Any]]:
+    """The grid as the strategy reads it, built at every point (a typo in a grid key fails
+    now, not mid-run). A quoted number becomes a number: `exit: [10, "20"]` would mix
+    kinds, which the sweep's table cannot tell apart."""
+    names = list(grid)
+    typed = {name: list(values) for name, values in grid.items()}
+    for indexes in product(*(range(len(grid[name])) for name in names)):
+        point = {name: grid[name][i] for name, i in zip(names, indexes, strict=True)}
+        strategy = build_slots(base.with_params(point).strategies)[0].strategy
+        params = getattr(strategy, "params", None)  # the plugin's checked params, if any
+        for name, i in zip(names, indexes, strict=True):
+            value = getattr(params, name, point[name])
+            if isinstance(point[name], str) and is_number(value):
+                typed[name][i] = value
+    return {name: in_order(values) for name, values in typed.items()}
 
 
 @dataclass(frozen=True)
@@ -183,13 +207,13 @@ class ValidationReport:
     monte_carlo: MonteCarloSummary  # in-sample baseline
     monte_carlo_oos: MonteCarloSummary  # stitched walk-forward test segments
     deflated: DeflatedSharpe
-    holdout: Metrics
+    holdout: Metrics | None  # None when the checks before it failed: it was not looked at
     holdout_evaluations: int
     gate: list[GateCheck]
 
     @property
     def passed(self) -> bool:
-        return all(check.passed for check in self.gate)
+        return self.holdout is not None and all(check.passed for check in self.gate)
 
 
 def run_validation(
@@ -200,7 +224,10 @@ def run_validation(
     *,
     workers: int = 1,
     progress: Callable[[str], None] = lambda _: None,
+    force_holdout: bool = False,
 ) -> ValidationReport:
+    """Every step on the in-sample period, then the holdout, which only a run whose other
+    checks pass gets to see (every look weakens it), unless force_holdout."""
     strategy = base.strategies[0]
     in_sample = base.with_period(base.start, config.holdout_start)
     objective, min_trades = config.objective, config.min_trades
@@ -257,11 +284,14 @@ def run_validation(
     monte_carlo_oos = resample(walk.stitched)
     deflated = _deflated(daily_returns(baseline_result), log.selection_sharpes(baseline_record))
 
-    progress("holdout")
-    holdout_config = base.with_period(config.holdout_start, base.end)
-    _, holdout = evaluate(holdout_config, data_dir)
-    holdout_record = make_record(holdout_config, holdout, "holdout")
-    log.append([holdout_record])
+    gate = _gate(config, oos, stress, _holdout_days(config, base, data_dir))
+    holdout = None
+    if force_holdout or all(check.passed for check in gate):
+        progress("holdout")
+        holdout_config = base.with_period(config.holdout_start, base.end)
+        _, holdout = evaluate(holdout_config, data_dir)
+        log.append([make_record(holdout_config, holdout, "holdout")])
+        gate.append(GateCheck("holdout return", holdout.total_return, 0, holdout.total_return > 0))
 
     return ValidationReport(
         config=config,
@@ -277,9 +307,19 @@ def run_validation(
         monte_carlo_oos=monte_carlo_oos,
         deflated=deflated,
         holdout=holdout,
-        holdout_evaluations=log.holdout_looks(holdout_record, config.holdout_start),
-        gate=_gate(config, oos, stress, holdout),
+        holdout_evaluations=log.holdout_looks(baseline_record, config.holdout_start),
+        gate=gate,
     )
+
+
+def _holdout_days(config: ValidationConfig, base: BacktestConfig, data_dir: Path) -> float:
+    """Length of the holdout run, known before it runs: to the backtest's end, or to the
+    earliest last close of its streams."""
+    start = datetime.combine(config.holdout_start, time(), tzinfo=UTC)
+    ends = list(data_ends(base, BarStore(data_dir)).values())
+    if base.end is not None:
+        ends.append(datetime.combine(base.end, time(), tzinfo=UTC))
+    return max(0.0, (min(ends, default=start) - start).total_seconds() / 86400)
 
 
 def _plateau(
@@ -316,8 +356,9 @@ def _deflated(returns: npt.NDArray[np.float64], annual_sharpes: list[float]) -> 
 
 
 def _gate(
-    config: ValidationConfig, oos: Metrics, stress: Metrics, holdout: Metrics
+    config: ValidationConfig, oos: Metrics, stress: Metrics, holdout_days: float
 ) -> list[GateCheck]:
+    """The checks that need no look at the holdout."""
     gate = config.gate
     dd_limit = -gate.max_drawdown
     return [
@@ -339,5 +380,10 @@ def _gate(
             0,
             stress.total_return > 0,
         ),
-        GateCheck("holdout return", holdout.total_return, 0, holdout.total_return > 0),
+        GateCheck(
+            "holdout length",
+            holdout_days,
+            gate.min_holdout_days,
+            holdout_days >= gate.min_holdout_days,
+        ),
     ]

@@ -50,6 +50,7 @@ param(
     [string] $Config = "config\paper.yaml"
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $repo
 
@@ -57,7 +58,7 @@ function Step([string] $text) { Write-Output "== $text" }
 
 function Test-Signed([string] $exe) {
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return $false }
-    $signature = Get-AuthenticodeSignature $exe
+    $signature = Get-AuthenticodeSignature -LiteralPath $exe
     return $signature.Status -eq "Valid" -and
         $signature.SignerCertificate.Subject -match "O=Python Software Foundation"
 }
@@ -159,9 +160,10 @@ if (-not $busy -and $Python) {
     if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "no python.exe at $Python" }
     $wanted = Split-Path -Parent (Resolve-Path -LiteralPath $Python).Path
     $current = ""
-    if (Test-Path -LiteralPath ".venv\pyvenv.cfg") {
+    $venvConfig = Join-Path $repo ".venv\pyvenv.cfg"
+    if (Test-Path -LiteralPath $venvConfig) {
         # uv writes it in UTF-8: read as ANSI, a user name like C:\Users\<non-ASCII> never matches.
-        $line = Get-Content -LiteralPath ".venv\pyvenv.cfg" -Encoding UTF8 |
+        $line = Get-Content -LiteralPath $venvConfig -Encoding UTF8 |
             Where-Object { $_ -match "^home\s*=" } | Select-Object -First 1
         if ($line) { $current = ($line -split "=", 2)[1].Trim() }
     }
@@ -178,12 +180,13 @@ if ($busy) {
     Write-Output "skipped: .venv is in use"
 } else {
     Invoke-Checked $uv @("sync", "--frozen")
-    Invoke-Checked $uv @("run", "--frozen", "python", "-c", "import sqlite3, polars, pydantic_core, tbot")
+    $problem = Test-Packages $uv
+    if ($problem) { throw $problem }
 }
 Invoke-Checked $uv ($run + @("python", "-m", "tbot", "--version"))
 
 Step "git hooks"
-if (Test-Path -LiteralPath ".git") {
+if (Test-Path -LiteralPath (Join-Path $repo ".git")) {
     Invoke-Checked "git" @("config", "core.hooksPath", ".githooks")
     Write-Output "hooks from .githooks"
 } else {
@@ -198,13 +201,14 @@ if ($NoPath) {
 }
 
 Step ".env"
-if (Test-Path -LiteralPath ".env") {
+$envFile = Join-Path $repo ".env"
+if (Test-Path -LiteralPath $envFile) {
     Write-Output ".env exists: left as it is"
 } else {
-    Copy-Item -LiteralPath ".env.example" -Destination ".env"
+    Copy-Item -LiteralPath (Join-Path $repo ".env.example") -Destination $envFile
     # Only this account may read the keys it will hold, whatever the folder allows.
     $owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    & icacls ".env" /inheritance:r /grant:r "${owner}:F" | Out-Null
+    & icacls $envFile /inheritance:r /grant:r "${owner}:F" | Out-Null
     Write-Output "created .env from .env.example, readable by $owner only; tbot notify sets up Telegram alerts"
 }
 

@@ -5,6 +5,7 @@ import pytest
 
 from factories import Scripted, price_bars
 from tbot.backtest.engine import BacktestEngine, BacktestResult
+from tbot.backtest.metrics import compute_metrics
 from tbot.core.timeframe import Timeframe
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel
@@ -28,6 +29,7 @@ def run(
     bars: dict[tuple[str, Timeframe], pl.DataFrame],
     timeframe: Timeframe = H1,
     start: datetime = T0,
+    protective_stop_pct: float = 0.0,
 ) -> BacktestResult:
     engine = BacktestEngine(
         [StrategySlot(strategy, timeframe, 1.0)],
@@ -37,6 +39,7 @@ def run(
         costs=COSTS,
         risk=RiskLimits(),
         rules=RULES,
+        protective_stop_pct=protective_stop_pct,
     )
     return engine.run()
 
@@ -291,3 +294,63 @@ def test_a_halt_drops_orders_the_strategies_had_queued() -> None:
     result = engine.run()
     assert result.halted.startswith("2024-01-01 13:00")
     assert result.fills.filter(pl.col("symbol") == "ETH").is_empty()  # never bought
+
+
+def dip_bars(opens: list[float], closes: list[float], low: float) -> pl.DataFrame:
+    """Hourly bars whose third bar (2h to 3h) trades down to low."""
+    bars = price_bars(T0, H1, opens, closes)
+    lows = [low if i == 2 else value for i, value in enumerate(bars["low"])]
+    return bars.with_columns(pl.Series("low", lows))
+
+
+def hold_from_1h() -> Scripted:
+    return Scripted(["BTC"], {"script": {at(1): {"BTC": 0.5}}})
+
+
+def test_a_protective_stop_sells_at_its_level_when_the_low_touches_it() -> None:
+    # Bought 5 at the 1h open; the 2h bar dips to 79, under 80% of the 100 close before it.
+    bars = dip_bars([100, 100, 100, 95, 95], [100, 100, 95, 95, 95], low=79)
+    result = run(hold_from_1h(), {("BTC", H1): bars}, protective_stop_pct=0.2)
+
+    fills = result.fills.select("time", "quantity", "price", "fee").rows()
+    assert fills[:2] == [
+        (at(1), 5.0, pytest.approx(100.1), pytest.approx(0.5005)),
+        (at(3), -5.0, pytest.approx(80 * 0.999), pytest.approx(5 * 80 * 0.999 * 0.001)),
+    ]
+    # Still long by its signal, the strategy buys back at the next open.
+    assert fills[2][0] == at(3)
+    assert fills[2][1] > 0
+    assert fills[2][2] == pytest.approx(95 * 1.001)
+    [trade] = result.trades.rows(named=True)
+    assert trade["exit_time"] == at(3)
+    assert trade["pnl"] == pytest.approx(5 * 79.92 - 0.3996 - 5 * 100.1 - 0.5005)
+    metrics = compute_metrics(result)
+    assert metrics.trades == 1
+    assert metrics.fees == pytest.approx(sum(row[3] for row in fills))
+
+
+def test_a_gap_through_the_protective_stop_sells_at_the_open() -> None:
+    bars = dip_bars([100, 100, 70, 70, 70], [100, 100, 70, 70, 70], low=70)
+    result = run(hold_from_1h(), {("BTC", H1): bars}, protective_stop_pct=0.2)
+    sale = result.fills.row(1, named=True)
+    assert (sale["time"], sale["quantity"]) == (at(3), -5.0)
+    assert sale["price"] == pytest.approx(70 * 0.999)  # under the 80 stop: the open it gapped to
+
+
+def test_protective_stops_are_off_by_default() -> None:
+    bars = {("BTC", H1): dip_bars([100, 100, 100, 95, 95], [100, 100, 95, 95, 95], low=79)}
+    engine = BacktestEngine(
+        [StrategySlot(hold_from_1h(), H1, 1.0)],
+        bars,
+        start=T0,
+        initial_cash=1000.0,
+        costs=COSTS,
+        risk=RiskLimits(),
+        rules=RULES,
+    )
+    default = engine.run()
+    assert default.fills["time"].to_list() == [at(1)]  # held through the dip
+    for pct in (0.0, 0.25):  # off, or a stop the dip never reaches
+        other = run(hold_from_1h(), bars, protective_stop_pct=pct)
+        assert other.fills.equals(default.fills)
+        assert other.equity.equals(default.equity)

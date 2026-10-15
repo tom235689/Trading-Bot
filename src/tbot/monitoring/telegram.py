@@ -63,6 +63,34 @@ class Telegram:
         )
         response.raise_for_status()
 
+    async def typing(self) -> None:
+        """Show "typing" in the chat for a moment, posting nothing: it fails (403) where an
+        alert would, as for a bot the owner blocked, which getChat does not tell. Raises
+        httpx errors; never log their URL."""
+        payload = {"chat_id": self.chat_id, "action": "typing"}
+        response = await self.client.post(f"{self.base}/sendChatAction", json=payload, timeout=15.0)
+        response.raise_for_status()
+
+    async def probe(self) -> bool:
+        """Whether alerts get through again after a refusal; clears it when they do."""
+        try:
+            await self.typing()
+        except httpx.HTTPError as exc:
+            log.info("telegram_still_refused", error=describe_error(exc))
+            return False
+        if self.refused:
+            log.warning("telegram_takes_alerts_again")
+        self.refused = ""
+        return True
+
+    def refuse(self, problem: str) -> None:
+        """Note that Telegram refuses this bot for good (until the owner fixes it)."""
+        if not self.refused:
+            log.error("telegram_refused", error=problem, hint="`tbot notify` tests it")
+            if self.on_refused is not None:
+                self.on_refused(problem)
+        self.refused = problem
+
     async def updates(self, offset: int | None, timeout: int) -> list[dict[str, Any]]:
         """Messages sent to the bot (long poll). Raises httpx errors; never log their URL."""
         params: dict[str, Any] = {"timeout": timeout, "allowed_updates": '["message"]'}
@@ -106,12 +134,7 @@ class Telegram:
             return False, _retry_after(response)
         if response.status_code >= 500:
             return False, 0.0
-        problem = f"HTTP {response.status_code}: {response.text[:120]}"  # a wrong chat id
-        if not self.refused:
-            log.error("telegram_refused", error=problem, hint="`tbot notify` tests it")
-            if self.on_refused is not None:
-                self.on_refused(problem)
-        self.refused = problem
+        self.refuse(f"HTTP {response.status_code}: {response.text[:120]}")  # a wrong chat id
         return False, None
 
 
@@ -121,6 +144,11 @@ class QueuedNotifier:
     def __init__(self, inner: Notifier) -> None:
         self.inner = inner
         self.queue: asyncio.Queue[tuple[str, float]] = asyncio.Queue()
+        self.current: float | None = None  # when the alert being sent now was queued
+
+    def undelivered(self) -> float:
+        """How long the oldest alert not sent yet has waited, in seconds; 0 when none."""
+        return time.monotonic() - self.current if self.current is not None else 0.0
 
     async def send(self, text: str) -> bool:
         self.queue.put_nowait((text, time.monotonic()))
@@ -129,11 +157,13 @@ class QueuedNotifier:
     async def run(self) -> None:
         while True:
             text, queued = await self.queue.get()
+            self.current = queued  # first in, first out: the oldest
             try:
                 await self._deliver(text, queued)
             except Exception as exc:  # a notifier must never stop the sender
                 log.warning("notify_failed", error=repr(exc))
             finally:
+                self.current = None
                 self.queue.task_done()
 
     async def _deliver(self, text: str, queued: float) -> None:

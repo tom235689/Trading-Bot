@@ -132,3 +132,17 @@ def test_one_session_that_cannot_be_read_does_not_hide_the_others(
     assert multiline.notes == ("config/old.yaml: not valid YAML: while parsing in line 3",)
     with instance_lock(config.ledger):
         assert broken_row("paper", "invalid", config.ledger).state == "running"
+
+
+def test_dust_a_sale_left_is_no_position(tmp_path: Path) -> None:
+    config = paper(tmp_path)
+    with Ledger(config.ledger) as ledger:
+        ledger.set_meta(BASE_META, "1000")
+        ledger.add_fill(Fill(T0, "BTCUSDT", 0.0100, 60_000.0, 0.6), reference_price=60_000.0)
+        # The sale rounds down to the lot step: 0.000009 BTC (0.55 USDT) stays behind.
+        sale = Fill(T0 + timedelta(hours=4), "BTCUSDT", -0.009991, 61_000.0, 0.61)
+        ledger.add_fill(sale, reference_price=61_000.0)
+        ledger.add_equity(EquityPoint(T0 + timedelta(hours=4), 1008.8, 1008.25, 0.0005))
+    row = session_row("paper", config, BarStore(tmp_path / "data"))
+    assert row.symbols == ()
+    assert overview_text([row]).splitlines()[1].endswith("none")

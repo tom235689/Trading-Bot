@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -19,20 +20,27 @@ from tbot.live.commands import HELP
 from tbot.live.config import LiveConfig, PaperConfig, Settings, load_paper_config
 from tbot.live.executor import PaperExecutor
 from tbot.live.history import BarHistory
-from tbot.live.ledger import Adjustment, EquityPoint, Ledger
+from tbot.live.ledger import Adjustment, EquityPoint, Ledger, config_hash
 from tbot.live.runner import (
     GUARD_META,
+    HASHED,
+    OPERATIONAL,
     AlreadyRunning,
     SessionTrader,
     StartRefused,
+    _check_config,
     adopt_resume,
+    awake,
     build_session,
     check_budget,
+    clock_note,
     command_answer,
+    disk_loop,
     instance_lock,
     load_checkpoint,
     load_guard,
     lookback_bars,
+    low_disk,
     make_notifier,
     restore_portfolio,
     resume,
@@ -623,3 +631,79 @@ def test_the_daily_change_leaves_out_money_put_in(tmp_path: Path) -> None:
     summary = summary_text(trader.session, ledger, later, "paper")
     assert "(+0.00% over 24h" in summary  # 1000 to 1500, all of it a deposit
     ledger.close()
+
+
+def test_a_budget_or_summary_change_is_no_change_of_the_trading_config(tmp_path: Path) -> None:
+    config = paper_config(tmp_path)
+    with Ledger(config.ledger) as ledger:
+        _check_config(config, ledger)
+        update = {"initial_cash": 5.0, "summary_hour_utc": 7, "heartbeat_seconds": 900}
+        _check_config(config.model_copy(update=update), ledger)
+        assert ledger.events_starting("config changed") == []
+        traded = config.model_copy(update={"rebalance": RebalanceRules(min_notional=20.0)})
+        _check_config(traded, ledger)
+        assert len(ledger.events_starting("config changed")) == 1
+
+
+def test_a_ledger_an_older_tbot_hashed_is_no_change(tmp_path: Path) -> None:
+    config = paper_config(tmp_path)
+    with Ledger(config.ledger) as ledger:
+        ledger.set_meta("config_hash", config_hash(config.model_dump_json(exclude=OPERATIONAL)))
+        _check_config(config, ledger)
+        assert ledger.events_starting("config changed") == []
+        assert ledger.get_meta("config_hash") == config_hash(config.model_dump_json(include=HASHED))
+
+
+def test_status_names_the_resume_of_its_own_config(tmp_path: Path) -> None:
+    trader, ledger, _ = make_trader(tmp_path, {}, FakePrices({"BTC": 100.0}))
+    trader.guard.halt("drawdown 50%")
+    trader.save_guard()
+    ledger.close()
+    status = status_text(paper_config(tmp_path), BarStore(tmp_path / "data"), "live")
+    assert "HALTED: drawdown 50% (run `tbot resume live`)" in status
+
+
+def test_a_drive_running_low_is_told_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    free = [10 * 1024**3]
+    monkeypatch.setattr(
+        "tbot.live.runner.shutil.disk_usage", lambda path: SimpleNamespace(free=free[0])
+    )
+    monkeypatch.setattr("tbot.live.runner.DISK_CHECK_SECONDS", 0.01)
+    assert low_disk([tmp_path]) == ""
+    free[0] = 1024**3
+    assert low_disk([tmp_path]) == f"1.0 GB free on the drive of {tmp_path.resolve()}"
+    notifier = Collect()
+
+    async def watch() -> None:
+        with Ledger(tmp_path / "paper.sqlite") as ledger:
+            task = asyncio.create_task(disk_loop([tmp_path], ledger, notifier, "paper"))
+            await asyncio.sleep(0.1)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(watch())
+    assert notifier.messages == [
+        f"[paper] LOW DISK: 1.0 GB free on the drive of {tmp_path.resolve()}; a full disk "
+        "stops the bot: make room"
+    ]
+
+
+def test_a_clock_far_off_is_named_in_the_summary() -> None:
+    assert clock_note(4.5) == []
+    assert clock_note(45.0) == [
+        "CLOCK: this PC's clock is 45 s behind the exchange's; trading corrects it, log "
+        "times do not: let the system set the time"
+    ]
+    assert "s ahead of the exchange's" in clock_note(-120.0)[0]
+
+
+def test_a_session_keeps_windows_awake_while_it_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+    kernel = SimpleNamespace(SetThreadExecutionState=calls.append)
+    monkeypatch.setattr(
+        "tbot.live.runner.ctypes", SimpleNamespace(windll=SimpleNamespace(kernel32=kernel))
+    )
+    monkeypatch.setattr("tbot.live.runner.sys.platform", "win32")
+    with awake():
+        assert calls == [0x80000001]  # continuous, system required
+    assert calls == [0x80000001, 0x80000000]  # sleep allowed again

@@ -48,7 +48,14 @@ def run_backtest(
 ) -> BacktestResult:
     """Backtest config's period; until, if earlier than its end, stops the run there."""
     ends = [end for end in (_utc(config.end) if config.end else None, until) if end is not None]
-    return run_period(config, store, _utc(config.start), min(ends, default=None), config.guard)
+    return run_period(
+        config,
+        store,
+        _utc(config.start),
+        min(ends, default=None),
+        config.guard,
+        protective_stop_pct=config.protective_stop_pct,
+    )
 
 
 def run_period(
@@ -57,6 +64,8 @@ def run_period(
     start: datetime,
     end: datetime | None,
     guard: GuardConfig | None = None,
+    *,
+    protective_stop_pct: float = 0.0,
 ) -> BacktestResult:
     """Trade config's settings from the first bar close at or after start to end, if given.
     Every stream stops at the earliest last close among them, so none is valued at a stale
@@ -66,10 +75,11 @@ def run_period(
     bars: dict[StreamKey, pl.DataFrame] = {}
     for (symbol, timeframe), needed in history_bars(slots, config.risk).items():
         frame = store.read(symbol, timeframe, start - timeframe.delta * needed * WARMUP_MARGIN, end)
-        if frame.is_empty():
-            hint = store.download_hint([(symbol, timeframe)])
-            raise ValueError(f"no stored bars for {symbol} {timeframe}; run {hint}")
         bars[(symbol, timeframe)] = frame
+    missing = [key for key, frame in bars.items() if frame.is_empty()]
+    if missing:  # every one in one hint, not one download after another
+        named = ", ".join(f"{symbol} {timeframe}" for symbol, timeframe in missing)
+        raise ValueError(f"no stored bars for {named}; run {store.download_hint(missing)}")
     common = min(_last_close(key, frame) for key, frame in bars.items())
     if end is not None:  # a bar opening before end may close after it
         common = min(common, end)
@@ -87,6 +97,7 @@ def run_period(
         risk=config.risk,
         rules=config.rebalance,
         guard=guard,
+        protective_stop_pct=protective_stop_pct,
     )
     return engine.run()
 

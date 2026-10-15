@@ -10,8 +10,8 @@ import asyncio
 import contextlib
 import hashlib
 import time
-from collections.abc import Callable, Coroutine
-from datetime import datetime
+from collections.abc import Awaitable, Callable, Coroutine
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
@@ -26,6 +26,8 @@ log = structlog.get_logger(__name__)
 POLL_SECONDS = 50  # long poll: Telegram holds the request until a message arrives
 RETRY_SECONDS = 60
 CONFLICT_SECONDS = 600  # another process polls this bot; look again later
+CONFLICT_ALERT_SECONDS = 86400.0  # the conflict alert goes once a day, not at each clash
+REFUSED = frozenset({401, 403, 404})  # a revoked or wrong token: alerts fail the same way
 TURN_DIR = Path("data")  # every tbot process of a clone runs in its repository
 TURN_SECONDS = 10.0  # how often a process waiting for its turn looks again
 WANT_FRESH = 60.0  # a request for the turn this old was left by a process that ended
@@ -44,12 +46,20 @@ HELP = (
 )
 
 Answer = Callable[[str], Coroutine[Any, Any, str]]  # the message's text -> the reply
+Reply = Callable[[str], Awaitable[object]]
 
 
 def command_of(text: str) -> str:
     """`/Status@my_bot extra` -> `/status`."""
     words = text.strip().split()
     return words[0].split("@")[0].lower() if words else ""
+
+
+def addressee(text: str) -> str:
+    """The bot a command names: `/halt@my_bot 1234` -> `my_bot`, else ""."""
+    words = text.strip().split()
+    head = words[0] if words else ""
+    return head.split("@", 1)[1].lower() if head.startswith("/") and "@" in head else ""
 
 
 class PollTurn:
@@ -107,7 +117,8 @@ class PollTurn:
             return False
         self.handle = handle
         if self.waiting_rank() == self.rank:
-            self.want.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):  # Windows: another process reads it now
+                self.want.unlink(missing_ok=True)
         return True
 
     def release(self) -> None:
@@ -124,9 +135,14 @@ async def command_loop(
     started: datetime,
     turn: PollTurn | None = None,
     label: str = "",
+    reply: Reply | None = None,
 ) -> None:
+    """Answer the owner's messages sent after `started` (the exchange's time: the PC clock
+    may be off); `reply` sends the answers (by default once, straight to Telegram)."""
     offset: int | None = None
     failing = False
+    conflict_said = -CONFLICT_ALERT_SECONDS
+    chat = Chat(telegram, answer, started, reply or telegram.send, label)
     try:
         while True:
             if turn is not None:
@@ -141,19 +157,22 @@ async def command_loop(
                 updates = await telegram.updates(offset, POLL_SECONDS)
                 for update in updates:
                     offset = int(update["update_id"]) + 1
-                    await _handle(telegram, answer, started, update)
+                    await chat.handle(update)
+                await chat.missed_halts()
             except Exception as exc:  # anything Telegram sends back must never end the session
-                conflict = (
-                    isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 409
-                )
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 0
+                conflict = status == 409
+                if status in REFUSED:  # the heartbeat says so; alerts fail the same way
+                    telegram.refuse(f"HTTP {status} when reading messages")
                 if not failing:
                     error = describe_error(exc) if isinstance(exc, httpx.HTTPError) else repr(exc)
                     hint = "another process polls this bot token" if conflict else "retrying"
                     log.warning("telegram_commands_failed", error=error, hint=hint)
-                    if conflict:  # outside this clone's turns: the owner must hear of it
-                        await telegram.send(
-                            f"[{label}] {CONFLICT_ALERT}" if label else CONFLICT_ALERT
-                        )
+                # Two programs on one bot clash again at every poll the other wins: the
+                # owner hears of it once a day, not at each clash.
+                if conflict and time.monotonic() - conflict_said >= CONFLICT_ALERT_SECONDS:
+                    conflict_said = time.monotonic()
+                    await telegram.send(f"[{label}] {CONFLICT_ALERT}" if label else CONFLICT_ALERT)
                 failing = True
                 if turn is not None and (conflict or turn.wanted()):
                     turn.release()  # nobody waits through this sleep for a turn not used
@@ -172,14 +191,57 @@ async def _confirm(telegram: Telegram, offset: int | None) -> None:
             await telegram.updates(offset, 0)
 
 
-async def _handle(telegram: Telegram, answer: Answer, started: datetime, update: object) -> None:
-    message = (update.get("message") if isinstance(update, dict) else None) or {}
-    chat = str((message.get("chat") or {}).get("id", ""))
-    if chat != telegram.chat_id or message.get("date", 0) < started.timestamp():
-        return  # someone else, or a message from before this session
-    try:
-        reply = await answer(str(message.get("text") or ""))
-    except Exception as exc:  # a question must never stop the session
-        log.exception("telegram_command_failed")
-        reply = f"could not answer: {exc!r}"
-    await telegram.send(reply)
+class Chat:
+    """The owner's messages to one session: answered when sent after it started; a /halt
+    sent while no session read the chat is told to be sent again, not obeyed."""
+
+    def __init__(
+        self, telegram: Telegram, answer: Answer, started: datetime, reply: Reply, label: str
+    ) -> None:
+        self.telegram = telegram
+        self.answer = answer
+        self.started = started
+        self.reply = reply
+        self.label = label
+        self.bot = ""  # this bot's username, to tell its commands in a group from others'
+        self.missed: list[datetime] = []  # /halt messages from before the start
+
+    async def handle(self, update: object) -> None:
+        message = (update.get("message") if isinstance(update, dict) else None) or {}
+        chat = message.get("chat") or {}
+        if str(chat.get("id", "")) != self.telegram.chat_id:
+            return  # someone else
+        text = str(message.get("text") or "")
+        group = chat.get("type", "private") != "private"
+        if group and not self.bot:  # asked once, when a group first writes
+            with contextlib.suppress(httpx.HTTPError, ValueError):
+                self.bot = (await self.telegram.me()).lower()
+        if group:
+            named = addressee(text)
+            if not text.startswith("/") or (named and self.bot and named != self.bot):
+                return  # talk in a group, or a command for another bot
+        if message.get("date", 0) < self.started.timestamp():
+            if command_of(text) == "/halt":  # obeying it now could surprise; say so
+                self.missed.append(datetime.fromtimestamp(message.get("date", 0), UTC))
+            return
+        try:
+            answer = await self.answer(text)
+        except Exception as exc:  # a question must never stop the session
+            log.exception("telegram_command_failed")
+            answer = f"could not answer: {exc!r}"
+        if group and self.bot:
+            answer = answer.replace("/halt ", f"/halt@{self.bot} ")  # sure to reach this bot
+        await self.reply(answer)
+
+    async def missed_halts(self) -> None:
+        """Tell of /halt messages that came while no session read the chat."""
+        if not self.missed:
+            return
+        last, count = max(self.missed), len(self.missed)
+        self.missed.clear()
+        what = "a /halt" if count == 1 else f"{count} /halt messages"
+        head = f"[{self.label}] " if self.label else ""
+        await self.reply(
+            f"{head}{what} (the last sent {last:%H:%M} UTC) came while no session read this "
+            "chat, at a restart: not carried out now; send /halt again to halt"
+        )

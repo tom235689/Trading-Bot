@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -19,6 +20,11 @@ DEFAULT_RULES: dict[str, dict[str, str]] = {
 }
 
 
+def assets(symbol: str, rules: dict[str, str]) -> tuple[str, str]:
+    """Base and quote: from the rules when given (ETHBTC), else a four-letter quote."""
+    return rules.get("base", symbol[:-4]), rules.get("quote", symbol[-4:])
+
+
 def symbol_info(symbol: str, rules: dict[str, str], status: str = "TRADING") -> dict[str, Any]:
     filters: list[dict[str, str]] = [
         {"filterType": "PRICE_FILTER", "tickSize": rules["tick"]},
@@ -27,11 +33,12 @@ def symbol_info(symbol: str, rules: dict[str, str], status: str = "TRADING") -> 
     ]
     if "marketMaxQty" in rules:
         filters.append({"filterType": "MARKET_LOT_SIZE", "maxQty": rules["marketMaxQty"]})
+    base, quote = assets(symbol, rules)
     return {
         "symbol": symbol,
         "status": status,
-        "baseAsset": symbol[:-4],
-        "quoteAsset": symbol[-4:],
+        "baseAsset": base,
+        "quoteAsset": quote,
         "filters": filters,
     }
 
@@ -57,10 +64,15 @@ class FakeSpot:
     delisted: set[str] = field(default_factory=set)  # every call naming one fails (-1121)
     lose_next_order_response: bool = False  # place the order, then fail the response
     error_after_next_order: httpx.Response | None = None  # place it, then answer this
+    archived: set[str] = field(default_factory=set)  # client ids Binance archived (-2026)
+    market_fraction: float = 1.0  # of a market order that executes; below 1 it ends EXPIRED
+    stop_max_qty: float = math.inf  # a larger stop is refused (-1013)
+    now: datetime | None = None  # when market orders execute; None: the real time
     next_id: int = 1000
     can_trade: bool = True
     telegram_token: str = "t"
     telegram_chat: str = "1"
+    telegram_blocked: bool = False  # the owner blocked the bot: getChat answers, sends fail
     restrictions: dict[str, bool] = field(
         default_factory=lambda: {
             "ipRestrict": True,
@@ -81,7 +93,7 @@ class FakeSpot:
         for order in self.orders:
             if order["symbol"] == symbol and order["type"] in STOPS and order["status"] == "NEW":
                 qty, price = float(order["origQty"]), float(order["stopPrice"])
-                base, quote = symbol[:-4], symbol[-4:]
+                base, quote = assets(symbol, self.rules[symbol])
                 self.locked[base] -= qty
                 self.balances[quote] = self.balances.get(quote, 0.0) + qty * price * (
                     1 - self.fee_rate
@@ -163,6 +175,8 @@ class FakeSpot:
                 return error
             return response
         if path == "/api/v3/order" and request.method == "GET":
+            if params.get("origClientOrderId") in self.archived:
+                return _error(400, -2026, "Order was canceled or expired with no executed qty")
             order = self._find(params.get("origClientOrderId"))
             if order is None:
                 return _error(400, -2013, "Order does not exist.")
@@ -194,6 +208,9 @@ class FakeSpot:
             return httpx.Response(401, json={"ok": False, "description": "Unauthorized"})
         if method == "getChat" and params.get("chat_id") != self.telegram_chat:
             return httpx.Response(400, json={"ok": False, "description": "chat not found"})
+        if method in ("sendChatAction", "sendMessage") and self.telegram_blocked:
+            blocked = {"ok": False, "description": "Forbidden: bot was blocked by the user"}
+            return httpx.Response(403, json=blocked)
         return httpx.Response(200, json={"ok": True, "result": {"username": "tbot_bot"}})
 
     def _check_signature(
@@ -222,24 +239,26 @@ class FakeSpot:
         ]
 
     def _find(self, client_order_id: str | None) -> dict[str, Any] | None:
-        return next((o for o in self.orders if o["clientOrderId"] == client_order_id), None)
+        found = [o for o in self.orders if o["clientOrderId"] == client_order_id]
+        return found[-1] if found else None
 
     def _open(self, symbol: str) -> list[dict[str, Any]]:
         return [o for o in self.orders if o["symbol"] == symbol and o["status"] == "NEW"]
 
     def _cancel(self, order: dict[str, Any]) -> None:
         order["status"] = "CANCELED"
-        base = order["symbol"][:-4]
+        base, _ = assets(order["symbol"], self.rules[order["symbol"]])
         self.locked[base] -= float(order["origQty"])
         self.balances[base] = self.balances.get(base, 0.0) + float(order["origQty"])
 
     def _place(self, params: dict[str, str]) -> httpx.Response:
         symbol, side, kind = params["symbol"], params["side"], params["type"]
-        if self._find(params.get("newClientOrderId")) is not None:
-            return _error(400, -2022, "Duplicate client order id.")
+        used = [o for o in self.orders if o["clientOrderId"] == params.get("newClientOrderId")]
+        if any(o["status"] != "FILLED" for o in used):  # an id comes back once filled
+            return _error(400, -2010, "Duplicate order sent.")
         rules = self.rules[symbol]
         qty = float(params["quantity"])
-        base, quote = symbol[:-4], symbol[-4:]
+        base, quote = assets(symbol, rules)
         price = self.prices[symbol] * (1 + self.spread if side == "BUY" else 1 - self.spread)
         if qty < float(rules["minQty"]) or qty * price < float(rules["minNotional"]):
             return _error(400, -1013, "Filter failure: NOTIONAL")
@@ -252,6 +271,8 @@ class FakeSpot:
         if kind in STOPS and side == "SELL" and float(params["stopPrice"]) >= price:
             return _error(400, -2010, "Stop price would trigger immediately.")
         if kind == "MARKET" and qty > float(rules.get("marketMaxQty", "inf")):
+            return _error(400, -1013, "Filter failure: MARKET_LOT_SIZE")
+        if kind in STOPS and qty > self.stop_max_qty:
             return _error(400, -1013, "Filter failure: MARKET_LOT_SIZE")
         order: dict[str, Any] = {
             "symbol": symbol,
@@ -277,6 +298,13 @@ class FakeSpot:
             return httpx.Response(200, json=order)
         if kind != "MARKET":
             return _error(400, -1116, "Invalid orderType.")
+        order["transactTime"] = int((self.now or datetime.now(UTC)).timestamp() * 1000)
+        if self.market_fraction < 1:  # too little in the book: the rest expires
+            order["status"] = "EXPIRED"
+            qty = math.floor(qty * self.market_fraction / step + 1e-9) * step
+            if qty <= 0:
+                self.orders.append(order)
+                return httpx.Response(200, json=order)
         notional = qty * price
         fee_value = notional * self.fee_rate
         if side == "BUY":
@@ -303,7 +331,7 @@ class FakeSpot:
             )
         self.balances[commission_asset] = self.balances.get(commission_asset, 0.0) - commission
         order.update(
-            status="FILLED",
+            status="FILLED" if self.market_fraction >= 1 else "EXPIRED",
             executedQty=f"{qty:.8f}",
             cummulativeQuoteQty=f"{notional:.8f}",
             fills=[

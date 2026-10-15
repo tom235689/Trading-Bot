@@ -586,3 +586,32 @@ def test_a_supervised_start_that_gives_up_keeps_trying_its_alert(
     sent.clear()
     _alert("tbot cannot start: a config error")
     assert len(sent) == 1  # by hand, the terminal shows it
+
+
+def test_the_cash_of_a_book_whose_config_has_a_typo_still_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "first.yaml").write_text(  # edited while it runs
+        "mode: testnet\ninitial_cahs: 800\nledger: first.sqlite\nstrategies:\n"
+        "  - {name: donchian_trend, symbols: [BTCUSDT, ETHUSDT], timeframe: 4h, allocation: 1}\n",
+        "utf-8",
+    )
+    with Ledger(tmp_path / "first.sqlite") as first:
+        first.set_meta(BUDGET_META, repr(800.0))
+        first.add_fill(Fill(datetime(2024, 1, 1, tzinfo=UTC), "BTCUSDT", 0.001, 100000.0, 0.1), 0)
+    config = live(tmp_path, "testnet", initial_cash=500, ledger=tmp_path / "second.sqlite")
+    spot = FakeSpot(balances={"USDT": 1000.0}, prices={})
+    with (
+        Ledger(config.ledger) as ledger,
+        pytest.raises(StartRefused, match=r"699\.90 of it the cash of first"),
+    ):
+        funds(config, spot, ledger)
+
+
+def test_a_real_money_start_refuses_a_bot_its_owner_blocked() -> None:
+    spot = FakeSpot(balances={}, prices={})
+    spot.telegram_blocked = True  # getChat still answers: only a send tells
+    with pytest.raises(StartRefused, match="cannot send to TBOT_TELEGRAM_CHAT_ID"):
+        telegram_check(spot)

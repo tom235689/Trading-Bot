@@ -15,9 +15,10 @@ from pydantic import ValidationError
 from tbot import __version__
 from tbot.backtest.runner import run_period
 from tbot.core.config import streams_of
+from tbot.core.hints import validation_text
 from tbot.core.timeframe import Timeframe
 from tbot.data.http import describe_error
-from tbot.data.store import BarStore
+from tbot.data.store import BarStore, StoreUnreadable
 from tbot.exchange.binance import (
     PRODUCTION_URL,
     TESTNET_URL,
@@ -25,7 +26,14 @@ from tbot.exchange.binance import (
     BinanceSpot,
 )
 from tbot.live.backup import daily_backups
-from tbot.live.config import ONE_QUOTE, LiveConfig, SessionConfig, Settings, env_readers
+from tbot.live.config import (
+    ONE_QUOTE,
+    LiveConfig,
+    SessionConfig,
+    Settings,
+    env_notes,
+    env_readers,
+)
 from tbot.live.ledger import Ledger, LedgerUnavailable
 from tbot.live.release import newest_release, update_note
 from tbot.live.runner import (
@@ -33,14 +41,18 @@ from tbot.live.runner import (
     KEYS_MISSING,
     AlreadyRunning,
     StartRefused,
+    budget_change,
     halt_path,
     instance_lock,
     key_hint,
+    leftovers,
     load_guard,
+    low_disk,
     make_spot,
     mode_problem,
     needless_rights,
     other_books_cash,
+    quote_problem,
     restore_portfolio,
     stop_path,
     symbols_of,
@@ -81,16 +93,9 @@ async def run_checks(
     checks = strategy_checks(config) + ledger_checks(config) + alert_checks(settings, real_money)
     if isinstance(config, LiveConfig) and settings.api_keys(config.mode) is None:
         checks.append(Check("fail", "api key", KEYS_MISSING))
-    synced = synced_folder(Path.cwd())
-    if synced:
-        checks.append(
-            Check(
-                "warn",
-                "folder",
-                f"the repository is in a folder {synced} syncs: it uploads .env with the keys, "
-                "and syncing a running ledger can damage it; move the repository out",
-            )
-        )
+    if store is not None:
+        checks.extend(start_checks(config, store))
+    checks.extend(folder_checks(config, store))
     env = Path(".env")
     readers = env_readers(env) if env.is_file() else []
     if readers:
@@ -102,6 +107,7 @@ async def run_checks(
                 "your account (README, Security)",
             )
         )
+    checks.extend(env_checks(env))
     if offline:  # a real-money start refuses a missing Telegram, offline or not
         anyway = STARTS_ANYWAY - {"telegram"} if real_money else STARTS_ANYWAY
         checks = [
@@ -149,7 +155,18 @@ async def run_checks(
     return checks
 
 
-SYNCED = ("OneDrive", "Dropbox", "Google Drive", "iCloudDrive", "iCloud Drive")
+# Folder names of cloud services: Google Drive for desktop streams "G:\My Drive" and
+# "G:\Shared drives", or mirrors "%USERPROFILE%\My Drive".
+SYNCED = {
+    "onedrive": "OneDrive",
+    "dropbox": "Dropbox",
+    "google drive": "Google Drive",
+    "my drive": "Google Drive",
+    "shared drives": "Google Drive",
+    "iclouddrive": "iCloud Drive",
+    "icloud drive": "iCloud Drive",
+}
+LOW_DISK_GB = 2.0
 
 
 def synced_folder(folder: Path) -> str:
@@ -162,11 +179,83 @@ def synced_folder(folder: Path) -> str:
         top = [part.lower() for part in Path(root).resolve().parts]
         if parts[: len(top)] == top:  # inside it, not a sibling such as OneDriveArchive
             return "OneDrive"
-    for name in SYNCED:
-        lower = name.lower()  # also "OneDrive - Company", "Dropbox (Personal)"
+    for lower, name in SYNCED.items():  # also "OneDrive - Company", "Dropbox (Personal)"
         if any(part == lower or part.startswith((f"{lower} - ", f"{lower} (")) for part in parts):
             return name
     return ""
+
+
+def folder_checks(config: SessionConfig, store: BarStore | None) -> list[Check]:
+    """Folders a cloud service syncs (the repository with .env, or the ledger), and a drive
+    running out of room."""
+    checks = []
+    synced = synced_folder(Path.cwd())
+    if synced:
+        checks.append(
+            Check(
+                "warn",
+                "folder",
+                f"the repository is in a folder {synced} syncs: it uploads .env with the keys, "
+                "and syncing a running ledger can damage it; move the repository out",
+            )
+        )
+    else:
+        synced = synced_folder(config.ledger.parent)
+        if synced:
+            checks.append(
+                Check(
+                    "warn",
+                    "folder",
+                    f"the ledger {config.ledger} is in a folder {synced} syncs, which can "
+                    "damage it while a session writes it: give the config a ledger outside it",
+                )
+            )
+    places = [config.ledger.parent] + ([store.base] if store is not None else [])
+    low = low_disk([place for place in places if place.exists()])
+    if low:
+        checks.append(Check("warn", "disk", f"{low}; a full disk stops the bot: make room"))
+    return checks
+
+
+def env_checks(env: Path) -> list[Check]:
+    """Lines of .env that set nothing (a misspelled name, another shell's syntax), and a
+    copy Notepad saved as .env.txt."""
+    checks = []
+    twin = env.with_name(env.name + ".txt")
+    if twin.is_file():
+        checks.append(
+            Check(
+                "warn",
+                "env",
+                f"{twin} is there: tbot reads only {env} (Notepad adds .txt; save it as "
+                '"All files")',
+            )
+        )
+    try:
+        text = env.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):  # missing, or said when it is read
+        return checks
+    checks.extend(
+        Check("warn", "env", f"{env} {note}") for note in env_notes(text, Settings.names())
+    )
+    return checks
+
+
+def start_checks(config: SessionConfig, store: BarStore) -> list[Check]:
+    """What refuses the next start of this book for good: coins of a pair the config no
+    longer trades, or a budget cut beyond the book's value."""
+    if not config.ledger.is_file():
+        return []
+    now = datetime.now(UTC)
+    try:
+        with Ledger(config.ledger) as ledger:
+            if mode_problem(config, ledger):
+                return []  # the ledger check says so
+            _, problem = leftovers(config, restore_portfolio(config, ledger), store, now)
+            _, _, budget = budget_change(config, ledger, store, now)
+    except LedgerUnavailable:
+        return []  # the ledger check says so
+    return [Check("fail", "book", text) for text in (problem, budget) if text]
 
 
 async def server_offset(public: BinanceSpot) -> float:
@@ -247,17 +336,32 @@ async def telegram_check(token: str, chat: str, client: httpx.AsyncClient) -> Ch
         )
     except httpx.HTTPError as exc:
         return Check("fail", "telegram", f"unreachable: {describe_error(exc)}")
+    try:
+        await bot.typing()  # getChat still answers for a bot the owner blocked
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code >= 500 or exc.response.status_code == 429:
+            return Check("fail", "telegram", f"unreachable: {describe_error(exc)}")
+        return Check(
+            "fail",
+            "telegram",
+            "the bot may not write to the chat: unblock it in Telegram (or add it to the group "
+            "again), then `tbot notify`",
+        )
+    except httpx.HTTPError as exc:
+        return Check("fail", "telegram", f"unreachable: {describe_error(exc)}")
     return Check("ok", "telegram", "Telegram knows the bot and the chat; `tbot notify` tests it")
 
 
 def strategy_checks(config: SessionConfig) -> list[Check]:
-    try:
-        slots = build_slots(config.strategies)
-    except ValidationError as exc:
-        details = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
-        return [Check("fail", "strategies", details)]
-    except ValueError as exc:
-        return [Check("fail", "strategies", str(exc))]
+    for index, strategy in enumerate(config.strategies):
+        try:
+            build_slots([strategy])
+        except ValidationError as exc:
+            where = f"strategies.{index}.params."
+            return [Check("fail", "strategies", f"{strategy.name}: {validation_text(exc, where)}")]
+        except ValueError as exc:
+            return [Check("fail", "strategies", str(exc))]
+    slots = build_slots(config.strategies)
     names = ", ".join(f"{s.strategy.name} {s.timeframe}" for s in slots)
     checks = [Check("ok", "strategies", names)]
     finest = min((s.timeframe for s in slots), key=lambda t: t.millis)
@@ -275,35 +379,44 @@ def strategy_checks(config: SessionConfig) -> list[Check]:
 
 def guard_check(config: SessionConfig, store: BarStore) -> Check:
     """Would the kill switch have stopped this config on the stored history?"""
+    try:
+        return _guard_check(config, store)
+    except StoreUnreadable as exc:  # a damaged file: named, and the report goes on
+        return Check("fail", "market data", str(exc))
+
+
+def _guard_check(config: SessionConfig, store: BarStore) -> Check:
     if not config.guard.max_drawdown:
-        return Check("warn", "kill switch", "off (guard.max_drawdown is 0)")
+        return Check("warn", "kill switch history", "off (guard.max_drawdown is 0)")
     firsts = [store.first_open_time(s, c.timeframe) for c in config.strategies for s in c.symbols]
     hint = store.download_hint(streams_of(config))
     if any(first is None for first in firsts):
-        return Check("warn", "kill switch", f"no stored history to test it on; run {hint}")
+        return Check("warn", "kill switch history", f"no stored history to test it on; run {hint}")
     start = max(f for f in firsts if f is not None) + timedelta(days=90)  # after the warmup
     lasts = [store.last_open_time(s, c.timeframe) for c in config.strategies for s in c.symbols]
     days = (min(last for last in lasts if last is not None) - start).days
     if days < MIN_GUARD_DAYS:
         return Check(
             "warn",
-            "kill switch",
+            "kill switch history",
             f"too little stored history to test it ({max(days, 0)} days after the warmup); "
             f"run {hint} for the full history",
         )
     try:
         result = run_period(config, store, start, None, config.guard)
     except ValueError as exc:
-        return Check("warn", "kill switch", f"could not test it on history: {exc}")
+        return Check("warn", "kill switch history", f"could not test it on history: {exc}")
     limit = f"{config.guard.max_drawdown:.0%}"
     if result.halted:
         return Check(
             "warn",
-            "kill switch",
+            "kill switch history",
             f"at {limit} it would have halted the backtest on {result.halted}; "
             "a strategy's normal drawdowns should stay inside it",
         )
-    return Check("ok", "kill switch", f"{limit} never tripped on history since {start:%Y-%m-%d}")
+    return Check(
+        "ok", "kill switch history", f"{limit} never tripped on history since {start:%Y-%m-%d}"
+    )
 
 
 async def heartbeat_check(url: str, client: httpx.AsyncClient) -> Check:
@@ -312,7 +425,11 @@ async def heartbeat_check(url: str, client: httpx.AsyncClient) -> Check:
         response.raise_for_status()
     except httpx.HTTPError as exc:  # the URL is a secret: anyone with it can ping
         return Check("fail", "heartbeat", f"ping failed: {describe_error(exc)}")
-    return Check("ok", "heartbeat", f"ping answered {response.status_code}")
+    return Check(
+        "ok",
+        "heartbeat",
+        f"ping answered {response.status_code} (the monitor counts it as the bot alive)",
+    )
 
 
 def backup_check(config: SessionConfig) -> Check:
@@ -438,6 +555,9 @@ async def symbol_checks(config: SessionConfig, spot: BinanceSpot) -> list[Check]
     quotes = sorted({rule.quote for rule in rules.values()})
     if len(quotes) > 1:
         return [Check("fail", "symbols", f"quoted in {', '.join(quotes)}: {ONE_QUOTE}")]
+    problem = quote_problem(config, rules)
+    if problem:  # a testnet or live start refuses it; paper trades nothing
+        return [Check("fail" if isinstance(config, LiveConfig) else "warn", "symbols", problem)]
     paused = [f"{s} {spot.status[s]}" for s in sorted(rules) if not spot.trading(s)]
     if paused:
         return [

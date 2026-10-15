@@ -1,16 +1,21 @@
 """Plain-text validation report."""
 
 from tbot.backtest.metrics import Metrics
+from tbot.backtest.report import MIN_RATIO_DAYS
 from tbot.research.montecarlo import MonteCarloSummary
 from tbot.research.sweep import sweep_table
-from tbot.research.validate import ValidationReport
+from tbot.research.validate import GateCheck, ValidationReport
 
 TOP_ROWS = 10
+MANY_LOOKS = 3  # a holdout seen more often than this is warned about
 
 
 def _line(label: str, m: Metrics) -> str:
+    short = m.years * 365.25 < MIN_RATIO_DAYS  # annualized ratios say nothing, as in backtest
+    cagr = f"{'n/a':>7}" if short else f"{m.cagr:7.1%}"
+    sharpe = f"{'n/a':>5}" if short else f"{m.sharpe:5.2f}"
     return (
-        f"{label:<14}CAGR {m.cagr:7.1%}  Sharpe {m.sharpe:5.2f}  MaxDD {m.max_drawdown:7.1%}  "
+        f"{label:<14}CAGR {cagr}  Sharpe {sharpe}  MaxDD {m.max_drawdown:7.1%}  "
         f"Return {m.total_return:+8.1%}  Trades {m.trades:4d}"
     )
 
@@ -58,6 +63,9 @@ def format_report(r: ValidationReport) -> str:
             f"return {m.total_return:+7.1%}  trades {m.trades}"
         )
     lines.append("   " + _line("stitched OOS", r.oos))
+    lines.append(
+        "   (segments start flat: what one holds at its end counts at the last close, unsold)"
+    )
     lines.append("")
 
     mc = r.monte_carlo
@@ -71,26 +79,55 @@ def format_report(r: ValidationReport) -> str:
             f"Sharpe {r.deflated.expected_max_sharpe:.2f}; P(true Sharpe > 0) = "
             f"{r.deflated.probability:.1%}",
             "",
-            f"7. Holdout (baseline params), seen {r.holdout_evaluations} time(s) so far, "
-            "counting every backtest over it",
-            "   " + _line("", r.holdout),
+            *_holdout_lines(r),
             "",
             "8. Gate",
         ]
     )
     for check in r.gate:
-        status = "PASS" if check.passed else "FAIL"
-        if "return" in check.name or "drawdown" in check.name:  # fractions, shown as percent
-            values = f"{check.value:+.1%} vs {check.threshold:+.1%}"
-        else:
-            values = f"{check.value:.3g} vs {check.threshold:.3g}"
-        lines.append(f"   {status}  {check.name}: {values}")
-    lines.append(
-        "   PASSED: it held up out of sample; paper trade it before real money"
-        if r.passed
-        else "   FAILED: it did not hold up out of sample; do not trade it with money you need"
-    )
+        lines.append(f"   {'PASS' if check.passed else 'FAIL'}  {check.name}: {_values(check)}")
+    if r.holdout is None:
+        lines.append("   SKIP  holdout return: not evaluated (see 7)")
+    failed = [check.name for check in r.gate if not check.passed]
+    if r.passed:
+        lines.append("   PASSED: it held up out of sample; paper trade it before real money")
+    elif failed == ["holdout length"]:
+        lines.append(
+            "   FAILED: the holdout is too short to confirm it; do not trade it with money you need"
+        )
+    else:
+        lines.append(
+            "   FAILED: it did not hold up out of sample; do not trade it with money you need"
+        )
     return "\n".join(lines)
+
+
+def _holdout_lines(r: ValidationReport) -> list[str]:
+    looks = r.holdout_evaluations
+    seen = f"seen {looks} time(s) so far, counting every backtest over it"
+    if r.holdout is None:
+        lines = [
+            "7. Holdout (baseline params): not evaluated, since the checks before it failed",
+            f"   It was {seen}; every look weakens it.",
+            "   `tbot validate <config> --holdout` evaluates it anyway.",
+        ]
+    else:
+        lines = [f"7. Holdout (baseline params), {seen}", "   " + _line("", r.holdout)]
+    if looks > MANY_LOOKS:
+        lines.append(
+            f"   Warning: {looks} looks; it is no longer unseen data, since what changed "
+            "after a look was fitted to it too"
+        )
+    return lines
+
+
+def _values(check: GateCheck) -> str:
+    if check.name == "holdout length":
+        short = "" if check.passed else ": too short"
+        return f"{int(check.value)} days vs {check.threshold:g}{short}"
+    if "return" in check.name or "drawdown" in check.name:  # fractions, shown as percent
+        return f"{check.value:+.1%} vs {check.threshold:+.1%}"
+    return f"{check.value:.3g} vs {check.threshold:.3g}"
 
 
 def _monte_carlo_lines(label: str, mc: MonteCarloSummary) -> list[str]:
@@ -110,10 +147,15 @@ def _grid_lines(r: ValidationReport) -> list[str]:
     objective = r.config.objective
     table = sweep_table(r.sweep_runs, objective)
     if len(grid) != 2:
-        rows = table.head(TOP_ROWS).select(*grid, objective, "max_drawdown", "trades").rows()
+        columns = [*grid, objective, "max_drawdown", "trades"]
+        rows = table.head(TOP_ROWS).select(*columns).rows()
+        cells = [columns] + [
+            [f"{v:.2f}" if isinstance(v, float) else str(v) for v in row] for row in rows
+        ]
+        widths = [max(len(row[i]) for row in cells) for i in range(len(columns))]
         return [
-            "   " + "  ".join(f"{v:.2f}" if isinstance(v, float) else str(v) for v in row)
-            for row in rows
+            "   " + "  ".join(cell.rjust(width) for cell, width in zip(row, widths, strict=True))
+            for row in cells
         ]
     (row_name, row_values), (col_name, col_values) = grid.items()
     lookup = {(row[row_name], row[col_name]): row[objective] for row in table.rows(named=True)}

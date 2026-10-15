@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from tbot.live.commands import command_loop, command_of
+from tbot.live.runner import heartbeat_problem
 from tbot.monitoring.heartbeat import heartbeat_loop
 from tbot.monitoring.telegram import LogNotifier, QueuedNotifier, Telegram
 
@@ -313,3 +314,166 @@ def test_a_second_reader_of_the_bot_is_told_once(monkeypatch: pytest.MonkeyPatch
     asyncio.run(run())
     assert len(sent) == 1  # once, not at every try
     assert sent[0].startswith("[live] Telegram commands paused: another program reads this bot")
+
+
+def test_two_readers_that_take_turns_winning_are_told_once_a_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("tbot.live.commands.CONFLICT_SECONDS", 0.01)
+    sent: list[str] = []
+    polls: list[int] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getUpdates"):
+            polls.append(1)
+            if len(polls) % 2:  # the other program cut this poll short
+                return httpx.Response(409, json={"ok": False, "description": "Conflict"})
+            return httpx.Response(200, json={"ok": True, "result": []})
+        sent.append(json.loads(request.content)["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            started = datetime(2024, 1, 1, tzinfo=UTC)
+            task = asyncio.create_task(command_loop(Telegram("t", "42", client), echo, started))
+            async with asyncio.timeout(5):
+                while len(polls) < 8:
+                    await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert len(sent) == 1  # not after every poll the other program won
+
+
+def test_a_halt_sent_while_no_session_read_the_chat_is_told_not_obeyed() -> None:
+    started = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+    stamp = int(started.timestamp())
+    updates = [
+        {"update_id": 1, "message": {"chat": {"id": 42}, "date": stamp - 90, "text": "/halt"}},
+        {"update_id": 2, "message": {"chat": {"id": 42}, "date": stamp - 30, "text": "/halt 12"}},
+        {"update_id": 3, "message": {"chat": {"id": 42}, "date": stamp - 20, "text": "/fills"}},
+    ]
+    polls: list[int] = []
+    replies: list[str] = []
+    asked: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        polls.append(1)
+        if len(polls) > 1:
+            await asyncio.sleep(10)
+        return httpx.Response(200, json={"ok": True, "result": updates})
+
+    async def answer(text: str) -> str:
+        asked.append(text)
+        return text
+
+    async def reply(text: str) -> bool:
+        replies.append(text)
+        return True
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            telegram = Telegram("t", "42", client)
+            loop = command_loop(telegram, answer, started, label="live", reply=reply)
+            task = asyncio.create_task(loop)
+            async with asyncio.timeout(5):
+                while not replies:
+                    await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert asked == []  # nothing from before the start is carried out
+    assert replies == [
+        "[live] 2 /halt messages (the last sent 11:59 UTC) came while no session read this "
+        "chat, at a restart: not carried out now; send /halt again to halt"
+    ]
+
+
+def test_in_a_group_only_commands_for_this_bot_are_answered() -> None:
+    started = datetime(2024, 1, 1, tzinfo=UTC)
+    stamp = int(started.timestamp()) + 9
+    group = {"id": 42, "type": "supergroup"}
+    texts = ["good morning", "/status@other_bot", "/status@TBot_Bot", "/halt"]
+    updates = [
+        {"update_id": i, "message": {"chat": group, "date": stamp, "text": text}}
+        for i, text in enumerate(texts, 1)
+    ]
+    polls: list[int] = []
+    sent: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getMe"):
+            return httpx.Response(200, json={"ok": True, "result": {"username": "TBot_Bot"}})
+        if request.url.path.endswith("/getUpdates"):
+            polls.append(1)
+            if len(polls) > 1:
+                await asyncio.sleep(10)
+            return httpx.Response(200, json={"ok": True, "result": updates})
+        sent.append(json.loads(request.content)["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    async def answer(text: str) -> str:
+        return "send /halt 1234 to go on" if command_of(text) == "/halt" else text
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            task = asyncio.create_task(command_loop(Telegram("t", "42", client), answer, started))
+            async with asyncio.timeout(5):
+                while len(sent) < 2:
+                    await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert sent == ["/status@TBot_Bot", "send /halt@tbot_bot 1234 to go on"]
+
+
+def test_a_token_telegram_refuses_when_reading_stops_the_heartbeat() -> None:
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sendChatAction"):
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(401, json={"ok": False, "description": "Unauthorized"})
+
+    async def run() -> tuple[str, str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            telegram = Telegram("t", "42", client)
+            started = datetime(2024, 1, 1, tzinfo=UTC)
+            task = asyncio.create_task(command_loop(telegram, echo, started))
+            async with asyncio.timeout(5):
+                while not telegram.refused:
+                    await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            refused = telegram.refused
+            await telegram.probe()  # fixed meanwhile: alerts get through again
+            return refused, telegram.refused
+
+    refused, after = asyncio.run(run())
+    assert refused == "HTTP 401 when reading messages"
+    assert heartbeat_problem([], "", None, refused).startswith("Telegram refuses alerts")
+    assert after == ""
+
+
+def test_alerts_that_do_not_get_through_stop_the_heartbeat() -> None:
+    class Down:
+        async def deliver(self, text: str) -> float | None:
+            return 0.0  # no network: tried again
+
+        async def send(self, text: str) -> bool:
+            return False
+
+    async def run() -> float:
+        queued = QueuedNotifier(Down())
+        sender = asyncio.create_task(queued.run())
+        await queued.send("KILL SWITCH")
+        await asyncio.sleep(0.05)
+        waited = queued.undelivered()
+        sender.cancel()
+        await asyncio.gather(sender, return_exceptions=True)
+        return waited
+
+    assert asyncio.run(run()) > 0
+    assert heartbeat_problem([], "", None, "", 960.0) == "alerts not delivered for 16 minutes"
+    assert heartbeat_problem([], "", None, "", 60.0) == ""

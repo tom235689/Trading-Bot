@@ -4,7 +4,7 @@ from pathlib import Path
 
 from tbot.backtest.config import BacktestConfig
 from tbot.backtest.metrics import Metrics
-from tbot.research.trials import TrialLog, make_record
+from tbot.research.trials import TrialLog, make_record, setup_hash
 
 
 def metrics(sharpe: float) -> Metrics:
@@ -76,6 +76,28 @@ def test_every_run_over_the_holdout_is_a_look(tmp_path: Path) -> None:
     )
     like = log.read()[-1]
     assert log.holdout_looks(like, date(2025, 1, 1)) == 2
+
+
+def test_symbols_in_another_order_are_the_same_sample(tmp_path: Path) -> None:
+    log = TrialLog(tmp_path / "trials.jsonl")
+    both = CONFIG.strategies[0].model_copy(update={"symbols": ["ETHUSDT", "BTCUSDT"]})
+    listed = CONFIG.model_copy(update={"strategies": [both]})
+    record = make_record(listed, metrics(1.0), "sweep")
+    assert record.symbols == ["BTCUSDT", "ETHUSDT"]
+    # A line from before records were sorted keeps the order the config listed.
+    old = record.model_copy(update={"symbols": ["ETHUSDT", "BTCUSDT"], "sharpe": 0.5})
+    log.append([record, old, make_record(listed, metrics(0.7), "backtest")])
+    flipped = listed.model_copy(
+        update={"strategies": [both.model_copy(update={"symbols": ["BTCUSDT", "ETHUSDT"]})]}
+    )
+    like = make_record(flipped, metrics(1.0), "baseline")
+    assert sorted(log.selection_sharpes(like)) == [0.5, 0.7, 1.0]
+    assert log.holdout_looks(like, date(2024, 6, 1)) == 3
+
+
+def test_a_protective_stop_is_another_setup() -> None:
+    stopped = CONFIG.model_copy(update={"protective_stop_pct": 0.2})
+    assert setup_hash(stopped) != setup_hash(CONFIG)
 
 
 def test_log_lines_end_in_lf(tmp_path: Path) -> None:

@@ -2,7 +2,7 @@ import json
 from datetime import UTC, datetime
 
 from tbot.core.timeframe import Timeframe
-from tbot.data.binance_ws import parse_kline, stream_url
+from tbot.data.binance_ws import STREAM_URLS, parse_kline, stream_url
 
 MESSAGE = {
     "stream": "btcusdt@kline_4h",
@@ -51,3 +51,7 @@ def test_parse_ignores_other_messages() -> None:
 def test_stream_url() -> None:
     url = stream_url([("BTCUSDT", Timeframe.H1), ("ETHUSDT", Timeframe.H4)])
     assert url == "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1h/ethusdt@kline_4h"
+    # Binance serves the same streams on port 443, for networks that block 9443.
+    assert stream_url([("BTCUSDT", Timeframe.H1)], STREAM_URLS[1]) == (
+        "wss://stream.binance.com:443/stream?streams=btcusdt@kline_1h"
+    )

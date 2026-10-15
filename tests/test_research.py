@@ -61,7 +61,7 @@ grid: {entry: [5, 10], exit: [3, 5]}
 min_trades: 3
 walk_forward: {train_months: 2, test_months: 1}
 monte_carlo: {runs: 200, seed: 1}
-gate: {min_oos_sharpe: 0.5, max_drawdown: 0.3, min_trades: 5}
+gate: {min_oos_sharpe: 0.5, max_drawdown: 0.3, min_trades: 5, min_holdout_days: 30}
 """
 
 
@@ -231,8 +231,10 @@ def test_validation_end_to_end(tmp_path: Path, data_dir: Path) -> None:
     assert report.plateau.rank >= 1
     assert len(report.walk_forward.windows) == 2
     assert report.holdout_evaluations == 1
+    assert report.holdout is not None
     assert report.baseline.start < report.holdout.start
-    assert len(report.gate) == 5
+    assert [check.name for check in report.gate][-2:] == ["holdout length", "holdout return"]
+    assert report.passed  # the fixture's cycles are easy money: every check passes
     tags = [r.tag for r in log.read()]
     assert tags.count("baseline") == 1
     assert tags.count("sweep") == 4
@@ -253,6 +255,83 @@ def test_validation_end_to_end(tmp_path: Path, data_dir: Path) -> None:
     assert "beyond the 45% kill switch" in text
     holdout = next(line for line in text.splitlines() if "holdout return:" in line)
     assert holdout.endswith("% vs +0.0%")  # fractions shown as percent, as elsewhere
+    assert "PASS  holdout length: 61 days vs 30" in text
+    assert "(segments start flat:" in text  # what stitching does at a segment's end
+    assert "Warning" not in text  # one look so far
+
+
+def test_the_holdout_waits_for_the_checks_before_it(tmp_path: Path, data_dir: Path) -> None:
+    path = write_validation(tmp_path)
+    path.write_text(VALIDATION.replace("min_oos_sharpe: 0.5", "min_oos_sharpe: 99"), "utf-8")
+    config, base = load_validation_config(path)
+    log = TrialLog(tmp_path / "trials.jsonl")
+
+    report = run_validation(config, base, data_dir, log)
+    assert report.holdout is None
+    assert not report.passed
+    assert "holdout" not in [r.tag for r in log.read()]
+    text = format_report(report)
+    assert "7. Holdout (baseline params): not evaluated, since the checks before it" in text
+    assert "`tbot validate <config> --holdout` evaluates it anyway" in text
+    assert "SKIP  holdout return: not evaluated" in text
+
+    forced = run_validation(config, base, data_dir, log, force_holdout=True)
+    assert forced.holdout is not None
+    assert not forced.passed
+    assert [r.tag for r in log.read()].count("holdout") == 1
+    assert forced.holdout_evaluations == 1
+
+    log.append(log.read()[-1:] * 3)  # three more backtests over the holdout
+    again = run_validation(config, base, data_dir, log)
+    assert again.holdout_evaluations == 4
+    assert "Warning: 4 looks; it is no longer unseen data" in format_report(again)
+
+
+def test_a_short_holdout_cannot_pass(tmp_path: Path, data_dir: Path) -> None:
+    path = write_validation(tmp_path)
+    path.write_text(VALIDATION.replace("2024-05-01", "2024-06-10"), encoding="utf-8")
+    config, base = load_validation_config(path)
+    log = TrialLog(tmp_path / "trials.jsonl")
+
+    report = run_validation(config, base, data_dir, log)
+    assert report.holdout is None  # too short to decide anything: not worth a look
+    text = format_report(report)
+    assert "FAIL  holdout length: 21 days vs 30: too short" in text
+    assert "FAILED: the holdout is too short to confirm it" in text
+
+    forced = run_validation(config, base, data_dir, log, force_holdout=True)
+    assert forced.holdout is not None
+    assert forced.holdout.total_return > 0  # it would have passed on its return alone
+    assert not forced.passed
+    holdout = format_report(forced).split("7. Holdout")[1].splitlines()[1]
+    assert "CAGR     n/a  Sharpe   n/a" in holdout  # 21 days: no annualized ratios
+
+
+def test_quoted_grid_numbers_are_read_as_numbers(tmp_path: Path, data_dir: Path) -> None:
+    path = write_validation(tmp_path)
+    path.write_text(VALIDATION.replace("exit: [3, 5]", 'exit: ["5", 3]'), encoding="utf-8")
+    config, base = load_validation_config(path)
+    assert config.grid == {"entry": [5, 10], "exit": [3, 5]}
+    report = run_validation(config, base, data_dir, TrialLog(tmp_path / "trials.jsonl"))
+    assert "entry\\exit" in format_report(report)  # the table finds every cell
+
+    path.write_text(VALIDATION.replace("exit: [3, 5]", 'exit: [5, "5"]'), encoding="utf-8")
+    with pytest.raises(ValueError, match="grid: exit lists 5 twice"):
+        load_validation_config(path)
+    path.write_text(VALIDATION.replace("exit: [3, 5]", 'exit: [3, "five"]'), encoding="utf-8")
+    with pytest.raises(ValueError, match="exit"):
+        load_validation_config(path)
+
+
+def test_top_sweep_rows_name_their_columns(tmp_path: Path, data_dir: Path) -> None:
+    path = write_validation(tmp_path)
+    path.write_text(VALIDATION.replace(", exit: [3, 5]}", "}"), encoding="utf-8")
+    config, base = load_validation_config(path)
+    report = run_validation(config, base, data_dir, TrialLog(tmp_path / "trials.jsonl"))
+    lines = format_report(report).splitlines()
+    header = lines.index("   entry  sharpe  max_drawdown  trades")
+    assert lines[header + 1].split()[0] in ("5", "10")
+    assert len(lines[header + 1]) == len(lines[header])  # right-aligned under the names
 
 
 def test_validation_rejects_bad_holdout(tmp_path: Path) -> None:
@@ -271,6 +350,18 @@ def test_validate_command(
     assert code in (0, 1)
     assert "8. Gate" in out
     assert (data_dir / "trials.jsonl").exists()
+
+
+def test_validate_command_can_force_the_holdout(
+    tmp_path: Path, data_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = write_validation(tmp_path)
+    path.write_text(VALIDATION.replace("min_oos_sharpe: 0.5", "min_oos_sharpe: 99"), "utf-8")
+    command = ["validate", str(path), "--data-dir", str(data_dir), "--workers", "1"]
+    assert main(command) == 1
+    assert "7. Holdout (baseline params): not evaluated" in capsys.readouterr().out
+    assert main([*command, "--holdout"]) == 1
+    assert "7. Holdout (baseline params), seen 1 time(s)" in capsys.readouterr().out
 
 
 def test_windows_do_not_drift_after_short_months() -> None:

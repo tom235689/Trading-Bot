@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class RebalanceRules(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    min_notional: float = Field(default=10.0, ge=0)  # Binance spot minimum order value
+    min_notional: float = Field(default=10.0, ge=0, allow_inf_nan=False)  # in the quote asset
     rebalance_threshold: float = Field(default=0.02, ge=0, lt=1)  # skip smaller weight changes
 
 

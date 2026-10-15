@@ -250,7 +250,19 @@ def test_an_icon_is_not_read_as_utf16_text() -> None:
     icon = b"\x00\x00\x01\x00\x01\x00" + b"\x00\xac" + b"\x10\x00\x00\x00" * 40
     assert list(gg.scan_blob("app.ico", icon)) == []
     text = "x = 1\n".encode("utf-16-le")  # UTF-16 without a byte order mark is still read
-    assert gg.blob_text(text) == "x = 1\n"
+    assert "x = 1\n" in gg.blob_texts(text)
+
+
+def test_hangul_in_utf16_without_a_mark_is_found_when_it_also_reads_as_utf8() -> None:
+    # Without its NUL bytes this line is valid UTF-8 with no Hangul left in it.
+    word = chr(0xD55C) + chr(0xAE00)
+    data = f"note = {word}\r\n".encode("utf-16-le")
+    assert not gg.HANGUL.search(data.replace(b"\x00", b"").decode("utf-8"))
+    assert kinds(gg.scan_blob("out.txt", data)) == ["Hangul at column 8"]
+    # A stray NUL in UTF-8 is no UTF-16: read so, "x1" would be a Hangul letter.
+    stray = b"x1x1x1x1 = 12345\n\x00"
+    assert gg.HANGUL.search(stray.decode("utf-16-le"))
+    assert list(gg.scan_blob("notes.txt", stray)) == []
 
 
 def test_hangul_hidden_in_files_git_calls_binary_is_found() -> None:

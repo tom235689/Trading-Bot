@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import csv
 import io
 import json
 import logging
@@ -26,12 +27,14 @@ from tbot.cli import (
     EXIT_CONFIG,
     EXIT_ERROR,
     EXIT_LEDGER,
+    _fail,
     announce,
     build_parser,
     check_holdout,
     check_period,
     config_arg,
     config_names,
+    kind_of,
     load_session_config,
     main,
     not_running,
@@ -45,14 +48,18 @@ from tbot.cli import (
     write_dashboard,
 )
 from tbot.core.config import StrategyConfig, load_yaml
+from tbot.core.hints import known_keys
+from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.live.commands import PollTurn
-from tbot.live.config import Settings, save_settings
-from tbot.live.ledger import EquityPoint, Ledger
+from tbot.live.config import EnvUnreadable, LiveConfig, Settings, save_settings
+from tbot.live.ledger import Adjustment, EquityPoint, Ledger
 from tbot.live.runner import (
     GUARD_META,
     STOP_REQUEST_SECONDS,
+    SUPERVISED_META,
+    halt_path,
     instance_lock,
     stop_path,
     take_stop_request,
@@ -160,8 +167,11 @@ def test_errors_end_in_one_line(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert main(["backtest", "config/donchian_voltarget.yaml", "--data-dir", empty]) == EXIT_ERROR
     err = capsys.readouterr().err
     *progress, error = err.splitlines()
-    assert progress == ["running the backtest..."]
-    assert error.startswith("error: no stored bars for BTCUSDT 4h; run `tbot download --symbols")
+    assert progress == []  # found before it runs, every stream in one download
+    assert error.startswith(
+        "error: no stored bars for BTCUSDT 4h, ETHUSDT 4h; run `tbot download --symbols BTCUSDT "
+        "ETHUSDT --timeframes 4h"
+    )
     assert f'--data-dir "{empty}"`' in err  # the store it looked in
     assert "Traceback" not in err
 
@@ -192,7 +202,7 @@ def test_env_that_is_not_utf8_is_named(
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_bytes("TBOT_TELEGRAM_TOKEN=x\n".encode("utf-16"))
     assert main(["notify"]) == EXIT_CONFIG  # retrying cannot fix the file
-    assert "save .env and configs as UTF-8" in capsys.readouterr().err
+    assert ".env holds UTF-16 text" in capsys.readouterr().err
 
 
 def test_stop_asks_a_running_session(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -485,14 +495,14 @@ def test_notify_guides_a_first_setup_and_saves_it(
     no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # A stranger wrote to the bot before (the backlog, skipped), and sends text holding
-    # the code and an old message; only the chat that sends the code gets the alerts.
+    # the code; only the chat that sends the code gets the alerts, whatever this PC's
+    # clock says (three hours ahead here).
     telegram = FakeTelegram(
         monkeypatch,
         [
             [message(7, "Stranger", CODE)],
             [message(8, "Stranger", f"all codes {CODE} tb000001")],
-            [message(9, "Stranger", CODE, age=3600)],
-            [message(42, "Tom", f" {CODE} ")],
+            [message(42, "Tom", f" {CODE} ", age=3 * 3600)],
         ],
     )
     monkeypatch.setattr("builtins.input", lambda prompt="": "  123:abc  ")
@@ -621,12 +631,17 @@ def test_stop_reaches_a_supervisor_about_to_restart_the_only_session(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     write_configs(tmp_path)
-    Ledger(tmp_path / "testnet.sqlite").close()  # crashed; its supervisor waits
+    with Ledger(tmp_path / "testnet.sqlite") as ledger:  # crashed; its supervisor waits
+        ledger.set_meta(SUPERVISED_META, "1")
     assert main(["stop"]) == 0
     assert "no session is running on testnet.sqlite; a supervisor's restart" in (
         capsys.readouterr().out
     )
     assert stop_path(tmp_path / "testnet.sqlite").exists()
+    with Ledger(tmp_path / "testnet.sqlite") as ledger:  # started by hand: no supervisor
+        ledger.set_meta(SUPERVISED_META, "0")
+    assert main(["stop"]) == 0
+    assert capsys.readouterr().out.endswith("no session is running on testnet.sqlite\n")
 
 
 def test_resume_never_picks_a_real_money_session(
@@ -1343,3 +1358,211 @@ def test_testnet_keys_of_their_own_come_first_for_testnet() -> None:
 def test_settings_lose_the_spaces_a_quoted_value_keeps() -> None:
     settings = Settings(_env_file=None, binance_api_key="  key\t")  # type: ignore[call-arg]
     assert settings.binance_api_key == "key"
+
+
+def test_check_names_a_damaged_file_and_checks_the_other_streams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("tbot.data.store.time.sleep", lambda seconds: None)
+    store = BarStore(tmp_path)
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        store.write(
+            symbol, Timeframe.H4, make_bars(datetime(2024, 1, 1, tzinfo=UTC), 6, Timeframe.H4)
+        )
+    damaged = store.directory("BTCUSDT", Timeframe.H4) / "2024.parquet"
+    damaged.write_bytes(b"PAR1garbagePAR1")
+    argv = ["check", "--symbols", "BTCUSDT", "ETHUSDT", "--timeframes", "4h"]
+    assert main([*argv, "--data-dir", str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    assert f"BTCUSDT 4h: FAIL, {damaged} is damaged" in out
+    assert "sets it aside and fetches that year again" in out
+    assert "ETHUSDT 4h: OK, 6 bars" in out
+
+
+def test_halt_and_stop_refuse_a_config_that_is_no_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    (tmp_path / "data").mkdir()
+    Ledger(tmp_path / "data" / "paper.sqlite").close()  # the default ledger of paper
+    for command in ("halt", "stop"):
+        assert main([command, "trend"]) == EXIT_CONFIG
+        assert "is a backtest config" in capsys.readouterr().err
+    assert list((tmp_path / "data").glob("paper.sqlite.*")) == []  # no request for paper
+
+
+def test_a_session_config_with_a_stray_start_is_still_a_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert kind_of({"mode": "live", "start": "2026-10-15"}) == "live"
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    testnet = tmp_path / "config" / "testnet.yaml"
+    testnet.write_text(testnet.read_text("utf-8") + "start: 2026-10-15\n", "utf-8")
+    assert main(["status", "testnet"]) == EXIT_CONFIG
+    assert "start: unknown key" in capsys.readouterr().err  # not "is a backtest config"
+
+
+def test_an_env_with_utf16_lines_or_that_cannot_be_read_ends_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    env = tmp_path / ".env"
+    env.write_bytes(
+        b"TBOT_TELEGRAM_TOKEN=1:a\n" + "TBOT_TELEGRAM_CHAT_ID=42\r\n".encode("utf-16-le")
+    )
+    assert main(["doctor"]) == EXIT_CONFIG  # PowerShell's `>>`: the chat id would be lost
+    assert ".env holds UTF-16 text" in capsys.readouterr().err
+    env.unlink()
+    env.mkdir()  # stands in for a file this account may not read
+    assert main(["paper"]) == EXIT_CONFIG
+    assert "error: cannot read .env" in capsys.readouterr().err
+
+
+def test_a_failed_save_leaves_no_copy_of_the_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = tmp_path / ".env"
+    env.write_text("TBOT_BINANCE_API_KEY=old\n", "utf-8")
+
+    def refuse(source: Path, target: Path) -> None:
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr("tbot.live.config.replace_keeping_access", refuse)
+    with pytest.raises(EnvUnreadable, match=r"cannot save .*\.env \(Access is denied\); if it"):
+        save_settings(env, {"TBOT_BINANCE_API_SECRET": "s" * 64})
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".env"]
+
+
+def test_a_tolerance_typed_as_a_percent_is_refused(tmp_path: Path) -> None:
+    raw = {
+        "mode": "testnet",
+        "strategies": [{"name": "x", "symbols": ["BTCUSDT"], "timeframe": "4h", "allocation": 1.0}],
+        "ledger": str(tmp_path / "t.sqlite"),
+    }
+    with pytest.raises(ValidationError, match=r"at most 0\.05: a fraction \(0\.002 means 0\.2%\)"):
+        LiveConfig.model_validate({**raw, "reconcile_tolerance": 0.2})
+    with pytest.raises(ValidationError):
+        LiveConfig.model_validate({**raw, "batch_wait_seconds": float("inf")})
+    assert "telegram_chat_id" not in known_keys()  # a .env setting, no config key
+
+
+def test_halt_all_asks_every_session_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    (tmp_path / "config" / "live.yaml").write_text(
+        f"mode: live\ninitial_cash: 500\nledger: live.sqlite\nstrategies:\n{STRATEGY}", "utf-8"
+    )
+    ledgers = [tmp_path / f"{name}.sqlite" for name in ("paper", "live")]
+    for path in ledgers:
+        Ledger(path).close()
+    held, done = threading.Barrier(3), threading.Event()
+
+    def session(ledger: Path) -> None:
+        with instance_lock(ledger):
+            held.wait(5)
+            while not halt_path(ledger).exists():
+                if done.wait(0.05):
+                    return
+            halt_path(ledger).unlink()  # sold and halted
+            done.wait(5)
+
+    threads = [threading.Thread(target=session, args=(path,)) for path in ledgers]
+    for thread in threads:
+        thread.start()
+    try:
+        held.wait(5)
+        assert main(["halt"]) == EXIT_CONFIG  # two run: which one?
+        refusal = capsys.readouterr().err
+        assert "  tbot halt live (real money)\n  tbot halt paper\n  tbot halt --all" in refusal
+        assert main(["halt", "--all", "--timeout", "10"]) == 0
+    finally:
+        done.set()
+        for thread in threads:
+            thread.join(5)
+    out = capsys.readouterr().out
+    assert "live: halted" in out
+    assert "paper: halted" in out
+
+
+def test_export_writes_every_trade_and_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    with Ledger(tmp_path / "paper.sqlite") as ledger:
+        day = datetime(2025, 12, 31, 20, tzinfo=UTC)
+        ledger.add_fill(Fill(day, "BTCUSDT", 0.01, 90000.0, 0.9), 90000.0)
+        ledger.add_adjustment(Adjustment(day + timedelta(hours=8), "", 0.0, 500.0, "deposit"))
+        ledger.add_fill(Fill(day + timedelta(days=2), "BTCUSDT", -0.01, 95000.0, 0.95), 95000.0)
+    assert main(["export", "paper"]) == 0
+    out = capsys.readouterr().out
+    assert "wrote reports" in out
+    assert "2 trades and 1 transfers" in out
+    rows = list(
+        csv.reader((tmp_path / "reports" / "paper-trades.csv").read_text("utf-8").splitlines())
+    )
+    assert rows[0] == [
+        "time_utc",
+        "kind",
+        "side",
+        "symbol",
+        "quantity",
+        "price",
+        "value (USDT)",
+        "fee (USDT)",
+        "note",
+    ]
+    assert rows[1][:4] == ["2025-12-31 20:00:00", "trade", "BUY", "BTCUSDT"]
+    assert rows[2][1:2] + rows[2][-1:] == ["transfer", "deposit"]
+    assert rows[3][2] == "SELL"
+    assert main(["export", "paper", "--year", "2026", "--out", "y2026.csv"]) == 0
+    assert len((tmp_path / "y2026.csv").read_text("utf-8").splitlines()) == 3
+
+
+def test_a_backup_goes_into_a_folder_not_made_yet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_configs(tmp_path)
+    Ledger(tmp_path / "paper.sqlite").close()
+    assert main(["backup", "paper", "--out", str(tmp_path / "usb" / "tbot")]) == 0
+    [copy] = (tmp_path / "usb" / "tbot").iterdir()
+    assert copy.name.startswith("paper-")
+    assert copy.suffix == ".sqlite"
+
+
+def test_a_failure_on_a_full_disk_still_sends_its_alert(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[str] = []
+
+    class Full(io.StringIO):
+        def write(self, text: str) -> int:
+            raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("tbot.cli._alert", sent.append)
+    monkeypatch.setattr("sys.stderr", Full())
+    assert _fail("error: disk full", EXIT_ERROR, alert=True) == EXIT_ERROR
+    assert sent == ["tbot cannot start: error: disk full"]
+
+
+def test_the_symbols_help_reads_as_typed(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["download", "-h"]) == 0
+    assert "(default: BTCUSDT ETHUSDT)" in capsys.readouterr().out
+
+
+def test_a_pasted_token_telegram_refuses_is_said_to_be_unsaved(
+    no_telegram: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    telegram = FakeTelegram(monkeypatch, [])
+    telegram.status = 401
+    monkeypatch.setattr("builtins.input", lambda prompt="": "123:typo")
+    monkeypatch.setattr("tbot.cli.interactive", lambda: True)
+    assert main(["notify"]) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "Telegram does not know this token" in out
+    assert "nothing was saved" in out
+    assert "TBOT_TELEGRAM_TOKEN in" not in out  # it is in no file
+    assert not no_telegram.exists()

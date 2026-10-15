@@ -1,16 +1,25 @@
 <#
 .SYNOPSIS
-Updates the bot: stops its scheduled sessions gracefully, pulls, syncs packages, starts them again.
+Updates the bot to the newest release: stops its scheduled sessions gracefully, updates, syncs
+packages, checks the new version, and starts the sessions again.
 
 .DESCRIPTION
+The newest release is the newest vX.Y.Z tag with a published GitHub release (a version whose
+checks failed has a tag but no release); when GitHub cannot be asked, the newest vX.Y.Z tag.
+Before anything is stopped, the update must be able to apply: this clone is on a branch, the
+release follows from it (no commits of its own), and no untracked file is in the way of one
+the release adds.
 Tasks that run this repository's scripts\run_bot.ps1 are found by their action; stopping and
 starting them needs administrator rights, so with tasks, run from a normal terminal, it asks
 for them and goes on in a new window. A running one is asked to stop with
-`tbot stop` (it finishes the event in progress). Whatever happens afterwards, every task that was
-running is started again, after `tbot doctor --offline` checks its config; the network checks are
-left to the bot, which retries them. Nothing is sold or cancelled.
+`tbot stop` (it finishes the event in progress). Nothing is sold or cancelled.
+After the packages are synced, the new version must load on this PC, and `tbot doctor
+--offline` must still pass on every config whose task was stopped; otherwise everything goes
+back to the old version. Whatever happens afterwards, every task that was running is started
+again after doctor checks its config (offline, it fails only on what stops a start; the
+network checks are left to the bot, which retries them), and checked to run a little later.
 Local changes to tracked files (an edited config, a longer trial log) are stashed for the
-pull and put back; if the update changes the same lines, or any step fails, everything stays
+update and put back; if the update changes the same lines, or any step fails, everything stays
 at the old version with your changes. Exit code 1 means the update was not applied or a task
 was not started again. A bot started by hand in a console must be stopped by hand first.
 
@@ -51,6 +60,7 @@ $env:GIT_CONFIG_VALUE_0 = $repo -replace '\\', '/'
 $runner = (Join-Path $PSScriptRoot "run_bot.ps1").ToLowerInvariant()
 $venv = (Join-Path $repo ".venv").ToLowerInvariant()
 $StashName = "tbot update"
+$doctors = @{}  # doctor's exit code by commit and config
 
 function Invoke-Checked([string] $exe, [string[]] $arguments) {
     & $exe @arguments
@@ -62,18 +72,65 @@ function Invoke-Tbot([string[]] $arguments) {
     return $LASTEXITCODE
 }
 
-function Get-Incoming {
-    # Commits a pull would bring, or $null when that cannot be known (no upstream).
-    $ErrorActionPreference = "Continue"  # under Stop, a line on stderr would throw
-    $lines = @(git log --oneline "HEAD..@{u}" 2>$null)
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return ,$lines
-}
-
 function Get-Version {
     $ErrorActionPreference = "Continue"  # under Stop, a line on stderr would throw
     $text = & $uv run --quiet --frozen python -m tbot --version 2>$null
     if ($LASTEXITCODE -eq 0) { return [string] $text } else { return "an unknown version" }
+}
+
+function Test-Config([string] $config, [switch] $Quiet) {
+    # `tbot doctor --offline` on the version checked out now, once per version; it shows its
+    # warnings and failures (-Quiet: only when it fails).
+    $key = "$(git rev-parse HEAD) $config"
+    if (-not $doctors.ContainsKey($key)) {
+        $report = @(& $uv run --quiet --frozen python -m tbot doctor $config --offline)
+        $doctors[$key] = $LASTEXITCODE
+        if (-not $Quiet -or $LASTEXITCODE -ne 0) {
+            Write-Host "doctor --offline $($config):"
+            $report | Where-Object { $_ -notmatch '^OK\s' } | Write-Host
+        }
+    }
+    return $doctors[$key]
+}
+
+function Find-Release {
+    # The tag to update to: the newest vX.Y.Z with a published GitHub release, else the newest vX.Y.Z.
+    Invoke-Checked "git" @("fetch", "--quiet", "--tags", "origin")
+    $tags = @(git tag --list "v*" | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } |
+        Sort-Object { [version] $_.Substring(1) } -Descending)
+    if (-not $tags) { throw "origin has no release tag (vX.Y.Z) to update to" }
+    $published = Get-PublishedTags ([string] (git remote get-url origin))
+    $released = @($tags | Where-Object { $null -ne $published -and $published -contains $_ })
+    if ($released) { return $released[0] }
+    $why = if ($null -eq $published) {
+        "cannot tell which releases are published (origin is not on GitHub, or GitHub did not answer)"
+    } else {
+        "GitHub lists no published release of these tags"
+    }
+    Write-Host "$($why): taking the newest tag, $($tags[0])"
+    return $tags[0]
+}
+
+function Get-Refusal([string] $tag) {
+    # Why the update to $tag cannot apply, or "": asked before anything is stopped.
+    $null = git symbolic-ref -q HEAD
+    if ($LASTEXITCODE -ne 0) {
+        return ("this clone is not on a branch (as after git checkout <tag>): run " +
+            "git switch main, then this again")
+    }
+    $null = git merge-base --is-ancestor HEAD $tag
+    if ($LASTEXITCODE -ne 0) {
+        return ("this clone has commits that $tag does not have (git log --oneline $tag..HEAD), " +
+            "so it cannot simply move to $($tag): merge it by hand (git merge $tag)")
+    }
+    $added = @(git -c core.quotepath=off diff --name-only --diff-filter=A HEAD $tag)
+    $untracked = @(git -c core.quotepath=off ls-files --others --exclude-standard)
+    $inWay = @($added | Where-Object { $untracked -contains $_ })
+    if ($inWay) {
+        return ("$tag adds files that are here already but not tracked by git: " +
+            "$($inWay -join ', '). Move or rename them, then run this again")
+    }
+    return ""
 }
 
 function Get-VenvProcesses {
@@ -102,8 +159,8 @@ function Assert-EnvReadable {
     } catch {
         throw ("$([Environment]::UserName) cannot read .env, which only the account that set up " +
             "the bot may read, so its sessions would stop and not start again. Update as that " +
-            "account: tbot stop <config> for each session, git pull, uv sync --frozen, then " +
-            "tbot autostart <config>")
+            "account: tbot stop <config> for each session, git merge --ff-only <newest tag>, " +
+            "uv sync --frozen, then tbot autostart <config>")
     }
 }
 
@@ -132,6 +189,8 @@ try {
     if (-not $tasks) { Write-Output "no scheduled tbot task for $repo" }
     $running = @($tasks | Where-Object { $_.State -eq "Running" })
 
+    $null = git rev-parse HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git cannot use $repo as $([Environment]::UserName) (see above)" }
     if (git stash list | Select-String -SimpleMatch $StashName -Quiet) {
         throw "an earlier update left your local changes in 'git stash list' ($StashName). " +
             "Put them back with 'git stash pop' (or drop them), then run this again."
@@ -139,29 +198,29 @@ try {
     $status = @(git status --porcelain --untracked-files=no)
     if ($status) { Write-Output "local changes, kept across the update:`n$($status -join "`n")" }
     $others = Get-OtherProcesses @($running | ForEach-Object { $_.Config })
+
+    $tag = Find-Release
+    $null = git merge-base --is-ancestor $tag HEAD
+    if ($LASTEXITCODE -eq 0) {
+        Write-Output "already up to date: $tag is in this clone ($(Get-Version))"
+        return
+    }
+    $refusal = Get-Refusal $tag
     if ($DryRun) {
-        git fetch --quiet
-        $fetched = $LASTEXITCODE -eq 0
+        if ($refusal) { Write-Output "would refuse: $refusal" }
         if ($others) { Write-Output "would refuse: $(Format-Busy $others)" }
         $names = ($running | ForEach-Object { $_.Name }) -join ', '
         Write-Output "would stop: $(if ($names) { $names } else { 'nothing (no task runs)' })"
-        $incoming = Get-Incoming
-        if ($null -eq $incoming) {
-            Write-Output "cannot tell what would be pulled: this branch has no upstream to pull from"
-        } elseif (-not $fetched) {
-            Write-Output "cannot tell what would be pulled: git fetch failed (see above)"
-        } elseif ($incoming) {
-            Write-Output "would pull:"
-            $incoming | ForEach-Object { Write-Output "  $_" }
-        } else {
-            Write-Output "nothing to pull: already at $(Get-Version)"
-        }
+        Write-Output "would update to $($tag):"
+        git log --oneline "HEAD..$tag" | ForEach-Object { Write-Output "  $_" }
         return
     }
+    if ($refusal) { throw "nothing was stopped or changed: $refusal" }
     if ($others) { throw (Format-Busy $others) }  # before any task is stopped for nothing
     Assert-EnvReadable
-    $null = git rev-parse HEAD
-    if ($LASTEXITCODE -ne 0) { throw "git cannot use $repo as $([Environment]::UserName) (see above)" }
+    # A session whose doctor passes now and fails on the new version sends the update back.
+    $passed = @{}
+    foreach ($task in $running) { $passed[$task.Config] = (Test-Config $task.Config -Quiet) -eq 0 }
 
     $failed = $false
     $notStarted = @()
@@ -192,27 +251,37 @@ try {
         if ($busy) { throw (Format-Busy $busy) }
 
         $stashed = $false
-        if ($status) {  # set aside for the pull, put back last
+        if ($status) {  # set aside for the update, put back last
             Invoke-Checked "git" @("stash", "push", "--quiet", "-m", $StashName)
             $stashed = $true
         }
         try {
-            Invoke-Checked "git" @("pull", "--ff-only")
+            Invoke-Checked "git" @("merge", "--ff-only", "--quiet", $tag)
             Invoke-Checked $uv @("sync", "--frozen")
-            if ($stashed) {
-                & git stash pop --quiet
+            if ($stashed) {  # kept in the stash until the new version passed its checks
+                & git stash apply --quiet
                 if ($LASTEXITCODE -ne 0) {
                     throw ("the update changes the same lines as your local changes; nothing was " +
                         "changed. To take it: note your edits (git diff), undo them with 'git checkout " +
                         "-- <file>', run tbot update, then make them again in the updated file")
                 }
+            }
+            $problem = Test-Packages $uv
+            if ($problem) { throw "the new version does not work on this PC: $problem" }
+            foreach ($task in $running) {
+                if ($passed[$task.Config] -and (Test-Config $task.Config) -ne 0) {
+                    throw "doctor --offline passed on $($task.Config) before the update and fails after it (see above)"
+                }
+            }
+            if ($stashed) {
+                Invoke-Checked "git" @("stash", "drop", "--quiet")
                 $stashed = $false
             }
         } catch {
             $failed = $true
             Write-Output "update NOT applied: $_"
-            if ((git rev-parse HEAD) -ne $before) {
-                Write-Output "going back to $before"
+            if ($stashed -or (git rev-parse HEAD) -ne $before) {
+                Write-Output "going back to the old version, $oldVersion ($before)"
                 & git reset --hard --quiet $before  # local changes are still in the stash
             }
             if ($stashed) {
@@ -230,23 +299,24 @@ try {
         foreach ($task in $running) {
             if ((Get-ScheduledTask -TaskName $task.Name).State -eq "Running") { continue }
             $null = Invoke-Tbot @("stop", $task.Config, "--cancel")  # or the new start stops at once
-            # Offline, doctor fails only on what stops a start; its warnings are shown.
-            if ((Invoke-Tbot @("doctor", $task.Config, "--offline")) -ne 0) {
+            if ((Test-Config $task.Config) -ne 0) {
                 Write-Output ("NOT started '$($task.Name)': it could not start (see the FAIL lines). " +
                     "Fix it, then: tbot autostart $($task.Config)")
                 $notStarted += $task.Name
                 continue
             }
-            Start-ScheduledTask -TaskName $task.Name
-            Write-Output "started '$($task.Name)'"
+            $stem = [IO.Path]::GetFileNameWithoutExtension($task.Config)
+            $problem = Start-TaskChecked $task.Name (Join-Path $repo "logs\$stem.supervisor.log")
+            if ($problem) {
+                Write-Output "'$($task.Name)' was started again, but $problem"
+                $notStarted += $task.Name
+            } else {
+                Write-Output "started '$($task.Name)'"
+            }
         }
     }
     if ($failed -or $notStarted) { exit 1 }
-    if ($before -eq $after) {
-        Write-Output "already up to date ($oldVersion)"
-    } else {
-        Write-Output "updated: $oldVersion -> $(Get-Version); what changed: CHANGELOG.md"
-    }
+    Write-Output "updated to $($tag): $oldVersion -> $(Get-Version); what changed: CHANGELOG.md"
 } catch {
     Write-Output "FAILED: $($_.Exception.Message)"
     $exitCode = 1

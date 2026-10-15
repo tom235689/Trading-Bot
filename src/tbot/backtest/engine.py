@@ -4,6 +4,7 @@ Each event is a bar close time. At every event, in order:
 1. Reveal bars that close now.
 2. Fill pending orders at the open of the symbol's newly closed bar (the first
    price after the decision), with slippage and fees.
+   With a protective stop on, sell the positions whose stop that bar's low reached.
 3. Mark positions at the latest close and record equity.
 4. Run strategies whose bars closed now; they see only closed bars.
 5. Combine targets, apply risk limits, and queue orders for the next bar.
@@ -97,6 +98,7 @@ class BacktestEngine:
         risk: RiskLimits,
         rules: RebalanceRules,
         guard: GuardConfig | None = None,
+        protective_stop_pct: float = 0.0,
     ) -> None:
         self.slots = list(slots)
         self.streams = {key: _Stream(frame, key[1]) for key, frame in bars.items()}
@@ -122,12 +124,14 @@ class BacktestEngine:
         # lasts to the end: that is what an unattended bot would have done.
         self.guard = RiskGuard(guard) if guard else None
         self.halted = ""
+        self.protective_stop_pct = protective_stop_pct
 
     def run(self) -> BacktestResult:
         events = np.unique(np.concatenate([s.close_ms for s in self.streams.values()]))
         for now_ms in events.tolist():
             revealed = {key for key, stream in self.streams.items() if stream.advance(now_ms)}
             self._fill_pending(revealed)
+            self._stop_out(revealed, now_ms)
             self._mark(revealed)
             trading = now_ms >= self.start_ms
             now = from_millis(now_ms)
@@ -176,6 +180,33 @@ class BacktestEngine:
             if fill is not None:
                 self.portfolio.apply(fill)
         self.pending = remaining
+
+    def _stop_out(self, revealed: set[StreamKey], now_ms: int) -> None:
+        """Live's exchange stop: after every event a stop-market sell of the whole position
+        waits this far below the last close. A bar whose low reaches it sells at the stop,
+        or at the open when the bar opened below it, booked at the bar's close."""
+        if not self.protective_stop_pct:
+            return
+        for symbol, key in self.exec_keys.items():
+            stream = self.streams[key]
+            i = stream.visible - 1
+            quantity = self.portfolio.position(symbol)
+            if key not in revealed or i < 1 or quantity <= 0:
+                continue
+            level = float(stream.close[i - 1]) * (1 - self.protective_stop_pct)
+            # Live places no stop on dust, which the exchange would refuse.
+            if stream.low[i] > level or quantity * level < self.rules.min_notional:
+                continue
+            fill = self.broker.fill(
+                from_millis(now_ms),
+                symbol,
+                -quantity,
+                min(level, float(stream.open[i])),
+                self.portfolio.cash,
+                quantity,
+            )
+            if fill is not None:
+                self.portfolio.apply(fill)
 
     def _mark(self, revealed: set[StreamKey]) -> None:
         for symbol, key in self.exec_keys.items():

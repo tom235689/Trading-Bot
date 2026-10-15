@@ -5,6 +5,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from binance_spot_fake import FakeSpot
 from factories import price_bars
 from tbot.core.config import StrategyConfig
+from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
 from tbot.exchange.binance import BinanceError, BinanceSpot
@@ -26,7 +28,7 @@ from tbot.live.doctor import (
     synced_folder,
     works_on_testnet,
 )
-from tbot.live.ledger import Ledger
+from tbot.live.ledger import Adjustment, Ledger
 from tbot.live.runner import (
     BUDGET_META,
     GUARD_META,
@@ -530,3 +532,106 @@ def test_telegram_down_or_moved_is_said_plainly() -> None:
     assert check_moved.detail.endswith("set TBOT_TELEGRAM_CHAT_ID to -1009876")
     [check_down] = answer(502, {"ok": False})
     assert check_down.detail.startswith("unreachable: ")
+
+
+def test_doctor_fails_a_book_whose_next_start_is_refused(tmp_path: Path) -> None:
+    store = BarStore(tmp_path / "data")
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        bars = price_bars(T0, Timeframe.H4, [100.0] * 10, [100.0] * 10)
+        store.write(symbol, Timeframe.H4, bars)
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    with Ledger(config.ledger) as ledger:
+        ledger.set_meta(BUDGET_META, repr(10000.0))
+        ledger.add_fill(Fill(T0, "SOLUSDT", 5.0, 100.0, 0.0), 100.0)  # dropped from the config
+    btc_only = config.model_copy(
+        update={"strategies": [STRATEGIES[0].model_copy(update={"symbols": ["BTCUSDT"]})]}
+    )
+
+    async def offline(config: PaperConfig) -> list[Check]:
+        async with httpx.AsyncClient() as client:  # what `tbot update` asks
+            return await run_checks(config, settings(), client, store, offline=True)
+
+    [(status, detail)] = by_name(asyncio.run(offline(btc_only)))["book"]
+    assert status == "fail"
+    assert detail.startswith("the book holds 5.00000000 SOLUSDT, which this config does not")
+    cut = config.model_copy(update={"initial_cash": 1.0})  # the book is worth 10,000
+    with Ledger(config.ledger) as ledger:
+        ledger.add_fill(Fill(T0, "SOLUSDT", -5.0, 100.0, 0.0), 100.0)
+        ledger.add_fill(Fill(T0, "BTCUSDT", 99.0, 100.0, 0.0), 100.0)
+    with Ledger(config.ledger) as ledger:  # a fall: worth 9,900 at the stored 100, then cut
+        ledger.add_adjustment(Adjustment(T0, "", 0.0, -9500.0, "withdrawn"))
+    [(status, detail)] = by_name(asyncio.run(offline(cut)))["book"]
+    assert status == "fail"
+    assert detail.startswith("initial_cash 1.00 takes 9,999.00 out of a book worth")
+    assert "book" not in by_name(asyncio.run(offline(config)))
+
+
+def test_a_ledger_in_a_synced_folder_and_google_drive_are_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OneDrive", str(tmp_path / "OneDrive"))
+    assert synced_folder(Path("G:/My Drive/Trading-Bot")) == "Google Drive"
+    assert synced_folder(tmp_path / "My Drive" / "Trading-Bot") == "Google Drive"  # mirrored
+    assert synced_folder(Path("G:/Shared drives/team/Trading-Bot")) == "Google Drive"
+    monkeypatch.setattr(
+        "tbot.live.doctor.synced_folder", lambda folder: "OneDrive" * ("OneDrive" in str(folder))
+    )
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "OneDrive" / "paper.sqlite")
+    [(status, detail)] = by_name(check(config, settings(), fake()))["folder"]
+    assert status == "warn"
+    assert detail.startswith(f"the ledger {config.ledger} is in a folder OneDrive syncs")
+
+
+def test_a_drive_running_low_is_named(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "tbot.live.runner.shutil.disk_usage", lambda path: SimpleNamespace(free=512 * 1024**2)
+    )
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    [(status, detail)] = by_name(check(config, settings(), fake()))["disk"]
+    assert status == "warn"
+    assert detail.startswith("0.5 GB free on the drive of")
+
+
+def test_env_lines_that_set_nothing_are_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "# Telegram\nTBOT_TELEGRAM_TOKEN=1:a\nTBOT_TELEGRAM_CHATID=42\nset TBOT_HEARTBEAT_URL=x\n"
+        "export TBOT_BINANCE_API_KEY=k\nTBOT_SUPERVISED=1\n\n",
+        "utf-8",
+    )
+    (tmp_path / ".env.txt").write_text("TBOT_TELEGRAM_CHAT_ID=42\n", "utf-8")
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    found = [detail for _, detail in by_name(check(config, settings(), fake()))["env"]]
+    assert found == [
+        '.env.txt is there: tbot reads only .env (Notepad adds .txt; save it as "All files")',
+        ".env line 3: TBOT_TELEGRAM_CHATID is no tbot setting (did you mean "
+        "TBOT_TELEGRAM_CHAT_ID?)",
+        ".env line 4 is not NAME=value, so it sets nothing",
+    ]
+
+
+def test_a_blocked_bot_fails_doctor(tmp_path: Path) -> None:
+    config = live(tmp_path)
+    found = by_name(check(config, settings(**ALERTS, **KEYS), fake(telegram_blocked=True)))
+    [(status, detail)] = found["telegram"]
+    assert status == "fail"
+    assert detail.startswith("the bot may not write to the chat: unblock it in Telegram")
+
+
+def test_a_misspelled_strategy_parameter_is_placed_and_named(tmp_path: Path) -> None:
+    typo = STRATEGIES[0].model_copy(update={"params": {"entry": 55, "exti": 20}})
+    config = PaperConfig(strategies=[typo], ledger=tmp_path / "paper.sqlite")
+    [(status, detail)] = by_name(check(config, settings(), fake()))["strategies"]
+    assert (status, detail) == (
+        "fail",
+        "donchian_trend: strategies.0.params.exti: unknown key (did you mean exit?)",
+    )
+
+
+def test_a_ping_doctor_sends_is_said_to_count(tmp_path: Path) -> None:
+    config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
+    values = settings(heartbeat_url="https://hc.example/ping")
+    [(status, detail)] = by_name(check(config, values, fake()))["heartbeat"]
+    assert (status, detail) == ("ok", "ping answered 200 (the monitor counts it as the bot alive)")

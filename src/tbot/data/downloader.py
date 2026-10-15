@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from itertools import groupby
+from pathlib import Path
 
 import httpx
 import polars as pl
@@ -15,7 +16,7 @@ from tbot.data.binance_rest import fetch_klines, first_open_time
 from tbot.data.binance_vision import fetch_month
 from tbot.data.quality import aligned
 from tbot.data.schema import empty_bars
-from tbot.data.store import BarStore
+from tbot.data.store import BarStore, StoreUnreadable
 
 log = structlog.get_logger(__name__)
 INVALID_SYMBOL = -1121  # the REST API's code for a symbol it does not list (any more)
@@ -95,6 +96,34 @@ def store_aligned(
     return kept.height, bars.height - kept.height
 
 
+def _on_grid(
+    client: httpx.Client,
+    symbol: str,
+    timeframe: Timeframe,
+    archive: pl.DataFrame,
+    start: datetime,
+    end: datetime,
+) -> pl.DataFrame:
+    """REST's on-grid bars in [start, end) for open times an archive month lacks, when it
+    has off-grid bars: after the Feb 2018 outage the 1h and 15m archives hold bars at :28
+    where REST serves the real on-grid ones (they add up exactly to the archived 4h bars).
+    """
+    kept = archive.filter(aligned(timeframe))
+    if kept.height == archive.height or start >= end:
+        return empty_bars()
+    try:
+        bars = fetch_klines(client, symbol, timeframe, start, end)
+    except httpx.HTTPStatusError as exc:
+        if not_listed(exc):  # delisted: the archive is all there is
+            return empty_bars()
+        raise
+    found = bars.filter(aligned(timeframe)).join(
+        kept.select("open_time"), on="open_time", how="anti"
+    )
+    log.info("off_grid_filled", symbol=symbol, timeframe=str(timeframe), bars=found.height)
+    return found
+
+
 def sync(
     store: BarStore,
     client: httpx.Client,
@@ -109,9 +138,82 @@ def sync(
     """Download closed bars from start up to now, without holes.
 
     Extends forward from the last stored bar, and backfills bars before the first
-    stored one when start is earlier.
+    stored one when start is earlier. A year file that cannot be read is set aside
+    (renamed, not deleted) and that year fetched again.
     """
     counts = [0, 0, 0]  # archive bars, REST bars, dropped
+    set_aside: set[Path] = set()
+    while True:
+        try:
+            _refetch(store, client, symbol, timeframe, now, workers, progress, counts)
+            return _sync(store, client, symbol, timeframe, start, now, workers, progress, counts)
+        except StoreUnreadable as exc:
+            ours = exc.path.parent == store.directory(symbol, timeframe)
+            if not (exc.damaged and ours) or exc.path in set_aside:
+                raise  # held by another program, or damaged again just after the fetch
+            set_aside.add(exc.path)
+            moved = store.set_aside(exc.path)
+            if moved is None:
+                continue  # another process mended it meanwhile
+            log.warning("store_file_damaged", path=str(exc.path), moved_to=moved.name)
+            progress(
+                f"{symbol} {timeframe}: {exc.path} cannot be read; renamed it {moved.name} "
+                f"and fetching {exc.path.stem} again"
+            )
+
+
+def _refetch(
+    store: BarStore,
+    client: httpx.Client,
+    symbol: str,
+    timeframe: Timeframe,
+    now: datetime,
+    workers: int,
+    progress: Callable[[str], None],
+    counts: list[int],
+) -> None:
+    """Fetch the years whose file was set aside again, whole, before anything else.
+
+    Until that is done the year stays marked, so a fetch that fails is tried again by the
+    next sync instead of leaving a hole that only the first and last stored bars hide.
+    """
+    for year in store.years_to_refetch(symbol, timeframe):
+        begin = datetime(year, 1, 1, tzinfo=UTC)
+        end = min(datetime(year + 1, 1, 1, tzinfo=UTC), timeframe.floor(now))
+        if begin < end:
+            try:  # one probe, so months before the listing cost no requests
+                earliest = first_open_time(client, symbol, timeframe, begin, end)
+            except httpx.HTTPStatusError as exc:
+                if not not_listed(exc):
+                    raise
+                earliest = begin  # delisted: only the archives can say what there was
+            if earliest is not None:
+                _download(
+                    store,
+                    client,
+                    symbol,
+                    timeframe,
+                    earliest,
+                    end,
+                    workers,
+                    progress,
+                    counts,
+                    hold=True,
+                )
+        store.refetched(symbol, timeframe, year)
+
+
+def _sync(
+    store: BarStore,
+    client: httpx.Client,
+    symbol: str,
+    timeframe: Timeframe,
+    start: datetime,
+    now: datetime,
+    workers: int,
+    progress: Callable[[str], None],
+    counts: list[int],
+) -> SyncResult:
     first = store.first_open_time(symbol, timeframe)
     last = store.last_open_time(symbol, timeframe)
     if first is not None and start < first:
@@ -197,25 +299,31 @@ def _download(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for year, year_months in groupby(months, key=lambda ym: ym[0]):
             wanted = list(year_months)
-            frames = []
+            frames: list[pl.DataFrame] = []
+            filled = 0  # bars from REST where the archive has them off the grid
             for month, frame in zip(wanted, pool.map(fetch, wanted), strict=True):
                 if frame is None:
                     if seen:  # before the first bar a missing month is the listing, no hole
                         unpublished.append(month)
                     holding = holding or seen  # nothing after a hole is stored before it is filled
                 else:
-                    frames.append(frame)
+                    span = _month_span(month)
+                    fill = _on_grid(client, symbol, timeframe, frame, max(span[0], begin), span[1])
+                    frames.extend((frame, fill))
+                    filled += fill.height
                     seen = True
             if not frames:
                 continue
             bars = pl.concat(frames).filter(pl.col("open_time") >= begin, pl.col("open_time") < end)
             written, skipped = keep(bars)
-            counts[0] += written
+            counts[0] += written - filled
+            counts[1] += filled
             counts[2] += skipped
             latest = bars["open_time"].max()
             if isinstance(latest, datetime):
                 covered = max(covered, latest + timeframe.delta)
-            progress(f"{symbol} {timeframe} {year}: {written} bars from archives")
+            rest = f", {filled} from REST where the archive has them off the grid" if filled else ""
+            progress(f"{symbol} {timeframe} {year}: {written - filled} bars from archives{rest}")
 
     # REST fills months missing between archives, then everything after the last
     # archived bar, which covers months not yet published.

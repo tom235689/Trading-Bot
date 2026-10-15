@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import re
 import subprocess
@@ -103,9 +104,10 @@ def scan_text(where: str, text: str) -> Iterator[Finding]:
         yield from scan_line(f"{where}:{number}", line.rstrip("\r"))
 
 
-def blob_text(data: bytes) -> str | None:
-    """The text of a file git treats as binary: UTF-16 (PowerShell 5.1 writes it with `>`
-    and Out-File), or UTF-8 with a stray NUL byte; None for other binary files."""
+def blob_texts(data: bytes) -> list[str]:
+    """The readings of a file git treats as binary: UTF-16 (PowerShell 5.1 writes it with `>`
+    and Out-File), or UTF-8 with a stray NUL byte; none for other binary files. Without a
+    byte order mark a file can read as both, and only one of them shows its Hangul."""
     marks = (
         (b"\xff\xfe\x00\x00", "utf-32-le"),  # before UTF-16-LE, whose mark starts it
         (b"\x00\x00\xfe\xff", "utf-32-be"),
@@ -114,17 +116,20 @@ def blob_text(data: bytes) -> str | None:
     )
     for bom, codec in marks:
         if data.startswith(bom):
-            return data[len(bom) :].decode(codec, errors="replace")
-    try:  # text with NUL bytes, ASCII as UTF-16 among it
-        return data.replace(b"\x00", b"").decode("utf-8")
-    except UnicodeDecodeError:
-        pass
-    if len(data) >= 2 and len(data) % 2 == 0:  # UTF-16-LE without a mark, in any script
+            return [data[len(bom) :].decode(codec, errors="replace")]
+    texts: list[str] = []
+    with contextlib.suppress(UnicodeDecodeError):  # text with NUL bytes, ASCII as UTF-16 among it
+        texts.append(data.replace(b"\x00", b"").decode("utf-8"))
+    # UTF-16-LE without a mark: NULs at odd offsets are the high bytes of its ASCII, while a
+    # few stray ones in UTF-8 do not count. Text in any script fails as UTF-8 anyway.
+    odd, even = data[1::2].count(0), data[0::2].count(0)
+    likely = odd > even and odd * 4 >= len(data) // 2
+    if (likely or not texts) and len(data) >= 2 and len(data) % 2 == 0:
         text = data.decode("utf-16-le", errors="replace")
         printable = sum(char.isprintable() or char in "\t\r\n" for char in text)
         if "\x00" not in text and printable >= 0.95 * len(text):  # not an icon or bitmap
-            return text
-    return None
+            texts.append(text)
+    return texts
 
 
 def scan_blob(where: str, data: bytes, depth: int = 0) -> Iterator[Finding]:
@@ -149,9 +154,13 @@ def scan_blob(where: str, data: bytes, depth: int = 0) -> Iterator[Finding]:
             return
         except (zipfile.BadZipFile, NotImplementedError, RuntimeError):
             pass  # not readable as a zip: scanned as bytes below
-    text = blob_text(data)
-    if text is not None:
-        yield from scan_text(where, text)
+    texts = blob_texts(data)
+    if texts:
+        first = list(scan_text(where, texts[0]))
+        yield from first
+        if not any(f.kind.startswith("Hangul") for f in first):
+            for other in texts[1:]:  # only Hangul counts in another reading
+                yield from (f for f in scan_text(where, other) if f.kind.startswith("Hangul"))
         return
     for run in ASCII_RUN.findall(data):
         yield from scan_line(where, run.decode("ascii"))

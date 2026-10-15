@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.10.0 (2026-10-15)
+
+Fixes and additions from a review of the whole code base in eight parts: the session core, orders and the exchange, the command line, market data, research, monitoring, operations, and the documents with a new owner's first run. Upgrade notes:
+- `tbot update` installs the newest release (the newest `vX.Y.Z` tag with a published GitHub release), not whatever is on main, and goes back to the old version when the new one does not load or doctor fails on a config it stopped. A clone with commits of its own, or off its branch, is refused before anything is stopped.
+- `tbot validate` evaluates the holdout only when every check before it passes (`--holdout` evaluates it anyway), and a holdout shorter than `gate.min_holdout_days` (180) fails as too short.
+- `reconcile_tolerance` above 0.05 is refused: it is a fraction (0.002 means 0.2%). `heartbeat_seconds` and `reconcile_seconds` are at most a day, `stale_after_seconds` a week, `batch_wait_seconds` 300.
+- A testnet or live start refuses a `rebalance.min_notional` over 100 times Binance's minimum: on pairs quoted in BTC it counts in BTC.
+- A `.env` with UTF-16 in it (PowerShell's `>>`) or one this account cannot read is refused (exit 4) instead of losing lines without a word.
+- A config with `mode:` is a session config even with a stray `start:` in it (an unknown key).
+- Doctor's kill switch check on history is named `kill switch history`; `kill switch` is the halt state.
+
+**Getting out**
+- `tbot halt --all` halts every session at once, as `/halt` does; with several sessions running, `tbot halt` lists one command per session, real money first.
+- `/halt` and `tbot halt` reach a running session whose config was edited into errors (also invalid YAML) or to name another ledger: every start notes its ledger and config in `data/sessions/`.
+- `/halt` also reaches stopped books that hold coins (they halt at their next start), and names any session it could not reach, with the `tbot halt` to run.
+- A `/halt` sent while no session read the chat (a restart) is no longer dropped without a word: the next session says it was not carried out and asks for it again. The answers to commands are sent again until Telegram takes them.
+- A stop cut short at shutdown (cancelled while being refitted) is placed before the session ends; the stopped alert names a position still without one instead of saying its stop stays.
+- README: what to do when the bot cannot sell (halt first, cancel the `tbs` stops, then sell by hand).
+
+**Real money**
+- An order or stop Binance archived (cancelled or expired with nothing executed, over 90 days ago) no longer stops every start and every sale for good.
+- Binance's hourly change of the largest market order no longer cancels and re-places every stop each hour.
+- A market order Binance ends before it is done (too little in the book, or the owner's own order on the other side) is alerted with what executed.
+- Answers -1006 and -1000 leave an order in doubt, looked up by its id, instead of taken for a refusal.
+- A stop above the largest order Binance takes is placed at that size and the rest flagged; "Market is closed" reloads the pair's status.
+- An order in doubt is booked when it executed, not when it was found.
+- Money moved at a restart (a changed budget, a deposit while the bot was down) is booked before the bar the start hands over, so `tbot status` and the dashboard no longer show it as a profit or loss.
+- The budget check counts the cash of a book whose config has a typo; reconciliation's cash noise is a fifth of Binance's order minimum, so a BTC-quoted book is reconciled.
+- Doctor fails a book whose next start is refused (coins of a pair the config dropped, a budget cut beyond the book's value), a Telegram bot the owner blocked (also at a real-money start), and warns about a ledger in a synced folder, Google Drive's `My Drive` and `Shared drives`, a drive under 2 GB free, and `.env` lines that set nothing.
+- A running session keeps Windows from going to sleep when idle.
+
+**Alerts and Telegram**
+- The heartbeat stops while alerts have not got through for 15 minutes, and while Telegram refuses to let the bot read messages (a revoked token); a refused bot is asked every 5 minutes whether alerts get through again.
+- A second program reading the bot is reported once a day, not about every ten minutes.
+- A sale that keeps failing during a halt is alerted once an hour, not at every retry; entries a daily loss limit blocks are told once a day, not at every bar.
+- A low disk is alerted once and named in the summary; a PC clock far off the exchange's is named in the summary.
+- In a group, the bot ignores talk and other bots' commands, and asks for `/halt@<bot> <code>`. Pairing with `tbot notify` works with the PC clock off by any amount.
+- A full disk no longer silences the alert of a start that fails.
+
+**Market data**
+- A damaged store file is named with the cure; a download or a session's start sets it aside and fetches that year again, and `tbot check` and the other streams go on.
+- Reads no longer tear while another process writes; the February 2018 off-grid months are filled from REST; a socket bar after an exchange pause is traded at once; live bars are stored off the event loop.
+- A socket that cannot connect is logged as such and tries port 443; 15 minutes without one is alerted.
+
+**Commands**
+- New `tbot export <config>`: every trade and transfer in a CSV file (`--year` for one year), for a spreadsheet or a tax return.
+- `tbot halt` and `tbot stop` given a backtest or validation config refuse instead of acting on the paper session; `tbot stop` mentions a supervisor only when one started the session last.
+- `tbot status` lists no dust as a position, and `tbot status <config>` names its own `tbot resume`.
+- A backtest without data names every missing stream in one download; `tbot download` and `tbot check` say their times are bar openings; `tbot backup --out` takes a folder not made yet.
+- Doctor places a misspelled strategy parameter and suggests the name; a config key no longer gets a `.env` name suggested; `tbot notify` no longer says a refused pasted token is in `.env`.
+
+**Research**
+- Symbols listed in another order count as the same trials and holdout looks.
+- The report warns after more than three holdout looks; ratios under 30 days show n/a; grids read quoted numbers as numbers and refuse a value listed twice; the top sweep rows name their columns; the report says positions open at a segment's end count at its last close.
+- New opt-in `protective_stop_pct` in backtest configs simulates live's exchange stop (on `donchian_voltarget` at 0.2: fires twice, +655% becomes +616%).
+
+**Operations**
+- The Windows scripts work in a folder with `[` or `]` under Windows PowerShell 5.1 (0.9.1 did not fix it: the supervisor never started the bot).
+- The supervisor ends with 4 after three starts in a row that failed; `tbot autostart` says when the bot did not start, and refuses to replace another config's task of the same name (`-Name`).
+- Setup and update name a processor too old for polars instead of passing with a warning.
+- The git guard finds Hangul in UTF-16 without a byte order mark that also reads as UTF-8.
+- CI checks that `uv.lock` is current, the weekly newest-dependencies run adds Windows and ruff, and checkouts keep no token.
+
+**Tests**
+- 93 new tests (734 in all); undoing any of 106 changes, one at a time, makes a test fail.
+
 ## 0.9.2 (2026-10-14)
 
 The release of 0.9.1, whose Linux check failed on a test, not on the bot: the test that `tbot check` finds a 1m bar still open read the real clock and failed in the last ten seconds of a minute; it now sets the time. Nothing else changed.

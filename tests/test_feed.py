@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
+from typing import Any
 
 import httpx
 import polars as pl
@@ -109,12 +110,14 @@ def make_feed(
 def test_emit_stores_new_closed_bars_once(tmp_path: Path) -> None:
     feed, store, _ = make_feed(tmp_path, [BTC1], now=at(4.5))
     bars = from_rows(make_rows(T0, 6, H1))
-    assert feed._emit(BTC1, bars) == 4  # opens 0h..3h are closed at 4:30; 4h and 5h are not
+    # Opens 0h..3h are closed at 4:30; 4h and 5h are not.
+    assert asyncio.run(feed._emit(BTC1, bars)) == 4
     assert feed.queue.qsize() == 4
     assert store.last_open_time(*BTC1) == at(3)
     assert feed.last[BTC1] == at(3)
-    assert feed._emit(BTC1, bars) == 0
-    assert feed._emit(BTC1, bars, exchange_closed=True) == 2  # exchange says closed: trusted
+    assert asyncio.run(feed._emit(BTC1, bars)) == 0
+    # The exchange says closed: trusted.
+    assert asyncio.run(feed._emit(BTC1, bars, exchange_closed=True)) == 2
 
 
 def test_catch_up_fetches_missing_bars_via_rest(tmp_path: Path) -> None:
@@ -558,7 +561,7 @@ def test_a_stale_stream_that_comes_back_is_reported(tmp_path: Path) -> None:
 
     asyncio.run(watch())
     assert (stale, feed.stale(), back) == ([BTC1], [BTC1], [])
-    assert feed._emit(BTC1, from_rows(make_rows(at(3), 2, H1))) == 2
+    assert asyncio.run(feed._emit(BTC1, from_rows(make_rows(at(3), 2, H1)))) == 2
     assert (feed.stale(), back) == ([], [BTC1])
 
 
@@ -569,7 +572,7 @@ def test_a_failing_report_loses_no_bar(tmp_path: Path) -> None:
     feed, _, _ = make_feed(tmp_path, [BTC1], now=at(5.5), on_fresh=broken, on_stale=broken)
     feed.last[BTC1] = at(2)
     feed._stale_reported.add(BTC1)
-    assert feed._emit(BTC1, from_rows(make_rows(at(3), 2, H1))) == 2
+    assert asyncio.run(feed._emit(BTC1, from_rows(make_rows(at(3), 2, H1)))) == 2
     assert feed.queue.qsize() == 2  # stored and queued: the strategy still sees them
 
     feed.last[BTC1] = at(2)
@@ -608,3 +611,246 @@ def test_a_socket_silent_across_a_bar_close_is_replaced(tmp_path: Path) -> None:
     assert asyncio.run(run()) == at(4)
     assert len(urls) >= 2
     assert feed.reconnects >= 1
+
+
+class Recorder:
+    """Stands in for the module's logger: the events and their fields, in order."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, object]]] = []
+
+    def __getattr__(self, level: str) -> Callable[..., None]:
+        return lambda event, **fields: self.events.append((event, fields))
+
+
+def test_a_stream_whose_file_cannot_be_read_stops_alone_and_says_so_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.data.store.time.sleep", lambda seconds: None)
+    eth = ("ETHUSDT", H1)
+    rows = {BTC1: make_rows(T0, 6, H1), eth: make_rows(T0, 6, H1)}
+    alerts: list[str] = []
+    back: list[StreamKey] = []
+    feed, store, _ = make_feed(
+        tmp_path,
+        [BTC1, eth],
+        now=at(5.5),
+        rows=rows,
+        poll_seconds=0.01,
+        on_alert=alerts.append,
+        on_fresh=back.append,
+        last={BTC1: at(1), eth: at(1)},
+    )
+    damaged = store.directory(*BTC1) / "2024.parquet"
+    damaged.parent.mkdir(parents=True)
+    damaged.write_bytes(b"PAR1garbagePAR1")
+
+    async def watch() -> bool:
+        task = asyncio.create_task(feed.run_watchdog())
+        await asyncio.sleep(0.2)  # many polls
+        alive = not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return alive
+
+    assert asyncio.run(watch())
+    assert (feed.last[BTC1], feed.last[eth]) == (at(1), at(4))  # ETH is not held back
+    assert feed.stale() == [BTC1]
+    assert len(alerts) == 1
+    assert str(damaged) in alerts[0]
+    assert "`tbot download --symbols BTCUSDT --timeframes 1h" in alerts[0]
+    damaged.unlink()  # `tbot download` set it aside and fetched the year again
+    assert asyncio.run(feed.catch_up()) == 3
+    assert (feed.stale(), back) == ([], [BTC1])
+
+
+def test_a_socket_bar_after_an_exchange_pause_is_taken_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    eth = ("ETHUSDT", H1)
+    paused = [
+        row for row in make_rows(T0, 8, H1) if not 3 <= (row[0] - to_millis(T0)) // H1.millis < 6
+    ]
+    now = at(7) + timedelta(seconds=0.5)  # just after the 06:00 bar closed
+
+    def first_bar(folder: str) -> tuple[LiveFeed, list[str], datetime | None]:
+        feed, _, requests = make_feed(
+            tmp_path / folder, [eth], now=now, rows={eth: paused}, last={eth: at(2)}
+        )
+        connect, _ = fake_connector([[kline_message(eth, at(6), closed=True)]])
+        feed.connector = connect  # type: ignore[assignment]
+
+        async def run() -> datetime | None:
+            task = asyncio.create_task(feed.run_websocket())
+            try:
+                _, bar = await asyncio.wait_for(feed.queue.get(), 0.5)
+            except TimeoutError:
+                return None
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            opened: datetime = bar["open_time"][0]
+            return opened
+
+        return feed, requests, asyncio.run(run())
+
+    # Binance has no ETH bars from 03:00 to 06:00: REST said so, so there is no gap to fill.
+    _, requests, opened = first_bar("paused")
+    assert opened == at(6)
+    assert len(requests) == 2  # the catch-up at the connect, and the one for the gap
+
+    def down(*args: object) -> pl.DataFrame:
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr("tbot.live.feed.fetch_klines", down)
+    feed, _, opened = first_bar("down")
+    assert opened is None  # REST could not say: the bar waits for the watchdog
+    assert feed.last[eth] == at(2)
+
+
+def test_a_socket_that_cannot_connect_is_told_apart_and_port_443_is_tried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.live.feed.RETRY_SECONDS", 0.01)
+    logged = Recorder()
+    monkeypatch.setattr("tbot.live.feed.log", logged)
+    feed, _, _ = make_feed(tmp_path, [BTC1], now=at(5) + timedelta(seconds=1), last={BTC1: at(3)})
+    urls: list[str] = []
+
+    @asynccontextmanager
+    async def connect(url: str) -> AsyncIterator[AsyncIterator[str | bytes]]:
+        urls.append(url)
+        if ":9443/" in url:
+            raise TimeoutError  # websockets' opening handshake: a firewall drops the port
+
+        async def stream() -> AsyncIterator[str | bytes]:
+            yield kline_message(BTC1, at(4), closed=True)
+            await asyncio.Event().wait()
+
+        yield stream()
+
+    feed.connector = connect
+
+    async def run() -> datetime:
+        task = asyncio.create_task(feed.run_websocket())
+        _, bar = await asyncio.wait_for(feed.queue.get(), 5)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        opened: datetime = bar["open_time"][0]
+        return opened
+
+    assert asyncio.run(run()) == at(4)
+    assert [url.split("?")[0] for url in urls] == [
+        "wss://stream.binance.com:9443/stream",
+        "wss://stream.binance.com:443/stream",
+    ]
+    errors = [fields["error"] for event, fields in logged.events if event == "websocket_error"]
+    assert errors == ["cannot connect to stream.binance.com:9443: timed out"]
+
+
+def test_no_socket_for_a_while_is_alerted_once_and_so_is_the_next_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tbot.live.feed.RETRY_SECONDS", 0.01)
+    alerts: list[str] = []
+    feed, _, _ = make_feed(
+        tmp_path, [BTC1], now=at(4.5), last={BTC1: at(3)}, on_alert=alerts.append
+    )
+    feed.down_alert_after = 0.03
+    attempts = [0]
+
+    @asynccontextmanager
+    async def connect(url: str) -> AsyncIterator[AsyncIterator[str | bytes]]:
+        attempts[0] += 1
+        if attempts[0] <= 4:  # waits of 0.01, 0.02, 0.04, 0.08 s between them
+            raise OSError("[WinError 10060] the host did not answer")
+
+        async def stream() -> AsyncIterator[str | bytes]:
+            await asyncio.Event().wait()
+            yield ""
+
+        yield stream()
+
+    feed.connector = connect
+
+    async def run() -> None:
+        task = asyncio.create_task(feed.run_websocket())
+        async with asyncio.timeout(5):
+            while len(alerts) < 2:
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert len(alerts) == 2
+    assert alerts[0].startswith("no market data socket for 0 min (cannot connect to stream.")
+    assert "block stream.binance.com:9443 and stream.binance.com:443" in alerts[0]
+    assert alerts[0].endswith("bars still come by REST, up to 35 s late")
+    assert alerts[1] == "market data socket connected again (stream.binance.com:9443)"
+
+
+def test_a_bar_is_stored_off_the_event_loop_and_queued_only_then(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    import time
+
+    feed, store, _ = make_feed(tmp_path, [BTC1], now=at(4.5), last={BTC1: at(2)})
+    real = store.write
+    seen: list[object] = []
+
+    def slow(*args: Any, **kwargs: Any) -> None:
+        seen.append(threading.current_thread() is threading.main_thread())
+        time.sleep(0.2)  # a merge into a year file of 1m bars takes about as long
+        seen.append(feed.queue.qsize())
+        real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "write", slow)
+
+    async def run() -> int:
+        ticks = [0]
+
+        async def tick() -> None:
+            while True:
+                await asyncio.sleep(0.01)
+                ticks[0] += 1
+
+        ticker = asyncio.create_task(tick())
+        await feed._emit(BTC1, from_rows(make_rows(at(3), 1, H1)), exchange_closed=True)
+        ticker.cancel()
+        return ticks[0]
+
+    assert asyncio.run(run()) >= 5  # the event loop went on meanwhile
+    assert seen == [False, 0]  # in a thread, and nothing queued before it was stored
+    assert feed.queue.qsize() == 1
+
+
+def test_a_bar_a_catch_up_is_storing_is_not_queued_again_from_the_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    rows = {BTC1: make_rows(T0, 5, H1)}
+    feed, store, _ = make_feed(tmp_path, [BTC1], now=at(4.5), rows=rows, last={BTC1: at(2)})
+    real = store.write
+    storing, release = threading.Event(), threading.Event()
+
+    def held(*args: Any, **kwargs: Any) -> None:
+        storing.set()
+        release.wait(5)
+        real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "write", held)
+
+    async def run() -> None:
+        catch_up = asyncio.create_task(feed.catch_up())
+        await asyncio.to_thread(storing.wait, 5)
+        socket = asyncio.create_task(feed._on_socket_bar(BTC1, from_rows(make_rows(at(3), 1, H1))))
+        await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.gather(catch_up, socket)
+
+    asyncio.run(run())
+    queued = [feed.queue.get_nowait()[1]["open_time"][0] for _ in range(feed.queue.qsize())]
+    assert queued == [at(3)]

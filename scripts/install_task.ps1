@@ -135,6 +135,11 @@ try {
             if (-not (Test-OwnTask $other $runner)) {
                 throw "'$Name' runs the bot of another folder ($other): pass -Name with another name"
             }
+            # A config of the same file name elsewhere: replacing the task would end that session.
+            $was = if (@($existing.Actions)[0].Arguments -match '-Config "([^"]+)"') { $Matches[1] } else { "" }
+            if ($was -and -not (Test-SameFile $was $path) -and (Test-Path -LiteralPath $was)) {
+                throw "'$Name' runs $was, not $($path): pass -Name with another name, such as -Name `"tbot $stem 2`""
+            }
         }
         Register-ScheduledTask -TaskName $Name -InputObject $task -Force | Out-Null
         if ($existing -and $existing.State -eq "Running") {
@@ -148,15 +153,11 @@ try {
             # A `tbot stop` from before would end the new start at once: withdraw it.
             $withdrawn = @(& $uv --directory $repo run --quiet --frozen python -m tbot stop $path --cancel)
             $withdrawn | Where-Object { $_ -match "withdrawn" } | ForEach-Object { Write-Output $_ }
-            Start-ScheduledTask -TaskName $Name
-            Start-Sleep -Seconds 10  # a start that fails at once ends the task: say why
-            $state = [string] (Get-ScheduledTask -TaskName $Name).State
-            if ($state -eq "Running") {
+            $problem = Start-TaskChecked $Name (Join-Path $repo "logs\$stem.supervisor.log")
+            if (-not $problem) {
                 Write-Output "registered and started '$Name': it runs at every boot. Watch it: tbot status, tbot log $stem -f"
             } else {
-                $journal = Join-Path $repo "logs\$stem.supervisor.log"
-                $last = if (Test-Path -LiteralPath $journal) { Get-Content -LiteralPath $journal -Tail 1 } else { "no journal yet" }
-                Write-Output "registered '$Name', but it is not running ($state): $last"
+                Write-Output "registered '$Name', but $problem"
                 $code = 1
             }
         }

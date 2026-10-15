@@ -20,7 +20,9 @@ from tbot.monitoring.telegram import Notifier
 from tbot.portfolio.portfolio import Portfolio
 
 log = structlog.get_logger(__name__)
-CASH_TOLERANCE = 1.0  # quote units; fee assets like BNB make small cash drift normal
+# Of the exchange's order minimum (1 USDT on most USDT pairs, 0.00002 BTC on BTC pairs):
+# fee assets like BNB make small cash drift normal.
+CASH_TOLERANCE = 0.2
 Ownership = Literal["budget", "account"]
 
 
@@ -53,6 +55,7 @@ async def reconcile(
     if len(quotes) != 1:
         raise ValueError(f"all symbols must share one quote asset, got {sorted(quotes)}")
     quote = quotes.pop()
+    noise = CASH_TOLERANCE * max(float(spot.rules[s].min_notional) for s in symbols)
     adjustments = []
 
     for symbol in symbols:
@@ -69,9 +72,7 @@ async def reconcile(
     # Locked quote counts too: an open buy order of the owner's does not shrink the book.
     cash = balances[quote].total if quote in balances else 0.0
     target = _target(portfolio.cash, cash, ownership, min(cash_floor, 0.0))
-    if abs(target - portfolio.cash) > max(
-        CASH_TOLERANCE, tolerance * max(abs(target), abs(portfolio.cash))
-    ):
+    if abs(target - portfolio.cash) > max(noise, tolerance * max(abs(target), abs(portfolio.cash))):
         note = f"cash: book {portfolio.cash:.2f}, exchange {cash:.2f}"
         adjustments.append(Adjustment(now, "", 0.0, target - portfolio.cash, note))
 
