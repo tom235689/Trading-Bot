@@ -110,3 +110,48 @@ def test_the_bar_that_closes_at_midnight_counts_for_the_day_it_ends() -> None:
     assert guard.check(later, 900.0, later).mode == Mode.NORMAL
     gone = later + timedelta(days=3)  # days without events: no day before to judge
     assert guard.check(gone, 800.0, gone).mode == Mode.NORMAL
+
+
+def test_trading_too_much_in_a_day_blocks_entries() -> None:
+    config = GuardConfig(daily_loss_limit=0, max_drawdown=0, stale_seconds=0, max_daily_turnover=3)
+    guard = RiskGuard(config)
+    assert guard.check(T0, 1000.0, T0, traded=3000.0).mode == Mode.NORMAL  # at the limit
+    decision = guard.check(T0, 1000.0, T0, traded=3100.0)
+    assert (decision.mode, decision.rule) == (Mode.REDUCE_ONLY, "turnover")
+    assert decision.reason.startswith("traded 3.1x equity in 24 hours, beyond the 3x limit")
+    assert guard.check(T0, 0.0, T0, traded=10.0).mode == Mode.NORMAL  # a book emptied by a transfer
+    off = RiskGuard(config.model_copy(update={"max_daily_turnover": 0.0}))
+    assert off.check(T0, 1000.0, T0, traded=1e9).mode == Mode.NORMAL
+
+
+def test_a_day_loss_is_named_before_turnover() -> None:
+    guard = RiskGuard(GuardConfig(max_drawdown=0, stale_seconds=0))
+    guard.check(T0, 1000.0, T0)
+    later = T0 + timedelta(hours=4)
+    decision = guard.check(later, 900.0, later, traded=1e6)
+    assert (decision.mode, decision.rule) == (Mode.REDUCE_ONLY, "daily_loss")
+
+
+def test_the_turnover_limit_is_a_number_of_times_equity() -> None:
+    assert GuardConfig().max_daily_turnover == 3.0
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        GuardConfig(max_daily_turnover=-1)
+    with pytest.raises(ValueError, match="finite"):
+        GuardConfig(max_daily_turnover=float("inf"))
+
+
+def test_days_follow_the_bars_through_a_catch_up_after_a_sleep() -> None:
+    guard = RiskGuard(GuardConfig(daily_loss_limit=0.03, max_drawdown=0, stale_seconds=0))
+    day = datetime(2024, 1, 1, tzinfo=UTC)
+    guard.check(day + timedelta(hours=16), 1000.0, day + timedelta(hours=16))
+    woke = day + timedelta(days=1, hours=1, minutes=30)  # the PC slept from 18:30
+    assert guard.check(woke, 1000.0, day + timedelta(hours=20)).mode == Mode.NORMAL
+    # The bar that closes at midnight lost 4% of the day before: entries wait.
+    midnight = day + timedelta(days=1)
+    assert guard.check(woke, 960.0, midnight).mode == Mode.REDUCE_ONLY
+    # The new day opened at 960 and lost nothing.
+    later = midnight + timedelta(hours=4)
+    assert guard.check(later, 960.0, later).mode == Mode.NORMAL
+    # A late stream of the day before moves the day back to nothing.
+    guard.check(later, 960.0, day + timedelta(hours=20))
+    assert (guard.state.day, guard.state.day_open_equity) == (midnight.date(), 960.0)

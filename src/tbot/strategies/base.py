@@ -31,7 +31,9 @@ class BarWindow:
 class StrategyContext:
     time: datetime  # close time of the latest bars
     windows: Mapping[str, BarWindow]
-    exposures: Mapping[str, float]  # current portfolio exposure per symbol
+    # Current portfolio exposure per symbol. A session's start-up replay shows today's
+    # book here, not the positions a backtest held then: keep no state built from it.
+    exposures: Mapping[str, float]
 
     def bars(self, symbol: str) -> BarWindow:
         return self.windows[symbol]

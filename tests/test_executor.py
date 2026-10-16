@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from binance_spot_fake import FakeSpot
+from binance_spot_fake import FakeSpot, symbol_info
 from tbot.core.config import StrategyConfig
 from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
@@ -1694,3 +1694,130 @@ def test_a_stop_still_missing_at_the_end_is_named(
         return await final_protect(executor, portfolio, MARKS)
 
     assert run(fake, tmp_path, action) == [BTC]
+
+
+def test_a_buy_ends_rather_than_cancel_the_owners_resting_order(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0, "BTC": 0.01}, prices={BTC: 50000.0})
+    fake.own_resting = True  # the owner's order sits where the bot's would trade
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        portfolio = Portfolio(1000.0)
+        assert await executor.execute({BTC: 0.01}, T0, portfolio, MARKS) == []
+        return notifier.messages
+
+    messages = run(fake, tmp_path, action)
+    assert fake.own_expired == 0  # the owner's order stays
+    (order,) = [o for o in fake.orders if o["type"] == "MARKET"]
+    assert order["selfTradePreventionMode"] == "EXPIRE_TAKER"
+    assert "(EXPIRED_IN_MATCH: it met a resting order of this account (self-trade" in messages[0]
+
+
+def test_a_sale_keeps_binances_self_trade_default_so_an_exit_goes_out(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 0.0, "BTC": 0.01}, prices={BTC: 50000.0})
+    fake.own_resting = True
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> None:
+        portfolio = Portfolio(0.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        assert len(await executor.execute({BTC: -0.01}, T0, portfolio, MARKS)) == 1
+
+    run(fake, tmp_path, action)
+    assert [o["selfTradePreventionMode"] for o in fake.orders] == ["EXPIRE_MAKER"]
+    assert fake.own_expired == 1
+
+
+def test_a_pair_without_self_trade_modes_gets_no_mode() -> None:
+    info = symbol_info(BTC, fake_rules()[BTC])
+    info.pop("allowedSelfTradePreventionModes")
+    assert parse_rules(info).self_trade_modes == frozenset()
+    assert "EXPIRE_TAKER" in parse_rules(symbol_info(BTC, fake_rules()[BTC])).self_trade_modes
+
+
+def test_an_order_found_still_working_is_left_in_doubt_not_booked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+    fake.lose_next_order_response = True
+    working = [True]
+    handle = fake.handle
+
+    def still_working(request: httpx.Request) -> httpx.Response:
+        response = handle(request)
+        lookup = request.method == "GET" and request.url.path == "/api/v3/order"
+        if lookup and working[0] and response.status_code == 200:
+            data = {**response.json(), "status": "NEW", "executedQty": "0.00000000"}
+            return httpx.Response(200, json={**data, "cummulativeQuoteQty": "0.00000000"})
+        return response
+
+    monkeypatch.setattr(fake, "handle", still_working)
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> Portfolio:
+        portfolio = Portfolio(1000.0)
+        assert await executor.execute({BTC: 0.01}, T0, portfolio, MARKS) == []
+        assert statuses(ledger) == ["pending", "unknown"]
+        (note,) = ledger.conn.execute("SELECT note FROM orders WHERE status = 'unknown'").fetchone()
+        assert "still working (NEW)" in note
+        working[0] = False  # it executed in the end
+        assert await executor.settle(portfolio) == 1
+        return portfolio
+
+    portfolio = run(fake, tmp_path, action)
+    assert portfolio.position(BTC) == pytest.approx(0.00999)
+
+
+def test_no_buy_goes_out_while_another_buy_is_in_doubt(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0, "BTC": 0.01}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        ledger.add_order(T0, "ETHUSDT", 0.1, "unknown", "lost answer", "tbETHB")
+        portfolio = Portfolio(1000.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        assert await executor.execute({BTC: 0.005}, T0, portfolio, MARKS) == []
+        assert statuses(ledger)[-1] == "skipped"
+        sold = await executor.execute({BTC: -0.005}, T0, portfolio, MARKS)
+        assert len(sold) == 1  # a sale still goes out
+        return notifier.messages
+
+    messages = run(fake, tmp_path, action)
+    assert messages[0] == (
+        f"[live] {BTC}: a buy whose result is not known yet may have spent the book's cash; "
+        "no buy this bar"
+    )
+
+
+def test_a_kept_stop_flags_the_coins_bought_since(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0, "BTC": 0.01}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> list[str]:
+        portfolio = Portfolio(1000.0)
+        portfolio.apply(Fill(T0, BTC, 0.01, 50000.0, 0.0))
+        await executor.after_event(portfolio, MARKS)  # a stop for 0.01 at 40,000
+        await executor.execute({BTC: 0.005}, T0, portfolio, MARKS)
+        fake.prices[BTC] = 47000.0  # down from a close at 60,000 since
+        await executor.after_event(portfolio, {BTC: 60000.0})  # the old stop stays
+        assert executor.partial[BTC] == pytest.approx(0.004995)
+        return notifier.messages
+
+    messages = run(fake, tmp_path, action)
+    assert messages[-1] == (
+        f"[live] {BTC}: the stop covers 0.010000 of 0.014995; the price fell through the new "
+        "stop level, so the stop in place stays; the rest has no exchange stop"
+    )
+    assert stops(fake) == [("40000.00", "NEW")]
+
+
+def test_an_answer_that_is_no_json_is_an_answer_in_doubt(tmp_path: Path) -> None:
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={BTC: 50000.0})
+
+    async def action(executor: LiveExecutor, ledger: Ledger, notifier: Collect) -> None:
+        fake.fail_next = [httpx.Response(200, text="<html>proxy</html>")]
+        with pytest.raises(BinanceError) as caught:
+            await executor.spot.balances()
+        assert caught.value.uncertain
+        assert "not a Binance answer" in str(caught.value)
+        fake.error_after_next_order = httpx.Response(200, text="<html>proxy</html>")
+        fills = await executor.execute({BTC: 0.01}, T0, Portfolio(1000.0), MARKS)
+        assert len(fills) == 1  # looked up and booked, not taken for a refusal
+        assert statuses(ledger) == ["pending", "filled"]
+
+    run(fake, tmp_path, action)

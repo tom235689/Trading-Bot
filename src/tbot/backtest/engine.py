@@ -22,12 +22,13 @@ import numpy as np
 import polars as pl
 
 from tbot.core.arrays import readonly
+from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe, from_millis, to_millis
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
 from tbot.portfolio.allocation import StrategySlot, decide_orders, validate_targets
 from tbot.portfolio.portfolio import Portfolio
-from tbot.risk.guard import GuardConfig, Mode, RiskGuard
+from tbot.risk.guard import TURNOVER_WINDOW, Decision, GuardConfig, Mode, RiskGuard
 from tbot.risk.limits import RiskLimits
 from tbot.risk.volatility import volatility_scale
 from tbot.strategies.base import BarWindow, StrategyContext
@@ -51,6 +52,8 @@ class BacktestResult:
     positions: dict[str, float]  # open at the end
     marks: dict[str, float] = field(default_factory=dict)  # last close per symbol
     halted: str = ""  # why the kill switch stopped trading, if it did
+    # Events at which the turnover limit held back an order the strategies wanted.
+    turnover_blocks: tuple[datetime, ...] = ()
 
 
 class _Stream:
@@ -125,6 +128,8 @@ class BacktestEngine:
         self.guard = RiskGuard(guard) if guard else None
         self.halted = ""
         self.protective_stop_pct = protective_stop_pct
+        self.traded: list[tuple[int, float]] = []  # (decided, value) of recent fills
+        self.turnover_blocks: list[datetime] = []
 
     def run(self) -> BacktestResult:
         events = np.unique(np.concatenate([s.close_ms for s in self.streams.values()]))
@@ -138,15 +143,27 @@ class BacktestEngine:
             if trading:
                 self._record(now)
             updated = self._run_strategies(now, revealed)
-            mode = self._check_guard(now, now_ms) if trading else Mode.NORMAL
-            if updated and trading and mode != Mode.HALT:
-                self._rebalance(now_ms, revealed, mode)
+            decision = self._check_guard(now, now_ms) if trading else Decision(Mode.NORMAL)
+            if updated and trading and decision.mode != Mode.HALT:
+                self._rebalance(now_ms, revealed, decision)
         return self._result()
 
-    def _check_guard(self, now: datetime, now_ms: int) -> Mode:
+    def _apply(self, fill: Fill, decided_ms: int) -> None:
+        self.portfolio.apply(fill)
+        self.traded.append((decided_ms, abs(fill.quantity) * fill.price))
+
+    def _traded(self, now_ms: int) -> float:
+        """Value of the fills decided in the last 24 hours: a session fills at once, so it
+        counts the same orders."""
+        since = now_ms - int(TURNOVER_WINDOW.total_seconds() * 1000)
+        self.traded = [(decided, value) for decided, value in self.traded if decided >= since]
+        return sum(value for _, value in self.traded)
+
+    def _check_guard(self, now: datetime, now_ms: int) -> Decision:
         if self.guard is None:
-            return Mode.NORMAL
-        decision = self.guard.check(now, self.portfolio.equity(self.marks), now)
+            return Decision(Mode.NORMAL)
+        equity = self.portfolio.equity(self.marks)
+        decision = self.guard.check(now, equity, now, self._traded(now_ms))
         if decision.mode == Mode.HALT:
             if not self.halted:  # orders still queued were the strategy's: drop them
                 self.halted = f"{now:%Y-%m-%d %H:%M}: {decision.reason}"
@@ -157,7 +174,7 @@ class BacktestEngine:
                 for symbol, quantity in self.portfolio.positions.items()
                 if quantity and symbol not in queued
             ]
-        return decision.mode
+        return decision
 
     def _fill_pending(self, revealed: set[StreamKey]) -> None:
         remaining = []
@@ -178,7 +195,7 @@ class BacktestEngine:
                 self.portfolio.position(order.symbol),
             )
             if fill is not None:
-                self.portfolio.apply(fill)
+                self._apply(fill, order.decided_ms)
         self.pending = remaining
 
     def _stop_out(self, revealed: set[StreamKey], now_ms: int) -> None:
@@ -206,7 +223,7 @@ class BacktestEngine:
                 quantity,
             )
             if fill is not None:
-                self.portfolio.apply(fill)
+                self._apply(fill, now_ms)
 
     def _mark(self, revealed: set[StreamKey]) -> None:
         for symbol, key in self.exec_keys.items():
@@ -235,7 +252,7 @@ class BacktestEngine:
             updated = True
         return updated
 
-    def _rebalance(self, now_ms: int, revealed: set[StreamKey], mode: Mode) -> None:
+    def _rebalance(self, now_ms: int, revealed: set[StreamKey], decision: Decision) -> None:
         scales = None
         if self.risk.target_volatility:
             scales = {
@@ -250,9 +267,13 @@ class BacktestEngine:
         orders = decide_orders(
             self.slots, self.portfolio, self.marks, self.risk, self.rules, scales
         )
-        if mode == Mode.REDUCE_ONLY:
-            orders = RiskGuard.filter_orders(orders, self.portfolio.positions, mode)
         fresh = {symbol for symbol, key in self.exec_keys.items() if key in revealed}
+        if decision.mode == Mode.REDUCE_ONLY:
+            allowed = RiskGuard.filter_orders(orders, self.portfolio.positions, decision.mode)
+            held = {s for s in fresh if s in orders and allowed.get(s) != orders[s]}
+            if held and decision.rule == "turnover":
+                self.turnover_blocks.append(from_millis(now_ms))
+            orders = allowed
         kept = [order for order in self.pending if order.symbol not in fresh]
         self.pending = kept + [PendingOrder(now_ms, s, q) for s, q in orders.items() if s in fresh]
 
@@ -313,4 +334,5 @@ class BacktestEngine:
             positions=dict(self.portfolio.positions),
             marks=dict(self.marks),
             halted=self.halted,
+            turnover_blocks=tuple(self.turnover_blocks),
         )

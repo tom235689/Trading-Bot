@@ -38,6 +38,7 @@ STOP_PREFIX = "tbs"
 STOP_META = "stop:"  # + symbol: the protective stop in force and how much of it is booked
 TAG_META = "order_tag"
 BUY_MARGIN = 0.002  # keep this much quote free for price movement between quote and fill
+LIMIT_ROOM = 0.005  # a limit buy may execute this far above the ask it was priced on
 LOOKUP_DELAYS = (0.5, 1.0, 2.0, 4.0)  # seconds between lookups of an order in doubt
 ORDER_PATIENCE = 120.0  # seconds after sending before an order Binance does not know failed
 PRICE_ATTEMPTS = 3  # a paper quote lost to a network blip is asked again
@@ -98,6 +99,18 @@ def _sorted(orders: Mapping[str, float]) -> list[tuple[str, float]]:
     return sorted(orders.items(), key=lambda item: item[1])  # sells first fund buys
 
 
+def limit_problem(ask: float, close: float, pct: float) -> str:
+    """Why a buy at this ask pays too much over the close it was decided on, or ""."""
+    if ask <= close * (1 + pct):
+        return ""
+    if not close > 0:
+        return "no close to price it on"
+    return (
+        f"the ask {price_text(ask)} is {ask / close - 1:.1%} above the close "
+        f"{price_text(close)} it was decided on, beyond buy_limit_pct {pct:g}"
+    )
+
+
 class FailureAlerts:
     """A symbol's failed order is sent once an hour: a halt tries its sale again within
     minutes, and an outage would otherwise bury every other alert."""
@@ -128,6 +141,8 @@ class PaperExecutor:
         notifier: Notifier,
         clock: Callable[[], datetime],
         label: str = "paper",
+        *,
+        buy_limit_pct: float = 0.0,
     ) -> None:
         self.broker = broker
         self.prices = prices
@@ -135,6 +150,7 @@ class PaperExecutor:
         self.notifier = notifier
         self.clock = clock
         self.label = label
+        self.buy_limit_pct = buy_limit_pct
         self.failures = FailureAlerts(notifier)
 
     async def execute(
@@ -155,6 +171,13 @@ class PaperExecutor:
                     symbol, f"[{self.label}] price lookup failed for {symbol}: {exc!r}"
                 )
                 continue
+            if quantity > 0 and self.buy_limit_pct:
+                problem = limit_problem(reference, marks.get(symbol, 0.0), self.buy_limit_pct)
+                if problem:
+                    await _skip_buy(
+                        self.ledger, self.notifier, self.label, now, symbol, quantity, problem
+                    )
+                    continue
             fill = self.broker.fill(
                 self.clock(),
                 symbol,
@@ -201,6 +224,8 @@ class LiveExecutor:
         fee_rate: float,
         protective_stop_pct: float,
         label: str = "live",
+        buy_limit_pct: float = 0.0,
+        market_marks: bool = True,
     ) -> None:
         self.spot = spot
         self.ledger = ledger
@@ -209,6 +234,10 @@ class LiveExecutor:
         self.fee_rate = fee_rate
         self.protective_stop_pct = protective_stop_pct
         self.label = label
+        self.buy_limit_pct = buy_limit_pct
+        # Whether the closes come from the market the orders go to: testnet has prices of
+        # its own, so its limits start from its own ask.
+        self.market_marks = market_marks
         self.unprotected: set[str] = set()  # held symbols whose stop is missing
         self.alerted: set[str] = set()  # stop failures already sent, until one works
         self.statuses: dict[str, str] = {}  # each symbol's Binance status as last reported
@@ -238,7 +267,16 @@ class LiveExecutor:
                     f"[{self.label}] {symbol}: an earlier order was in doubt; no order this bar"
                 )
                 continue
-            fill = await self._execute_order(symbol, quantity, now, portfolio)
+            if quantity > 0 and self._buy_in_doubt():
+                # Its cost is still in the book's cash: a buy now could spend the owner's.
+                self.ledger.add_order(now, symbol, quantity, "skipped", "a buy in doubt")
+                await self.notifier.send(
+                    f"[{self.label}] {symbol}: a buy whose result is not known yet may have "
+                    "spent the book's cash; no buy this bar"
+                )
+                continue
+            close = marks.get(symbol, 0.0)
+            fill = await self._execute_order(symbol, quantity, now, portfolio, close)
             if fill is not None:
                 self.failures.worked(symbol)
                 fills.append(fill)
@@ -246,7 +284,7 @@ class LiveExecutor:
         return fills
 
     async def _execute_order(
-        self, symbol: str, quantity: float, now: datetime, portfolio: Portfolio
+        self, symbol: str, quantity: float, now: datetime, portfolio: Portfolio, close: float
     ) -> Fill | None:
         """Send one order and book it; a failure is recorded and alerted, never raised.
 
@@ -256,7 +294,7 @@ class LiveExecutor:
         for retry in (False, True):
             client_id = self._new_id(now, symbol, quantity)
             try:
-                return await self._execute_one(symbol, quantity, now, portfolio, client_id)
+                return await self._execute_one(symbol, quantity, now, portfolio, client_id, close)
             except OrderUnknown as exc:
                 log.error("order_unknown", symbol=symbol, client_order_id=client_id)
                 self.ledger.add_order(now, symbol, quantity, "unknown", str(exc), client_id)
@@ -307,6 +345,11 @@ class LiveExecutor:
                 doubtful.add(record.symbol)
         return doubtful
 
+    def _buy_in_doubt(self) -> bool:
+        return any(
+            r.quantity > 0 and self._listed(r.symbol) for r in self.ledger.unresolved_orders()
+        )
+
     def _new_id(self, now: datetime, symbol: str, quantity: float) -> str:
         """A second decision at the same close (a late stream) must not reuse an id."""
         attempt = 1
@@ -317,7 +360,13 @@ class LiveExecutor:
         return client_id
 
     async def _execute_one(
-        self, symbol: str, quantity: float, now: datetime, portfolio: Portfolio, client_id: str
+        self,
+        symbol: str,
+        quantity: float,
+        now: datetime,
+        portfolio: Portfolio,
+        client_id: str,
+        close: float,
     ) -> Fill | None:
         if not self.spot.trading(symbol):
             status = self.spot.status[symbol]
@@ -331,12 +380,27 @@ class LiveExecutor:
         if not reference > 0:
             self.ledger.add_order(now, symbol, quantity, "skipped", "no price in the book")
             return None
+        limit = None
+        if quantity > 0 and self.buy_limit_pct:
+            anchor = close if self.market_marks else reference
+            problem = limit_problem(reference, anchor, self.buy_limit_pct)
+            if problem:
+                await _skip_buy(
+                    self.ledger, self.notifier, self.label, now, symbol, quantity, problem
+                )
+                return None
+            cap = anchor * (1 + self.buy_limit_pct)
+            limit = rules.round_price(min(cap, reference * (1 + LIMIT_ROOM)))
         if quantity > 0:
             # Spend neither more than the account holds nor more than the book's own cash:
             # with budget ownership the rest of the account is the owner's money.
             free = balances[rules.quote].free if rules.quote in balances else 0.0
             spendable = max(0.0, min(free, portfolio.cash))
-            quantity = min(quantity, spendable / (reference * (1 + self.fee_rate + BUY_MARGIN)))
+            if limit is None:
+                price = reference * (1 + self.fee_rate + BUY_MARGIN)
+            else:  # Binance holds quantity times the limit while it is sent
+                price = limit * (1 + self.fee_rate)
+            quantity = min(quantity, spendable / price)
         else:
             # Never sell more than the book holds: in budget mode the rest is the owner's,
             # and a stop booked by cancel_stops above may have sold part of it already.
@@ -353,37 +417,55 @@ class LiveExecutor:
             self.ledger.add_order(now, symbol, quantity, "skipped", "below exchange minimum")
             return None
         self.ledger.add_order(now, symbol, quantity, "pending", "", client_id)  # write-ahead
-        order = await self._place(symbol, quantity, client_id)
+        order = await self._place(symbol, quantity, client_id, limit)
         fill = await self._book(order, rules, now, quantity, reference, portfolio, client_id)
-        await self._note_short(order, quantity, rules)
+        await self._note_short(order, quantity, rules, limit)
         return fill
 
-    async def _note_short(self, order: Order, quantity: float, rules: SymbolRules) -> None:
-        """Say when Binance ended a market order before all of it executed: too little in
-        the book, or the owner's own order on the other side (self-trade prevention)."""
+    async def _note_short(
+        self, order: Order, quantity: float, rules: SymbolRules, limit: float | None = None
+    ) -> None:
+        """Say when Binance ended an order before all of it executed: the price moved past
+        a buy's limit, too little in the book, or the owner's own order on the other side
+        (self-trade prevention)."""
         if abs(quantity) - order.executed_qty < float(rules.step_size) / 2:
             return
         side = "BUY" if quantity > 0 else "SELL"
         log.warning(
             "order_short", symbol=order.symbol, status=order.status, executed=order.executed_qty
         )
+        if limit is not None and order.status == "EXPIRED":
+            await self.notifier.send(
+                f"[{self.label}] the {order.symbol} buy executed {order.executed_qty:.6f} of "
+                f"{abs(quantity):.6f} within its limit {price_text(limit)}: the price moved "
+                "past it; the rest waits for the next decision"
+            )
+            return
         if order.executed_qty:
             done = f"after {order.executed_qty:.6f} of {abs(quantity):.6f}; the rest waits"
         else:
             done = "with nothing executed; it waits"
+        why = ""
+        if order.status == "EXPIRED_IN_MATCH":
+            why = ": it met a resting order of this account (self-trade prevention)"
         await self.notifier.send(
             f"[{self.label}] Binance ended the {side} order for {order.symbol} "
-            f"({order.status}) {done} for the next decision"
+            f"({order.status}{why}) {done} for the next decision"
         )
 
-    async def _place(self, symbol: str, quantity: float, client_id: str) -> Order:
-        """Send the order. When the answer leaves its fate open, ask the exchange by client id.
+    async def _place(
+        self, symbol: str, quantity: float, client_id: str, limit: float | None = None
+    ) -> Order:
+        """Send the order: at the market, or with a limit as an IOC order. When the answer
+        leaves its fate open, ask the exchange by client id.
 
         Raises OrderUnknown when the lookups find nothing: an order whose send status was
         unknown can still appear later, so settle() asks again before deciding it failed.
         """
         sent = self.clock()
         try:
+            if limit is not None:
+                return await self.spot.limit_ioc_order(symbol, quantity, limit, client_id)
             return await self.spot.market_order(symbol, quantity, client_id)
         except BinanceError as exc:
             if not exc.uncertain:
@@ -392,6 +474,7 @@ class LiveExecutor:
         except httpx.HTTPError as exc:
             cause = exc
         log.warning("order_send_uncertain", symbol=symbol, error=repr(cause))
+        state = "not found yet"
         for delay in LOOKUP_DELAYS:
             await asyncio.sleep(delay)
             try:  # one try each: these lookups are the retries, under the event lock
@@ -399,11 +482,13 @@ class LiveExecutor:
             except (BinanceError, httpx.HTTPError) as exc:
                 log.warning("order_lookup_failed", symbol=symbol, error=repr(exc))
                 continue
-            if order is not None:
+            if order is not None and order.done:
                 log.warning("order_recovered", symbol=symbol, client_order_id=client_id)
                 return order
+            if order is not None:  # booked now, what executes later would be lost
+                state = f"still working ({order.status})"
         self.missing_since[client_id] = sent
-        raise OrderUnknown(f"{symbol} {client_id}: sent, then {cause!r}; not found yet")
+        raise OrderUnknown(f"{symbol} {client_id}: sent, then {cause!r}; {state}")
 
     async def _book(
         self,
@@ -736,6 +821,7 @@ class LiveExecutor:
                     # The price fell through the new level since the close, and Binance
                     # refuses a stop that would trigger at once: the one working stays.
                     log.warning("stop_kept", symbol=symbol, level=level, bid=bid)
+                    await self._note_kept(symbol, state, portfolio, level)
                     return
             await self._cancel_own_stops(symbol)
             cancelled = True  # from here on, a failure leaves the position without a stop
@@ -767,6 +853,24 @@ class LiveExecutor:
                     f"[{self.label}] protective stop failed for {symbol}: {exc}. {left}; "
                     "retrying at every reconciliation"
                 )
+
+    async def _note_kept(
+        self, symbol: str, state: StopState, portfolio: Portfolio, level: float
+    ) -> None:
+        """A stop kept as it was covers the position it was placed for: flag coins bought
+        since (this event's buy) as without a stop until the next refit."""
+        try:
+            order = await self.spot.get_order(symbol, state["id"])
+        except (BinanceError, httpx.HTTPError) as exc:
+            log.warning("stop_lookup_failed", symbol=symbol, error=repr(exc))
+            return
+        if order is None or order.done:
+            return  # settle books it, and a new stop covers the whole position
+        why = "the price fell through the new stop level, so the stop in place stays; the rest has"
+        covered = order.orig_qty - order.executed_qty
+        await self._note_partial(
+            symbol, portfolio.position(symbol), covered, order.stop_price or level, why
+        )
 
     async def _drop_stop(self, symbol: str, portfolio: Portfolio) -> None:
         """Cancel a stop placed while stops were on, and book what it sold first."""
@@ -881,6 +985,22 @@ class BinanceBookTicker:
         response.raise_for_status()
         data = response.json()
         return float(data["askPrice"] if side > 0 else data["bidPrice"])
+
+
+async def _skip_buy(
+    ledger: Ledger,
+    notifier: Notifier,
+    label: str,
+    now: datetime,
+    symbol: str,
+    quantity: float,
+    problem: str,
+) -> None:
+    log.warning("buy_beyond_limit", symbol=symbol, problem=problem)
+    ledger.add_order(now, symbol, quantity, "skipped", problem)
+    await notifier.send(
+        f"[{label}] no {symbol} buy this bar: {problem}; the next close decides again"
+    )
 
 
 def _stop_fit(rules: SymbolRules) -> tuple[object, ...]:

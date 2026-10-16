@@ -39,6 +39,9 @@ def volatility_scale(
         return 1.0
     values = np.asarray(closes, dtype=np.float64)
     window = values[-(lookback_bars(timeframe, lookback_days) + 1) :]
+    # A bad close (zero, negative, NaN) is left out: taken in, it makes the estimate nan,
+    # which would hold the full weight instead of the scaled one.
+    window = window[np.isfinite(window) & (window > 0)]
     if len(window) < MIN_BARS + 1:
         return 1.0
     realized = realized_volatility(window, timeframe)

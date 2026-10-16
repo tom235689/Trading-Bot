@@ -28,6 +28,7 @@ from tbot.research.trials import TrialLog
 from tbot.research.validate import (
     ValidationConfig,
     WalkForwardConfig,
+    _gate,
     load_validation_config,
     run_validation,
 )
@@ -434,3 +435,37 @@ def test_validation_checks_its_walk_forward_and_costs_before_running(tmp_path: P
     path.write_text(VALIDATION + "cost_multiplier: 1000\n", encoding="utf-8")
     with pytest.raises(ValueError, match="cost_multiplier 1000 takes the fee rate"):
         load_validation_config(path)
+
+
+def test_the_gate_wants_more_than_holding_and_luck(tmp_path: Path, data_dir: Path) -> None:
+    config, base = load_validation_config(write_validation(tmp_path))
+    report = run_validation(config, base, data_dir, TrialLog(tmp_path / "trials.jsonl"))
+    holding = report.holding
+    assert holding is not None
+    # The same symbols held over the same test segments: same span, one entry each.
+    assert (holding.start, holding.end) == (report.oos.start, report.oos.end)
+    assert holding.trades == 0  # bought at each segment's start, never sold
+    checks = {check.name: check for check in report.gate}
+    over = checks["out-of-sample Sharpe over holding"]
+    assert (over.value, over.threshold, over.passed) == (report.oos.sharpe, holding.sharpe, True)
+    assert checks["deflated Sharpe"].value == report.deflated.probability
+    assert [check.name for check in report.gate][-2:] == ["holdout length", "holdout return"]
+
+    stronger = replace(holding, sharpe=report.oos.sharpe + 0.1)
+    unlucky = replace(report.deflated, probability=0.9)
+    gate = {c.name: c for c in _gate(config, report.oos, report.stress, 61, unlucky, stronger)}
+    assert not gate["out-of-sample Sharpe over holding"].passed
+    assert not gate["deflated Sharpe"].passed
+
+    text = format_report(report)
+    assert "holding them  CAGR" in text
+    assert f"deflated Sharpe: {report.deflated.probability:.1%} vs 95%" in text
+
+    off = config.model_copy(
+        update={
+            "gate": config.gate.model_copy(update={"beat_holding": False, "min_deflated_sharpe": 0})
+        }
+    )
+    names = [c.name for c in _gate(off, report.oos, report.stress, 61, unlucky, None)]
+    assert "deflated Sharpe" not in names
+    assert "out-of-sample Sharpe over holding" not in names

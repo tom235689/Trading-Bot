@@ -19,6 +19,7 @@ from tbot.risk.guard import GuardConfig
 ONE_QUOTE = "a book keeps one cash, so every symbol of a session needs the same quote asset"
 FRACTION = "a fraction (0.002 means 0.2%)"
 MAX_TOLERANCE = 0.05  # a reconciliation mismatch beyond 5% is never noise
+MAX_BUY_LIMIT = 0.5  # a buy limit beyond 50% above the close limits nothing
 OTHER_VARIABLES = {"TBOT_SUPERVISED", "TBOT_DEBUG"}  # read from the environment, not a setting
 ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 
@@ -35,6 +36,16 @@ class SessionConfig(TradingConfig):
     # Answer /status, /fills, and /halt from the Telegram chat. The sessions of a clone
     # take turns reading the bot's messages; a real-money one goes first.
     telegram_commands: bool = True
+    # A buy pays at most this much above the close it was decided on; when the price is
+    # already beyond, the buy waits for the next close. Sales always go out. 0: no limit.
+    buy_limit_pct: float = Field(default=0.02, ge=0, allow_inf_nan=False)
+
+    @field_validator("buy_limit_pct")
+    @classmethod
+    def limit_fraction(cls, value: float) -> float:
+        if value > MAX_BUY_LIMIT:  # 2 meant as 2% would let a buy pay three times the close
+            raise ValueError(f"must be at most {MAX_BUY_LIMIT:g}: a fraction (0.02 means 2%)")
+        return value
 
 
 class PaperConfig(SessionConfig):

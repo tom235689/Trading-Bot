@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.11.0 (2026-10-16)
+
+Trading safety: a limit on what a buy pays, a turnover limit, a gate that wants more than being long, and fixes from three reviews of the order path, the session loop, and the validation. Upgrade notes:
+- Buys on testnet and live are limit orders that execute what they can at once and drop the rest (IOC): at most 0.5% above the ask and at most `buy_limit_pct` (0.02) above the close they were decided on. When the ask is already beyond, the buy waits for the next close (alerted). Paper skips such a buy too. Sales, the kill switch, `tbot halt`, and exchange stops stay market orders. `buy_limit_pct: 0` gives market buys as before.
+- New guard rule `max_daily_turnover` (3): no new entries while the fills of the last 24 hours are worth more than 3 times the equity. The shipped strategies stay near 1 on 2018-2026 history. Backtests with a `guard` apply it, and doctor's kill switch history check names a config that would have hit it.
+- `tbot validate` has two more gate checks: the out-of-sample Sharpe must beat holding the same coins with the same risk settings over the same segments (`gate.beat_holding`), and the deflated Sharpe must reach 95% (`gate.min_deflated_sharpe`). The configured Donchian candidate also fails the first (0.79 against 0.88). A new `hold` strategy is the benchmark, and it can be backtested.
+- Ledgers kept by 0.10.0 or older see no "config changed" for the new settings left at their defaults.
+
+**Orders and the exchange**
+- A buy that meets a resting order of the account's own (the owner's, in budget mode) ends there instead of cancelling it: Binance's default self-trade prevention (`EXPIRE_MAKER`) cancelled the owner's order without a word. Buys send `EXPIRE_TAKER` where the pair allows it, and the alert says what happened. Sales keep the default, so an exit goes out.
+- An order whose answer was lost and that a lookup finds still working stays in doubt until it is done, instead of being booked as final. Before, what executed after the lookup was never booked, and the coins became the owner's.
+- While a buy's result is in doubt, no other buy goes out: its cost may already be spent, and in budget mode the next buy could spend the owner's cash.
+- A stop kept because the price fell through its new level flags coins an event bought since as without a stop (alerted, named in the summary), instead of leaving them uncovered without a word.
+- A 200 answer that is not JSON (a proxy's page) counts as an answer in doubt (-1006): an order is looked up instead of taken as refused, and a read fails like any other Binance error instead of ending the session.
+
+**The session and the guard**
+- The daily loss limit counts days by the bars' closes, not by the clock: a PC that slept through midnight measured the new day against the evening before, and blocked entries for a whole day in which nothing was lost (or let a real loss pass).
+- A halt sells every position Binance takes: one worth less than `rebalance.min_notional` (10) but more than Binance's minimum (5) was left as dust before.
+- A turnover block and a daily loss block are each alerted once a day; one no longer hides the other.
+- A zero, negative, or missing close in the volatility window is left out instead of turning volatility targeting off (full weight), and a mark that is no number plans no orders.
+
+**Tests**
+- 37 new tests (771 in all); undoing any of 49 changes, one at a time, makes a test fail.
+
 ## 0.10.0 (2026-10-15)
 
 Fixes and additions from a review of the whole code base in eight parts: the session core, orders and the exchange, the command line, market data, research, monitoring, operations, and the documents with a new owner's first run. Upgrade notes:

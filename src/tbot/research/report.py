@@ -63,6 +63,8 @@ def format_report(r: ValidationReport) -> str:
             f"return {m.total_return:+7.1%}  trades {m.trades}"
         )
     lines.append("   " + _line("stitched OOS", r.oos))
+    if r.holding is not None:  # the same symbols and risk settings, held all along
+        lines.append("   " + _line("holding them", r.holding))
     lines.append(
         "   (segments start flat: what one holds at its end counts at the last close, unsold)"
     )
@@ -122,6 +124,8 @@ def _holdout_lines(r: ValidationReport) -> list[str]:
 
 
 def _values(check: GateCheck) -> str:
+    if check.name == "deflated Sharpe":  # a probability
+        return f"{check.value:.1%} vs {check.threshold:.0%}"
     if check.name == "holdout length":
         short = "" if check.passed else ": too short"
         return f"{int(check.value)} days vs {check.threshold:g}{short}"

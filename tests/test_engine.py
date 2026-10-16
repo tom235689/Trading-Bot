@@ -354,3 +354,46 @@ def test_protective_stops_are_off_by_default() -> None:
         other = run(hold_from_1h(), bars, protective_stop_pct=pct)
         assert other.fills.equals(default.fills)
         assert other.equity.equals(default.equity)
+
+
+def test_a_strategy_that_flips_every_bar_is_held_back_by_the_turnover_limit() -> None:
+    closes = [100.0] * 14
+    bars = price_bars(T0, H1, opens=closes, closes=closes)
+    script = {at(h): {"BTC": 1.0 if h % 2 else 0.0} for h in range(1, 14)}
+    engine = BacktestEngine(
+        [StrategySlot(Scripted(["BTC"], {"script": script}), H1, 1.0)],
+        {("BTC", H1): bars},
+        start=T0,
+        initial_cash=1000.0,
+        costs=COSTS,
+        risk=RiskLimits(),
+        rules=RULES,
+        guard=GuardConfig(daily_loss_limit=0, max_drawdown=0, stale_seconds=0),
+    )
+    result = engine.run()
+    # Buy, sell, buy, sell: then over 3x equity in 24 hours, and no buy goes out again.
+    assert [q > 0 for q in result.fills["quantity"].to_list()] == [True, False, True, False]
+    assert result.turnover_blocks[0] == at(5)
+    # The last target holds at 14h: held back too.
+    assert result.turnover_blocks == (*(at(h) for h in range(5, 14, 2)), at(14))
+    assert result.halted == ""
+
+
+def test_the_turnover_window_lets_go_after_a_day() -> None:
+    closes = [100.0] * 40
+    bars = price_bars(T0, H1, opens=closes, closes=closes)
+    script = {at(h): {"BTC": 1.0 if h % 2 else 0.0} for h in range(1, 7)}  # ends flat
+    script[at(31)] = {"BTC": 1.0}  # a day after the last sale
+    engine = BacktestEngine(
+        [StrategySlot(Scripted(["BTC"], {"script": script}), H1, 1.0)],
+        {("BTC", H1): bars},
+        start=T0,
+        initial_cash=1000.0,
+        costs=COSTS,
+        risk=RiskLimits(),
+        rules=RULES,
+        guard=GuardConfig(daily_loss_limit=0, max_drawdown=0, stale_seconds=0),
+    )
+    result = engine.run()
+    assert result.fills["time"].to_list()[-1] == at(31)  # bought again once the day passed
+    assert result.positions["BTC"] > 0

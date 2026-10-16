@@ -49,6 +49,9 @@ ARCHIVED = "ARCHIVED"  # the status of an order Binance archived: done, nothing 
 DONE = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", ARCHIVED})
 UNLISTED = "UNLISTED"  # the status of a configured pair Binance no longer lists
 NOISE = Decimal("1e-6")  # of a step: closer than this to it is float rounding, not a remainder
+# Self-trade prevention for buys: the bot's order ends instead of the owner's resting one,
+# which Binance's default (EXPIRE_MAKER) would cancel without a word.
+EXPIRE_TAKER = "EXPIRE_TAKER"
 Params = Mapping[str, str | int | float]
 
 
@@ -77,6 +80,7 @@ class SymbolRules:
     min_qty: Decimal
     min_notional: Decimal
     max_qty: Decimal = Decimal(0)  # the largest market order; 0: no limit
+    self_trade_modes: frozenset[str] = frozenset()  # allowedSelfTradePreventionModes
 
     def round_quantity(self, quantity: float) -> float:
         """Round the magnitude down to the step size; the sign is kept.
@@ -193,6 +197,7 @@ def parse_rules(info: Mapping[str, Any]) -> SymbolRules:
         min_qty=Decimal(filters["LOT_SIZE"]["minQty"]),
         min_notional=Decimal(notional.get("minNotional", "0")),
         max_qty=min((limit for limit in limits if limit > 0), default=Decimal(0)),
+        self_trade_modes=frozenset(info.get("allowedSelfTradePreventionModes", ())),
     )
 
 
@@ -317,7 +322,12 @@ class BinanceSpot:
                     resynced = True
                     continue
                 raise error
-            return response.json()
+            try:
+                return response.json()
+            except ValueError:  # a proxy's page with status 200: an order may be out
+                raise BinanceError(
+                    UNEXPECTED_RESPONSE, f"not a Binance answer: {response.text[:80]!r}"
+                ) from None
 
     # public
 
@@ -410,8 +420,36 @@ class BinanceSpot:
             "quantity": self.rules[symbol].format_quantity(quantity),
             "newClientOrderId": client_order_id,
             "newOrderRespType": "FULL",
+            **self._buy_protection(symbol, quantity),
         }
         return parse_order(await self._request("POST", "/api/v3/order", params, signed=True))
+
+    async def limit_ioc_order(
+        self, symbol: str, quantity: float, price: float, client_order_id: str
+    ) -> Order:
+        """A limit order that executes what it can at `price` or better at once; Binance
+        expires the rest (status EXPIRED). It holds quantity times price of the quote while
+        it is sent, so a buy needs that much free."""
+        rules = self.rules[symbol]
+        params: dict[str, str | int | float] = {
+            "symbol": symbol,
+            "side": "BUY" if quantity > 0 else "SELL",
+            "type": "LIMIT",
+            "timeInForce": "IOC",
+            "quantity": rules.format_quantity(quantity),
+            "price": rules.format_price(price),
+            "newClientOrderId": client_order_id,
+            "newOrderRespType": "FULL",
+            **self._buy_protection(symbol, quantity),
+        }
+        return parse_order(await self._request("POST", "/api/v3/order", params, signed=True))
+
+    def _buy_protection(self, symbol: str, quantity: float) -> dict[str, str]:
+        """A buy that meets the account's own resting sell (the owner's, in budget mode)
+        ends there instead of cancelling it. Sales keep Binance's default: an exit goes out."""
+        if quantity > 0 and EXPIRE_TAKER in self.rules[symbol].self_trade_modes:
+            return {"selfTradePreventionMode": EXPIRE_TAKER}
+        return {}
 
     async def stop_loss_order(
         self, symbol: str, quantity: float, stop_price: float, client_order_id: str

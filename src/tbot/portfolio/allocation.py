@@ -61,7 +61,7 @@ def decide_orders(
     `scales` are per-symbol volatility scales in [0, 1] from `risk.volatility`.
     """
     equity = portfolio.equity(marks)
-    if equity <= 0:
+    if not equity > 0:  # also nan: a bad mark plans nothing rather than nan orders
         return {}
     weights = risk.apply(combine_targets(slots), scales)
     return plan_orders(weights, portfolio.positions, marks, equity, rules)

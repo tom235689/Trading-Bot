@@ -47,7 +47,7 @@ from tbot.research.sweep import (
     run_sweep,
 )
 from tbot.research.trials import TrialLog, make_record
-from tbot.research.walkforward import WalkForwardResult, run_walk_forward, windows
+from tbot.research.walkforward import WalkForwardResult, run_walk_forward, stitch, windows
 
 
 class WalkForwardConfig(BaseModel):
@@ -83,6 +83,11 @@ class GateConfig(BaseModel):
     max_drawdown: float = Field(default=0.25, gt=0, lt=1)
     min_trades: int = Field(default=100, ge=1)
     min_holdout_days: int = Field(default=180, ge=1)  # a few days' return confirms nothing
+    # P(true Sharpe > 0) after every logged trial (step 7); 0 leaves the check out.
+    min_deflated_sharpe: float = Field(default=0.95, ge=0, le=1)
+    # The out-of-sample Sharpe must beat holding the same symbols under the same risk
+    # settings over the same segments: being long a rising market is no skill.
+    beat_holding: bool = True
 
 
 class ValidationConfig(BaseModel):
@@ -207,6 +212,7 @@ class ValidationReport:
     monte_carlo: MonteCarloSummary  # in-sample baseline
     monte_carlo_oos: MonteCarloSummary  # stitched walk-forward test segments
     deflated: DeflatedSharpe
+    holding: Metrics | None  # the symbols held over the test segments; None if not asked
     holdout: Metrics | None  # None when the checks before it failed: it was not looked at
     holdout_evaluations: int
     gate: list[GateCheck]
@@ -262,6 +268,7 @@ def run_validation(
         records = [make_record(r.config, r.metrics, "walkforward-train") for r in window.train_runs]
         log.append(records)
     oos = compute_metrics(walk.stitched)
+    holding = _holding(in_sample, walk, data_dir) if config.gate.beat_holding else None
 
     progress("Monte Carlo and deflated Sharpe")
     mc = config.monte_carlo
@@ -284,7 +291,7 @@ def run_validation(
     monte_carlo_oos = resample(walk.stitched)
     deflated = _deflated(daily_returns(baseline_result), log.selection_sharpes(baseline_record))
 
-    gate = _gate(config, oos, stress, _holdout_days(config, base, data_dir))
+    gate = _gate(config, oos, stress, _holdout_days(config, base, data_dir), deflated, holding)
     holdout = None
     if force_holdout or all(check.passed for check in gate):
         progress("holdout")
@@ -306,10 +313,24 @@ def run_validation(
         monte_carlo=monte_carlo,
         monte_carlo_oos=monte_carlo_oos,
         deflated=deflated,
+        holding=holding,
         holdout=holdout,
         holdout_evaluations=log.holdout_looks(baseline_record, config.holdout_start),
         gate=gate,
     )
+
+
+def _holding(config: BacktestConfig, walk: WalkForwardResult, data_dir: Path) -> Metrics:
+    """The strategy's symbols held all along, with its allocation, risk limits (volatility
+    targeting too), costs, and rebalance rules, over the same test segments, stitched the
+    same way. Not logged: it is a benchmark, no trial."""
+    hold = config.strategies[0].model_copy(update={"name": "hold", "params": {}})
+    held = config.model_copy(update={"strategies": [hold]})
+    results = [
+        evaluate(held.with_period(w.window.train_end, w.window.test_end), data_dir)[0]
+        for w in walk.windows
+    ]
+    return compute_metrics(stitch(results, config.initial_cash))
 
 
 def _holdout_days(config: ValidationConfig, base: BacktestConfig, data_dir: Path) -> float:
@@ -356,12 +377,17 @@ def _deflated(returns: npt.NDArray[np.float64], annual_sharpes: list[float]) -> 
 
 
 def _gate(
-    config: ValidationConfig, oos: Metrics, stress: Metrics, holdout_days: float
+    config: ValidationConfig,
+    oos: Metrics,
+    stress: Metrics,
+    holdout_days: float,
+    deflated: DeflatedSharpe,
+    holding: Metrics | None,
 ) -> list[GateCheck]:
     """The checks that need no look at the holdout."""
     gate = config.gate
     dd_limit = -gate.max_drawdown
-    return [
+    checks = [
         GateCheck(
             "out-of-sample Sharpe",
             oos.sharpe,
@@ -380,10 +406,31 @@ def _gate(
             0,
             stress.total_return > 0,
         ),
+    ]
+    if holding is not None:
+        checks.append(
+            GateCheck(
+                "out-of-sample Sharpe over holding",
+                oos.sharpe,
+                holding.sharpe,
+                oos.sharpe > holding.sharpe,
+            )
+        )
+    if gate.min_deflated_sharpe:
+        checks.append(
+            GateCheck(
+                "deflated Sharpe",
+                deflated.probability,
+                gate.min_deflated_sharpe,
+                deflated.probability >= gate.min_deflated_sharpe,
+            )
+        )
+    checks.append(
         GateCheck(
             "holdout length",
             holdout_days,
             gate.min_holdout_days,
             holdout_days >= gate.min_holdout_days,
-        ),
-    ]
+        )
+    )
+    return checks

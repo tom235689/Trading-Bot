@@ -439,7 +439,16 @@ def test_a_testnet_session_buys_places_its_stop_and_stops_cleanly(
     an order at a breakout bar, and the stop that protects it."""
     notifier, feeds = offline
     paper, _, breakout = setup_store(tmp_path)
-    fake = FakeSpot(balances={"USDT": 1000.0}, prices={"BTCUSDT": 130.0})
+    # Testnet trades at prices of its own: 140 against the market's close at 130.
+    fake = FakeSpot(balances={"USDT": 1000.0}, prices={"BTCUSDT": 140.0})
+    traders: list[runner.SessionTrader] = []
+
+    class Trader(runner.SessionTrader):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            traders.append(self)
+
+    monkeypatch.setattr(runner, "SessionTrader", Trader)
 
     def spot(*args: Any, **kwargs: Any) -> BinanceSpot:  # config, settings, client, clock
         return BinanceSpot(fake.client(), "key", "secret", base_url=TESTNET_URL, clock=args[3])
@@ -473,6 +482,8 @@ def test_a_testnet_session_buys_places_its_stop_and_stops_cleanly(
     assert notifier.messages[-1].startswith("[testnet] stopped")
     assert "their exchange stops stay" in notifier.messages[-1]
     assert fake.balances["USDT"] < 1000.0  # the order reached the exchange
+    assert fake.order_count("LIMIT") == 1  # a buy with a limit, priced on testnet's ask
+    assert traders[0].minimum("BTCUSDT") == 5.0  # a halt sells down to Binance's minimum
     with Ledger(config.ledger) as ledger:
         assert ledger.counts()["fills"] == 1
     [entry] = registered_sessions(tmp_path / "data")  # `tbot halt` finds it by its config
@@ -544,3 +555,32 @@ def test_a_problem_of_the_feed_reaches_the_owner_and_the_ledger(
     with Ledger(config.ledger) as ledger:
         events = ledger.events_starting(f"[paper] {problem}")
     assert [event.level for event in events] == ["warning"]
+
+
+def test_a_paper_session_holds_back_a_buy_the_price_ran_away_from(
+    tmp_path: Path, offline: tuple[Collect, list[LiveFeed]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notifier, feeds = offline
+    config, _, breakout = setup_store(tmp_path)  # the breakout closes at 130
+
+    class Away:
+        async def price(self, symbol: str, side: int) -> float:
+            return 140.0  # 7.7% above the close: beyond buy_limit_pct 0.02
+
+    monkeypatch.setattr(runner, "BinanceBookTicker", lambda client: Away())
+
+    async def scenario() -> int:
+        stop = asyncio.Event()
+        session = asyncio.create_task(
+            run_paper(config, Settings(_env_file=None), tmp_path / "data", stop=stop)  # type: ignore[call-arg]
+        )
+        await until(lambda: bool(feeds) and any("started" in m for m in notifier.messages))
+        feeds[0].queue.put_nowait((KEY, breakout))
+        await until(lambda: any("no BTCUSDT buy this bar" in m for m in notifier.messages))
+        stop.set()
+        return await session
+
+    assert asyncio.run(scenario()) == 0
+    assert not any("BUY" in m for m in notifier.messages)
+    with Ledger(config.ledger) as ledger:
+        assert ledger.counts()["fills"] == 0

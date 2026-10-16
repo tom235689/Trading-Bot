@@ -13,7 +13,7 @@ from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
 from tbot.live.history import BarHistory
 from tbot.live.session import TradingSession
-from tbot.portfolio.allocation import StrategySlot
+from tbot.portfolio.allocation import StrategySlot, decide_orders
 from tbot.portfolio.portfolio import Portfolio
 from tbot.risk.limits import RiskLimits
 from tbot.risk.volatility import lookback_bars, realized_volatility, volatility_scale
@@ -163,3 +163,21 @@ def test_a_volatility_target_typed_as_a_percent_is_refused() -> None:
     with pytest.raises(ValidationError, match=r"at most 3: annualized, as a fraction \(0\.4"):
         RiskLimits(target_volatility=40)  # would never scale anything down
     assert RiskLimits(target_volatility=0.4).target_volatility == 0.4
+
+
+def test_a_bad_close_is_left_out_of_the_volatility_not_taken_for_calm() -> None:
+    closes = [100.0 * (1.05 if i % 2 else 0.95) for i in range(200)]
+    clean = volatility_scale(closes, Timeframe.H4, 0.4, 30)
+    assert clean < 0.5
+    for bad in (0.0, -1.0, math.nan):
+        broken = [*closes[:-5], bad, *closes[-4:]]
+        assert volatility_scale(broken, Timeframe.H4, 0.4, 30) == pytest.approx(clean, rel=0.1)
+
+
+def test_a_mark_that_is_no_number_plans_no_orders() -> None:
+    slot = StrategySlot(Scripted(["BTC", "ETH"]), Timeframe.H4, 1.0)
+    slot.targets = {"BTC": 0.5, "ETH": 0.5}
+    portfolio = Portfolio(1000.0)
+    portfolio.positions["ETH"] = 1.0
+    marks = {"BTC": 100.0, "ETH": math.nan}
+    assert decide_orders([slot], portfolio, marks, RiskLimits(), RebalanceRules()) == {}

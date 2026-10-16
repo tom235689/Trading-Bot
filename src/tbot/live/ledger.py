@@ -246,6 +246,14 @@ class Ledger:
         row = self.conn.execute("SELECT COUNT(*) FROM fills WHERE time >= ?", (_iso(since),))
         return int(row.fetchone()[0])
 
+    def traded_since(self, since: datetime) -> float:
+        """Value of the fills after `since`, in the quote asset."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(ABS(quantity) * price), 0) FROM fills WHERE time > ?",
+            (_iso(since),),
+        )
+        return float(row.fetchone()[0])
+
     def add_order(
         self,
         time: datetime,

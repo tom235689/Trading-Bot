@@ -78,3 +78,13 @@ def test_rsi_of_a_flat_series_is_neutral() -> None:
 def test_a_trend_filter_of_one_bar_is_refused() -> None:
     with pytest.raises(pydantic.ValidationError, match="trend_period must be 0"):
         RsiParams(trend_period=1)
+
+
+def test_hold_keeps_every_symbol_at_an_equal_share() -> None:
+    strategy = create_strategy("hold", ["BTC", "ETH"])
+    bars = window([1.0], [1.0], [1.0])
+    ctx = StrategyContext(time=T0, windows={"BTC": bars, "ETH": bars}, exposures={})
+    assert strategy.on_bar(ctx) == {"BTC": 0.5, "ETH": 0.5}
+    assert strategy.warmup == 1
+    with pytest.raises(pydantic.ValidationError):
+        create_strategy("hold", ["BTC"], {"entry": 5})

@@ -79,7 +79,7 @@ from tbot.monitoring.telegram import (
 )
 from tbot.portfolio.allocation import StrategySlot, build_slots
 from tbot.portfolio.portfolio import Portfolio
-from tbot.risk.guard import Decision, GuardState, Mode, RiskGuard
+from tbot.risk.guard import TURNOVER_WINDOW, Decision, GuardState, Mode, RiskGuard
 from tbot.risk.limits import RiskLimits
 
 log = structlog.get_logger(__name__)
@@ -205,12 +205,14 @@ class SessionTrader:
         self.health = health or Health()
         self.resume_command = resume_command(name)
         self._paused = False  # a blocked bar was announced; later ones are only logged
-        self._reduced: date | None = None  # the UTC day "entries blocked" was last sent
+        self._reduced: dict[str, date] = {}  # rule -> the UTC day "entries blocked" was sent
         self._halted_seen = guard.state.halted  # a change to not halted is a resume
         self._handled: tuple[datetime | None, set[StreamKey]] = (None, set())
         # Streams a close may never bring (stale, or a pair Binance does not trade): the
         # checkpoint does not wait for them.
         self.quiet: Callable[[], set[StreamKey]] = set
+        # The smallest position worth a sale: live lowers it to the exchange's minimum.
+        self.minimum: Callable[[str], float] = lambda symbol: session.config.rebalance.min_notional
 
     async def handle(self, batch: Batch) -> list[Fill]:
         async with self.lock:
@@ -231,7 +233,9 @@ class SessionTrader:
             await self.notifier.send(
                 f"[{self.label}] resumed: the kill switch is cleared, trading again from this bar"
             )
-        decision = self.guard.check(self.clock(), session.portfolio.equity(session.marks), now)
+        traded = self.ledger.traded_since(now - TURNOVER_WINDOW)  # by the bars, as a backtest
+        equity = session.portfolio.equity(session.marks)
+        decision = self.guard.check(self.clock(), equity, now, traded)
         if decision.mode != Mode.HALT and self.health.blocked:
             decision = Decision(Mode.BLOCK, self.health.blocked)
         self.save_guard()
@@ -256,8 +260,8 @@ class SessionTrader:
             allowed = self.guard.filter_orders(orders, session.portfolio.positions, mode)
             if decision.mode == Mode.REDUCE_ONLY and allowed != dict(orders):
                 self.ledger.add_event(now, "warning", f"reduce only: {decision.reason}")
-                if self._reduced != now.date():  # a daily loss limit holds for the day
-                    self._reduced = now.date()
+                if self._reduced.get(decision.rule) != now.date():  # once a day per rule
+                    self._reduced[decision.rule] = now.date()
                     await self.notifier.send(
                         f"[{self.label}] entries blocked: {decision.reason}; more today are "
                         "logged, not sent"
@@ -295,7 +299,7 @@ class SessionTrader:
             dust = unsold = 0
             for symbol, quantity in session.portfolio.positions.items():
                 value = abs(quantity) * session.marks.get(symbol, 0.0)
-                if quantity and value < session.config.rebalance.min_notional:
+                if quantity and value < self.minimum(symbol):
                     dust += 1
                 elif quantity:
                     unsold += 1
@@ -328,12 +332,14 @@ class SessionTrader:
     def sellable(self) -> dict[str, float]:
         """Positions an order can sell: below the exchange minimum is dust, which stays."""
         session = self.session
-        minimum = session.config.rebalance.min_notional
         return {
             symbol: quantity
             for symbol, quantity in session.portfolio.positions.items()
             if quantity
-            and (symbol not in session.marks or abs(quantity) * session.marks[symbol] >= minimum)
+            and (
+                symbol not in session.marks
+                or abs(quantity) * session.marks[symbol] >= self.minimum(symbol)
+            )
         }
 
     async def sell_if_halted(self) -> list[Fill]:
@@ -1476,6 +1482,10 @@ async def _trade(
             on_alert=lambda text: _report_feed(ledger, notifier, label, text),
         )
         trader.quiet = lambda: quiet_streams(feed, getattr(executor, "spot", None))
+        spot = getattr(executor, "spot", None)
+        if isinstance(spot, BinanceSpot):
+            exchange = spot
+            trader.minimum = lambda symbol: sale_minimum(config, exchange, symbol)
         if isinstance(direct, Telegram):
             direct.on_refused = lambda problem: ledger.add_event(
                 utc_now(), "error", f"Telegram refuses alerts: {problem}; `tbot notify` tests it"
@@ -1631,6 +1641,16 @@ async def final_protect(
     return sorted((executor.unprotected | executor.stopless) & held)
 
 
+def sale_minimum(config: TradingConfig, spot: BinanceSpot, symbol: str) -> float:
+    """The smallest position a halt sells: the configured order minimum, or Binance's when
+    that is lower, so a position worth more than Binance takes is never left as dust."""
+    minimum = config.rebalance.min_notional
+    rules = spot.rules.get(symbol)
+    if rules is None or not rules.min_notional > 0:
+        return minimum
+    return min(minimum, float(rules.min_notional))
+
+
 def quiet_streams(feed: LiveFeed, spot: BinanceSpot | None) -> set[StreamKey]:
     """Streams a close may never bring: stale ones, and pairs Binance does not trade."""
     found = set(feed.stale())
@@ -1751,6 +1771,7 @@ async def run_paper(
             ctx.notifier,
             ctx.clock.now,
             label=label,
+            buy_limit_pct=config.buy_limit_pct,
         )
         return executor, []
 
@@ -1920,6 +1941,8 @@ async def run_live(
             fee_rate=config.costs.fee_rate,
             protective_stop_pct=config.protective_stop_pct,
             label=label,
+            buy_limit_pct=config.buy_limit_pct,
+            market_marks=config.mode == "live",  # testnet trades at prices of its own
         )
         portfolio = ctx.session.portfolio
 
@@ -2173,12 +2196,27 @@ def _check_config(config: SessionConfig, ledger: Ledger) -> None:
     if stored is None:
         ledger.set_meta("config_hash", current)
         ledger.set_meta("created_at", utc_now().isoformat())
-    elif stored == config_hash(config.model_dump_json(exclude=OPERATIONAL)):
+    elif stored in _older_hashes(config):
         ledger.set_meta("config_hash", current)  # hashed by an older tbot: nothing changed
     elif stored != current:
         log.warning("config_changed", stored=stored, current=current)
         ledger.add_event(utc_now(), "warning", f"config changed: {stored} -> {current}")
         ledger.set_meta("config_hash", current)
+
+
+def _older_hashes(config: SessionConfig) -> set[str]:
+    """What older tbots hashed for these settings: before 0.10.0 all but the operational
+    ones, before 0.11.0 without the settings added then, if they are left at their defaults."""
+    added: dict[str, Any] = {}  # settings added in 0.11.0, left at their defaults
+    if "max_daily_turnover" not in config.guard.model_fields_set:
+        added["guard"] = {"max_daily_turnover"}
+    if "buy_limit_pct" not in config.model_fields_set:
+        added["buy_limit_pct"] = True
+    before_010 = {**dict.fromkeys(OPERATIONAL, True), **added}
+    return {
+        config_hash(config.model_dump_json(include=HASHED, exclude=added)),
+        config_hash(config.model_dump_json(exclude=before_010)),
+    }
 
 
 def _stamp(iso: str | None) -> str:

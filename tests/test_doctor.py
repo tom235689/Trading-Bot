@@ -326,6 +326,26 @@ def test_kill_switch_is_tried_on_the_stored_history(tmp_path: Path) -> None:
     assert (few.status, few.detail[:42]) == ("warn", "too little stored history to test it (59 d")
 
 
+def test_a_turnover_limit_the_strategy_trips_on_history_is_named(tmp_path: Path) -> None:
+    store = BarStore(tmp_path / "data")
+    closes = [100.0] * 2600  # over a year after the 90-day warmup
+    closes += [closes[-1] * 1.02**i for i in range(1, 21)]  # a breakout
+    closes += [closes[-1]] * 200
+    for symbol, lag in (("BTCUSDT", 0), ("ETHUSDT", 3)):  # ETH breaks out three bars later
+        shifted = [100.0] * lag + closes[: len(closes) - lag]
+        opens = [100.0, *shifted[:-1]]
+        store.write(symbol, Timeframe.H4, price_bars(T0, Timeframe.H4, opens, shifted))
+    holds = [STRATEGIES[0].model_copy(update={"params": {"entry": 5, "exit": 600}})]
+    guard = GuardConfig(max_drawdown=0.9, max_daily_turnover=0.1)  # BTC's buy alone is more
+    config = PaperConfig(strategies=holds, ledger=tmp_path / "p.sqlite", guard=guard)
+    result = guard_check(config, store)
+    assert result.status == "warn"
+    assert result.detail.startswith("90% never tripped, but the 0.1x turnover limit would have ")
+    assert "raise guard.max_daily_turnover above what the strategy trades" in result.detail
+    loose = config.model_copy(update={"guard": GuardConfig(max_drawdown=0.9)})
+    assert guard_check(loose, store).status == "ok"
+
+
 def test_ledger_backups_are_checked(tmp_path: Path) -> None:
     config = PaperConfig(strategies=STRATEGIES, ledger=tmp_path / "paper.sqlite")
     with Ledger(config.ledger) as ledger:

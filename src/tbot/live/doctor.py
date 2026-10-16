@@ -407,13 +407,25 @@ def _guard_check(config: SessionConfig, store: BarStore) -> Check:
     except ValueError as exc:
         return Check("warn", "kill switch history", f"could not test it on history: {exc}")
     limit = f"{config.guard.max_drawdown:.0%}"
+    blocks = result.turnover_blocks
+    turnover = ""
+    if blocks:
+        bars = "1 bar" if len(blocks) == 1 else f"{len(blocks)} bars"
+        turnover = (
+            f"the {config.guard.max_daily_turnover:g}x turnover limit would have held back "
+            f"orders on {bars}, first on {blocks[0]:%Y-%m-%d %H:%M}: raise "
+            "guard.max_daily_turnover above what the strategy trades"
+        )
     if result.halted:
+        also = f"; {turnover}" if turnover else ""
         return Check(
             "warn",
             "kill switch history",
             f"at {limit} it would have halted the backtest on {result.halted}; "
-            "a strategy's normal drawdowns should stay inside it",
+            f"a strategy's normal drawdowns should stay inside it{also}",
         )
+    if turnover:
+        return Check("warn", "kill switch history", f"{limit} never tripped, but {turnover}")
     return Check(
         "ok", "kill switch history", f"{limit} never tripped on history since {start:%Y-%m-%d}"
     )

@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl
 import httpx
 
 STOPS = ("STOP_LOSS", "STOP_LOSS_LIMIT")
+SELF_TRADE_MODES = ["EXPIRE_TAKER", "EXPIRE_MAKER", "EXPIRE_BOTH"]  # what BTCUSDT allows
 ASK_MULTIPLIER_DOWN = 0.8  # PERCENT_PRICE_BY_SIDE of BTCUSDT and most pairs
 DEFAULT_RULES: dict[str, dict[str, str]] = {
     "BTCUSDT": {"tick": "0.01", "step": "0.00001", "minQty": "0.00001", "minNotional": "5"},
@@ -40,6 +41,8 @@ def symbol_info(symbol: str, rules: dict[str, str], status: str = "TRADING") -> 
         "baseAsset": base,
         "quoteAsset": quote,
         "filters": filters,
+        "defaultSelfTradePreventionMode": "EXPIRE_MAKER",
+        "allowedSelfTradePreventionModes": SELF_TRADE_MODES,
     }
 
 
@@ -68,6 +71,8 @@ class FakeSpot:
     market_fraction: float = 1.0  # of a market order that executes; below 1 it ends EXPIRED
     stop_max_qty: float = math.inf  # a larger stop is refused (-1013)
     now: datetime | None = None  # when market orders execute; None: the real time
+    own_resting: bool = False  # a resting order of the account's own meets every order
+    own_expired: int = 0  # such orders Binance expired (self-trade prevention, EXPIRE_MAKER)
     next_id: int = 1000
     can_trade: bool = True
     telegram_token: str = "t"
@@ -286,6 +291,7 @@ class FakeSpot:
             "cummulativeQuoteQty": "0.00000000",
             "price": params.get("price", "0"),
             "stopPrice": params.get("stopPrice", "0"),
+            "selfTradePreventionMode": params.get("selfTradePreventionMode", "EXPIRE_MAKER"),
             "fills": [],
         }
         self.next_id += 1
@@ -296,9 +302,28 @@ class FakeSpot:
             self.locked[base] = self.locked.get(base, 0.0) + qty
             self.orders.append(order)
             return httpx.Response(200, json=order)
-        if kind != "MARKET":
-            return _error(400, -1116, "Invalid orderType.")
+        if kind not in ("MARKET", "LIMIT") or (
+            kind == "LIMIT" and params.get("timeInForce") != "IOC"
+        ):
+            return _error(400, -1116, "Invalid orderType.")  # no resting orders here
         order["transactTime"] = int((self.now or datetime.now(UTC)).timestamp() * 1000)
+        if kind == "LIMIT":
+            tick = float(rules["tick"])
+            if abs(round(limit / tick) * tick - limit) > tick * 1e-6:
+                return _error(400, -1013, "Filter failure: PRICE_FILTER")
+            if side == "BUY" and self.balances.get(quote, 0.0) < qty * limit:  # held while sent
+                return _error(400, -2010, "Account has insufficient balance for requested action.")
+            if (side == "BUY" and price > limit) or (side == "SELL" and price < limit):
+                order.update(status="EXPIRED", timeInForce="IOC")  # nothing at that price
+                self.orders.append(order)
+                return httpx.Response(200, json=order)
+            order["timeInForce"] = "IOC"
+        if self.own_resting:
+            if order["selfTradePreventionMode"] == "EXPIRE_TAKER":  # the incoming order ends
+                order["status"] = "EXPIRED_IN_MATCH"
+                self.orders.append(order)
+                return httpx.Response(200, json=order)
+            self.own_expired += 1  # the default: the account's resting order is cancelled
         if self.market_fraction < 1:  # too little in the book: the rest expires
             order["status"] = "EXPIRED"
             qty = math.floor(qty * self.market_fraction / step + 1e-9) * step

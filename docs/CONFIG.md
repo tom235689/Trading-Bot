@@ -31,11 +31,11 @@ Each strategy:
 
 | Key | Meaning |
 |---|---|
-| `name` | A registered strategy: `donchian_trend` or `rsi_reversion`. |
+| `name` | A registered strategy: `donchian_trend`, `rsi_reversion`, or `hold` (every symbol at an equal share all the time: the benchmark validation runs beside a candidate). |
 | `symbols` | Binance spot symbols such as `BTC/USDT`, `BTC-USDT`, or `BTCUSDT` (all mean `BTCUSDT`); none twice. Testnet and live need one quote asset for all: a start refuses symbols quoted in two (exit 4), and doctor fails them. |
 | `timeframe` | Bar length the strategy trades on: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, or `1d`; the shipped configs use `4h`. Doctor warns about sessions on bars under 15m. |
 | `allocation` | Share of equity for this strategy, more than 0 and at most 1. |
-| `params` | The strategy's own settings. `donchian_trend`: `entry` (55, bars of the breakout high) and `exit` (20, bars of the exit low), both at least 2. `rsi_reversion`: `period` (14, at least 2), `low` (30) and `high` (70), with 0 < `low` < `high` < 100, `trend_period` (0 = off, else 2 or more; buy only above this moving average). |
+| `params` | The strategy's own settings. `donchian_trend`: `entry` (55, bars of the breakout high) and `exit` (20, bars of the exit low), both at least 2. `rsi_reversion`: `period` (14, at least 2), `low` (30) and `high` (70), with 0 < `low` < `high` < 100, `trend_period` (0 = off, else 2 or more; buy only above this moving average). `hold`: none. |
 
 ## Backtest
 
@@ -61,6 +61,8 @@ Each strategy:
 | `monte_carlo.kill_switch` | 0.45 | The `guard.max_drawdown` whose chance of tripping is reported (between 0 and 1). |
 | `cost_multiplier` | 2.0 | Costs are multiplied by this in the stress test (at least 1). |
 | `gate.min_oos_sharpe` / `max_drawdown` / `min_trades` | 0.8 / 0.25 / 100 | Thresholds the out-of-sample result must meet to pass (`max_drawdown` between 0 and 1, `min_trades` at least 1). |
+| `gate.beat_holding` | true | The out-of-sample Sharpe must be above that of holding the strategy's symbols with its allocation, risk limits, costs, and rebalance rules over the same test segments (the report's `holding them` line); false leaves the check out. |
+| `gate.min_deflated_sharpe` | 0.95 | The deflated Sharpe (the chance that the in-sample Sharpe is no luck, after every logged trial) must reach this; 0 leaves the check out. Between 0 and 1. |
 | `gate.min_holdout_days` | 180 | The holdout must span at least this many days (from `holdout_start` to the backtest's `end` or the last stored bar), or the gate fails it as too short without looking at it. At least 1. |
 
 ## Sessions (paper, testnet, live)
@@ -68,9 +70,11 @@ Each strategy:
 | Key | Default | Meaning |
 |---|---|---|
 | `ledger` | `data/paper.sqlite`, `data/testnet.sqlite`, `data/live.sqlite` | The session's book: fills, events, and state. Give every config its own (a copy without this line shares the default); `tbot status` and `tbot doctor` point out two configs that share one. A ledger keeps the mode it was started in. |
-| `guard.daily_loss_limit` | 0.03 | While equity is this far below the day's open (UTC), no new entries; exits still trade (Telegram says so once a day). The bar that closes at midnight counts for the day it ends. 0 turns it off; below 1. |
+| `guard.daily_loss_limit` | 0.03 | While equity is this far below the day's open (UTC), no new entries; exits still trade (Telegram says so once a day). Days follow the bars' closes, also in a catch-up after midnight; the bar that closes at midnight counts for the day it ends. 0 turns it off; below 1. |
 | `guard.max_drawdown` | 0.45 | The kill switch: this far below the peak, sell everything and halt until `tbot resume`. 0 turns it off; below 1. Set it beyond the strategy's normal drawdowns (see the validation's Monte Carlo). Money moved in or out rescales the peak, so a transfer never moves the drawdown. `tbot halt` and Telegram's `/halt` trip it by hand. |
 | `guard.stale_seconds` | 900 | A bar event later than this after its close buys nothing; its sales still go out. 0 turns the check off. |
+| `guard.max_daily_turnover` | 3 | While the fills of the last 24 hours (by the bars' closes) are worth more than this many times the equity, no new entries; exits still trade (Telegram says so once a day). It catches a fault that trades at every bar; the shipped strategies stay near 1 on 2018-2026 history, and doctor's kill switch history check names a config that would have hit it. 0 turns it off. Backtests with a `guard` apply it too. |
+| `buy_limit_pct` | 0.02 | A buy pays at most this much above the close it was decided on: testnet and live send it as a limit order (IOC, at most 0.5% above the ask) and paper fills it only within the limit; when the price is already beyond, the buy waits for the next close. Sales are never limited. 0 turns it off (market buys); at most 0.5 (a value such as 2, meant as 2%, is refused). Testnet prices it on its own ask. |
 | `stale_after_seconds` | 600 | A stream whose next bar is this late is reported stale (an alert; the heartbeat pauses). 60 to 604800 (a week). |
 | `batch_wait_seconds` | 5 | How long an event waits for the other streams closing at the same time; 0 to 300. |
 | `heartbeat_seconds` | 300 | How often `TBOT_HEARTBEAT_URL` is pinged (30 to 86400). |

@@ -1,8 +1,11 @@
 import asyncio
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -14,6 +17,7 @@ from tbot.core.config import StrategyConfig
 from tbot.core.models import Fill
 from tbot.core.timeframe import Timeframe
 from tbot.data.store import BarStore
+from tbot.exchange.binance import BinanceSpot, SymbolRules
 from tbot.execution.rebalance import RebalanceRules
 from tbot.execution.sim_broker import CostModel, SimulatedBroker
 from tbot.live.commands import HELP
@@ -45,6 +49,7 @@ from tbot.live.runner import (
     restore_portfolio,
     resume,
     run_paper,
+    sale_minimum,
     status_text,
     stop_path,
     strategies_hash,
@@ -56,7 +61,7 @@ from tbot.live.session import Checkpoint, TradingSession
 from tbot.monitoring.telegram import LogNotifier, Telegram
 from tbot.portfolio.allocation import StrategySlot, build_slots
 from tbot.portfolio.portfolio import Portfolio
-from tbot.risk.guard import GuardConfig, Mode, RiskGuard
+from tbot.risk.guard import Decision, GuardConfig, Mode, RiskGuard
 from tbot.risk.limits import RiskLimits
 
 H1, H4 = Timeframe.H1, Timeframe.H4
@@ -645,13 +650,30 @@ def test_a_budget_or_summary_change_is_no_change_of_the_trading_config(tmp_path:
         assert len(ledger.events_starting("config changed")) == 1
 
 
+NEW_IN_0_11: dict[str, Any] = {"guard": {"max_daily_turnover"}, "buy_limit_pct": True}
+
+
 def test_a_ledger_an_older_tbot_hashed_is_no_change(tmp_path: Path) -> None:
     config = paper_config(tmp_path)
+    before_010 = {**dict.fromkeys(OPERATIONAL, True), **NEW_IN_0_11}
+    before_011 = config.model_dump_json(include=HASHED, exclude=NEW_IN_0_11)
+    for stored in (config.model_dump_json(exclude=before_010), before_011):
+        with Ledger(config.ledger) as ledger:
+            ledger.set_meta("config_hash", config_hash(stored))
+            _check_config(config, ledger)
+            assert ledger.events_starting("config changed") == []
+            current = config_hash(config.model_dump_json(include=HASHED))
+            assert ledger.get_meta("config_hash") == current
+
+
+def test_a_turnover_limit_set_after_an_upgrade_is_a_change(tmp_path: Path) -> None:
+    config = paper_config(tmp_path)
+    stored = config.model_dump_json(include=HASHED, exclude=NEW_IN_0_11)
+    tighter = config.model_copy(update={"guard": GuardConfig(max_daily_turnover=2.0)})
     with Ledger(config.ledger) as ledger:
-        ledger.set_meta("config_hash", config_hash(config.model_dump_json(exclude=OPERATIONAL)))
-        _check_config(config, ledger)
-        assert ledger.events_starting("config changed") == []
-        assert ledger.get_meta("config_hash") == config_hash(config.model_dump_json(include=HASHED))
+        ledger.set_meta("config_hash", config_hash(stored))
+        _check_config(tighter, ledger)
+        assert len(ledger.events_starting("config changed")) == 1
 
 
 def test_status_names_the_resume_of_its_own_config(tmp_path: Path) -> None:
@@ -707,3 +729,75 @@ def test_a_session_keeps_windows_awake_while_it_runs(monkeypatch: pytest.MonkeyP
     with awake():
         assert calls == [0x80000001]  # continuous, system required
     assert calls == [0x80000001, 0x80000000]  # sleep allowed again
+
+
+@pytest.mark.parametrize(("hours_ago", "blocked"), [(23, True), (25, False)])
+def test_a_day_of_heavy_trading_holds_back_the_next_entry(
+    tmp_path: Path, hours_ago: int, blocked: bool
+) -> None:
+    trader, ledger, notifier = make_trader(
+        tmp_path, {at(1): {"BTC": 0.5}}, FakePrices({"BTC": 100.0})
+    )
+    when = at(1) - timedelta(hours=hours_ago)  # from the bar's close, not the clock at(9)
+    ledger.add_fill(Fill(when, "BTC", 20.0, 100.0, 0.0), 100.0)  # 4,000 traded, equity 1,000
+    ledger.add_fill(Fill(when, "BTC", -20.0, 100.0, 0.0), 100.0)
+    fills = asyncio.run(trader.handle({BTC: BARS.slice(0, 1)}))
+    assert (fills == []) is blocked
+    held = [m for m in notifier.messages if "entries blocked" in m]
+    if blocked:
+        assert held == [
+            "[paper] entries blocked: traded 4.0x equity in 24 hours, beyond the 3x limit "
+            "(guard.max_daily_turnover): a strategy that trades this much may be broken; "
+            "more today are logged, not sent"
+        ]
+    else:
+        assert held == []
+    ledger.close()
+
+
+def test_a_halt_sells_what_binance_takes_below_the_configured_minimum(tmp_path: Path) -> None:
+    trader, ledger, _ = make_trader(tmp_path, {}, FakePrices({"BTC": 100.0}))
+    trader.session.portfolio.positions["BTC"] = 0.07  # 7 USDT: under min_notional 10
+    trader.session.marks["BTC"] = 100.0
+    trader.minimum = lambda symbol: 10.0  # the configured minimum
+    assert trader.sellable() == {}
+    trader.minimum = lambda symbol: 5.0  # Binance takes 5
+    assert trader.sellable() == {"BTC": 0.07}
+    ledger.close()
+
+
+def test_the_sale_minimum_is_binances_when_lower() -> None:
+    rebalance = RebalanceRules(min_notional=10.0)
+    config = paper_config(Path("unused")).model_copy(update={"rebalance": rebalance})
+    rules = SymbolRules("BTC", "USDT", Decimal("0.01"), Decimal("0.00001"), Decimal(0), Decimal(5))
+    spot = cast(BinanceSpot, SimpleNamespace(rules={"BTCUSDT": rules}))
+    assert sale_minimum(config, spot, "BTCUSDT") == 5.0
+    assert sale_minimum(config, spot, "ETHUSDT") == 10.0  # no rules: the configured one
+    spot.rules["BTCUSDT"] = replace(rules, min_notional=Decimal(0))
+    assert sale_minimum(config, spot, "BTCUSDT") == 10.0
+    spot.rules["BTCUSDT"] = replace(rules, min_notional=Decimal(20))
+    assert sale_minimum(config, spot, "BTCUSDT") == 10.0
+
+
+def test_each_rule_that_blocks_entries_is_told_once_a_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trader, ledger, notifier = make_trader(
+        tmp_path, {at(1): {"BTC": 0.5}}, FakePrices({"BTC": 100.0})
+    )
+    decisions = iter(
+        [
+            Decision(Mode.REDUCE_ONLY, "day loss -4.0% beyond 3%", "daily_loss"),
+            Decision(Mode.REDUCE_ONLY, "traded 3.5x equity", "turnover"),
+            Decision(Mode.REDUCE_ONLY, "traded 3.6x equity", "turnover"),
+        ]
+    )
+    monkeypatch.setattr(trader.guard, "check", lambda *args: next(decisions))
+    for i in range(3):
+        asyncio.run(trader.handle({BTC: BARS.slice(i, 1)}))
+    held = [m for m in notifier.messages if "entries blocked" in m]
+    assert [m.split(": ")[1].split(";")[0] for m in held] == [
+        "day loss -4.0% beyond 3%",
+        "traded 3.5x equity",
+    ]
+    ledger.close()
